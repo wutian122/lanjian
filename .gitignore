@@ -1,0 +1,69 @@
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local agent / tool metadata
+.agents/
+.codex/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+
+# Node.js / frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+!.env.example
+!backend/env.example
+backend/.env
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Logs / temp files
+*.log
+logs/
+tmp/
+temp/
+
+# Build / runtime outputs
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/static/uploads/*
+!backend/static/uploads/.gitkeep
+
+# Test artifacts
+playwright-report/
+test-results/
+
+# Docker / export artifacts
+*.tar
+*.tar.gz
+*.tgz
+
+# Database / local state
+*.db
+*.sqlite
+*.sqlite3
