@@ -131,6 +131,17 @@ cp backend/env.example backend/.env
 docker compose up -d
 ```
 
+### 首次登录
+
+系统启动时会自动初始化超级管理员账户，优先读取环境变量 `SUPERADMIN_USERNAME` 和 `SUPERADMIN_PASSWORD`。
+
+如果未显式配置，当前默认管理员账户为：
+
+- 用户名：`admin`
+- 密码：`123456789`
+
+出于安全考虑，生产环境请在首次部署前通过 `backend/.env` 覆盖默认凭据，并在首次登录后立即修改密码。
+
 默认访问入口：
 
 - 前端：`http://localhost/`
