@@ -256,8 +256,18 @@ _running_event_managers: Dict[str, EventManager] = {}
 _cancelled_tasks: Set[str] = set()
 
 # SSE 流的终态状态集合：任务进入这些状态时，SSE 流推送 task_end 并断开。
-# 注意：paused 也纳入，使前端能感知暂停并展示"继续"入口（见 fix-pause-resume-rpm-isolation）。
-_SSE_TERMINAL_STATUSES: set[str] = {"completed", "failed", "cancelled", "paused"}
+# 注意：
+# - paused 也纳入，使前端能感知暂停并展示"继续"入口（见 fix-pause-resume-rpm-isolation）。
+# - completed_with_gaps 必须纳入（覆盖率不足/超时安全阀放行），否则 DB 轮询流不识别终态，
+#   前端一直显示"运行中"直到 300s max_idle（见 fix-sse-realtime-stream Wave 0.3）。
+# - initializing 明确不纳入：属于任务运行前置阶段，SSE 应保持连接推送初始化进度事件。
+_SSE_TERMINAL_STATUSES: set[str] = {
+    "completed",
+    "completed_with_gaps",
+    "failed",
+    "cancelled",
+    "paused",
+}
 
 
 def is_task_cancelled(task_id: str) -> bool:

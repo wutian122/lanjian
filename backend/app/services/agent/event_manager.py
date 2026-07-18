@@ -440,7 +440,68 @@ class EventManager:
             )
             events = result.scalars().all()
             return [event.to_sse_dict() for event in events]
-    
+
+    async def _backfill_events_paged(
+        self,
+        task_id: str,
+        after_sequence: int,
+        batch_size: int = 500,
+        max_events: int = 20000,
+    ) -> AsyncGenerator[Dict, None]:
+        """分页拉取 DB 中 sequence > after_sequence 的事件并 yield。
+
+        - 按 sequence 游标推进：每批 <= batch_size 条
+        - 累计上限 max_events；达到时 yield notice/backfill_truncated 事件后 return
+        - 事件字典中 'type' 字段统一转为 'event_type'（保持与内存事件格式一致）
+        - 遇到终端事件（task_complete/task_error/task_cancel）立即 return
+        - DB 异常时 yield 结束并让上层继续实时循环
+        """
+        cursor = after_sequence
+        total = 0
+
+        while True:
+            try:
+                batch = await self.get_events(task_id, after_sequence=cursor, limit=batch_size)
+            except Exception as e:
+                logger.warning(
+                    f"[BackfillPaged] Task {task_id}: DB query failed, stopping backfill: {e}"
+                )
+                return
+
+            if not batch:
+                break
+
+            for evt in batch:
+                # 统一 'type' 字段为 'event_type'（保持与内存事件格式一致）
+                if "type" in evt and "event_type" not in evt:
+                    evt["event_type"] = evt["type"]
+
+                # 达到累计上限保护，yield notice 事件后停止回补
+                if total >= max_events:
+                    yield {
+                        "event_type": "notice",
+                        "sequence": cursor,
+                        "metadata": {
+                            "kind": "backfill_truncated",
+                            "dropped": total,
+                            "limit": max_events,
+                        },
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    return
+
+                total += 1
+                yield evt
+
+                # 推进游标
+                seq = evt.get("sequence", 0)
+                if seq > cursor:
+                    cursor = seq
+
+                # 遇到终端事件立即返回
+                if evt.get("event_type") in ("task_complete", "task_error", "task_cancel"):
+                    return
+
     async def stream_events(
         self,
         task_id: str,
@@ -504,29 +565,25 @@ class EventManager:
             return
 
         # 🔥 DB 回补：重连时内存队列中可能已无事件，但 DB 中存在 after_sequence 之后的事件
-        # 从 DB 查询断连期间未送达的事件，按序补发给前端
+        # 从 DB 分页查询断连期间未送达的事件，按序补发给前端（游标分页，支持 >500 条事件）
         if self.db_session_factory:
             try:
-                db_events = await self.get_events(task_id, after_sequence=after_sequence, limit=500)
-                if db_events:
-                    # 转换格式：to_sse_dict 返回 'type'，统一为 'event_type'
-                    db_backfill_count = 0
-                    for db_evt in db_events:
-                        # 统一为内存事件格式
-                        if "type" in db_evt and "event_type" not in db_evt:
-                            db_evt["event_type"] = db_evt["type"]
-                        yield db_evt
-                        db_backfill_count += 1
-                        # 更新 after_sequence 以便后续实时循环不重复发送
-                        seq = db_evt.get("sequence", 0)
-                        if seq > after_sequence:
-                            after_sequence = seq
-                        # 检查终端事件
-                        if db_evt.get("event_type") in ["task_complete", "task_error", "task_cancel"]:
-                            logger.info(f"[StreamEvents] Task {task_id}: Terminal event during DB backfill, exiting")
-                            return
-                    if db_backfill_count > 0:
-                        logger.info(f"[StreamEvents] Task {task_id}: DB backfilled {db_backfill_count} events (after_sequence now={after_sequence})")
+                db_backfill_count = 0
+                async for db_evt in self._backfill_events_paged(
+                    task_id, after_sequence=after_sequence
+                ):
+                    yield db_evt
+                    db_backfill_count += 1
+                    # 更新 after_sequence 以便后续实时循环不重复发送
+                    seq = db_evt.get("sequence", 0)
+                    if seq > after_sequence:
+                        after_sequence = seq
+                    # 检查终端事件
+                    if db_evt.get("event_type") in ["task_complete", "task_error", "task_cancel"]:
+                        logger.info(f"[StreamEvents] Task {task_id}: Terminal event during DB backfill, exiting")
+                        return
+                if db_backfill_count > 0:
+                    logger.info(f"[StreamEvents] Task {task_id}: DB backfilled {db_backfill_count} events (after_sequence now={after_sequence})")
             except Exception as db_err:
                 logger.warning(f"[StreamEvents] Task {task_id}: DB backfill failed (non-fatal): {db_err}")
 

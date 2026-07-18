@@ -66,6 +66,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # 生产/默认启动命令：单 worker，无 --reload。
+    # ⚠️ 严禁在此加 --reload：文件变更会触发 uvicorn 重启，正在运行的 SSE 连接全部断开，
+    # 内存中的 Orchestrator/EventManager 状态丢失，任务进入 stale running。
+    # 开发热更请在 docker-compose.override.yml 中覆盖 command 加 --reload。
+    command: >
+      sh -c ".venv/bin/alembic upgrade head &&
+             .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     networks:
       - lanjian-network
 

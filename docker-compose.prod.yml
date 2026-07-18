@@ -82,6 +82,10 @@ services:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
+    # 生产启动命令：单 worker、无 --reload、显式绑定所有接口。
+    # ⚠️ 严禁在此加 --reload：文件变更会触发 uvicorn 重启，正在运行的 SSE 连接全部断开，
+    # 内存中的 Orchestrator/EventManager 状态丢失（跨进程 Registry 尚未落地时会导致 stale running）。
+    command: [".venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     networks:
       - lanjian-network
 
