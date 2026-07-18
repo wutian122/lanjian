@@ -733,7 +733,10 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
                         await run_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                    await event_emitter.emit_event("warning", f"任务超时（{task_timeout}秒），已强制结束并保存已有发现")
+                    # Wave 1 §2.2 修复：AgentEventEmitter 无 emit_event 方法，此处应为 emit_warning。
+                    # 原实现 event_emitter.emit_event('warning', ...) 会抛 AttributeError，
+                    # 被外层 except Exception 吞掉，任务被误判为 FAILED 且不发终态事件。
+                    await event_emitter.emit_warning(f"任务超时（{task_timeout}秒），已强制结束并保存已有发现")
                     # 构造超时结果，保存已有发现
                     result = AgentResult(
                         success=True,
@@ -866,6 +869,12 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
                     await db.commit()
             except Exception:
                 pass
+            # Wave 1 §2.3 修复：CancelledError 分支也要发 task_cancel 终态事件，
+            # 否则 SSE 流的 stream_events 在等待终态事件永远等不到（原实现只更新 DB）。
+            try:
+                await event_emitter.emit_task_cancelled("任务已取消")
+            except Exception as e:
+                logger.warning(f"[Cancel] Failed to emit task_cancelled from CancelledError branch: {e}")
                 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}", exc_info=True)
@@ -2325,6 +2334,17 @@ async def cancel_agent_task(
     task.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
+    # Wave 1 §2.3 修复：通过 SSE 发出 task_cancel 终态事件，让前端立即感知（原实现
+    # 只更新 DB，stream_events 的实时循环在等 task_cancel 事件永远等不到，前端要等
+    # 15 秒心跳超时才断开）
+    event_manager = _running_event_managers.get(task_id)
+    if event_manager is not None:
+        try:
+            emitter = AgentEventEmitter(task_id, event_manager)
+            await emitter.emit_task_cancelled("任务已取消")
+        except Exception as e:
+            logger.warning(f"[Cancel] Failed to emit task_cancelled for {task_id}: {e}")
+
     logger.info(f"[Cancel] Task {task_id} cancelled successfully")
     return {"message": "任务已取消", "task_id": task_id}
 
@@ -2587,6 +2607,7 @@ async def delete_agent_task(
 @router.get("/{task_id}/events")
 async def stream_agent_events(
     task_id: str,
+    request: Request,  # Wave 1 §2.4: 用于 request.is_disconnected() 检测客户端断开
     after_sequence: int = Query(0, ge=0, description="从哪个序号之后开始"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
@@ -2597,19 +2618,24 @@ async def stream_agent_events(
     task = await db.get(AgentTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    
+
     project = await db.get(Project, task.project_id)
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权访问此任务")
-    
+
     async def event_generator():
         """生成 SSE 事件流"""
         last_sequence = after_sequence
         poll_interval = 0.5
         max_idle = 300  # 5 分钟无事件后关闭
         idle_time = 0
-        
+
         while True:
+            # Wave 1 §2.4: 每轮循环开始时检测客户端断开，5 秒内即可响应
+            if await request.is_disconnected():
+                logger.info(f"[stream_agent_events] Client disconnected for task {task_id}")
+                break
+
             # 查询新事件
             async with async_session_factory() as session:
                 result = await session.execute(
@@ -2620,11 +2646,11 @@ async def stream_agent_events(
                     .limit(50)
                 )
                 events = result.scalars().all()
-                
+
                 # 获取任务状态
                 current_task = await session.get(AgentTask, task_id)
                 task_status = current_task.status if current_task else None
-            
+
             if events:
                 idle_time = 0
                 for event in events:
@@ -2632,7 +2658,7 @@ async def stream_agent_events(
                     # event_type 已经是字符串，不需要 .value
                     event_type_str = str(event.event_type)
                     phase_str = str(event.phase) if event.phase else None
-                    
+
                     data = {
                         "id": event.id,
                         "type": event_type_str,
@@ -2643,7 +2669,9 @@ async def stream_agent_events(
                         "progress_percent": event.progress_percent,
                         "tool_name": event.tool_name,
                     }
-                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                    # Wave 1 §2.6: SSE 标准 id: 字段（值 = event.sequence），
+                    # 前端可通过 Last-Event-ID header 携带并回补事件
+                    yield f"id: {event.sequence}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
             else:
                 idle_time += poll_interval
             
@@ -2676,6 +2704,7 @@ async def stream_agent_events(
 @router.get("/{task_id}/stream")
 async def stream_agent_with_thinking(
     task_id: str,
+    request: Request,  # Wave 1 §2.4: 用于 request.is_disconnected() 检测客户端断开
     include_thinking: bool = Query(True, description="是否包含 LLM 思考过程"),
     include_tool_calls: bool = Query(True, description="是否包含工具调用详情"),
     after_sequence: int = Query(0, ge=0, description="从哪个序号之后开始"),
@@ -2684,34 +2713,39 @@ async def stream_agent_with_thinking(
 ):
     """
     增强版事件流 (SSE)
-    
+
     支持:
     - LLM 思考过程的 Token 级流式输出 (仅运行时)
     - 工具调用的详细输入/输出
     - 节点执行状态
     - 发现事件
-    
+
     优先使用内存中的事件队列 (支持 thinking_token)，
     如果任务未在运行，则回退到数据库轮询 (不支持 thinking_token 复盘)。
     """
     task = await db.get(AgentTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    
+
     project = await db.get(Project, task.project_id)
     if not project or project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权访问此任务")
-    
+
     # 定义 SSE 格式化函数
     def format_sse_event(event_data: Dict[str, Any]) -> str:
         """格式化为 SSE 事件"""
         event_type = event_data.get("event_type") or event_data.get("type")
-        
+
         # 统一字段
         if "type" not in event_data:
             event_data["type"] = event_type
-            
-        return f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+
+        # Wave 1 §2.6: 心跳除外，其他事件都带 id: {sequence} 行（Last-Event-ID 语义）
+        seq = event_data.get("sequence")
+        prefix = ""
+        if event_type != "heartbeat" and isinstance(seq, int):
+            prefix = f"id: {seq}\n"
+        return f"{prefix}event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
 
     async def enhanced_event_generator():
         """生成增强版 SSE 事件流"""
@@ -2728,21 +2762,29 @@ async def stream_agent_with_thinking(
                     skip_types.update(["thinking_start", "thinking_token", "thinking_end"])
                 if not include_tool_calls:
                     skip_types.update(["tool_call_start", "tool_call_input", "tool_call_output", "tool_call_end"])
-                
+
                 async for event in event_manager.stream_events(task_id, after_sequence=after_sequence):
+                    # Wave 1 §2.4: 每个事件出队后立即检测客户端断开，避免僵尸连接
+                    if await request.is_disconnected():
+                        logger.info(f"[stream_agent_with_thinking] Client disconnected for task {task_id}")
+                        break
+
                     event_type = event.get("event_type")
-                    
+
                     if event_type in skip_types:
                         continue
-                    
+
                     # 🔥 Debug: 记录 thinking_token 事件
                     if event_type == "thinking_token":
                         token = event.get("metadata", {}).get("token", "")[:20]
                         logger.debug(f"Stream {task_id}: Sending thinking_token: '{token}...'")
-                        
+
                     # 格式化并 yield
                     yield format_sse_event(event)
-                    
+
+            except asyncio.CancelledError:
+                logger.info(f"[stream_agent_with_thinking] Cancelled for task {task_id}")
+                raise
             except Exception as e:
                 logger.error(f"In-memory stream error: {e}")
                 err_data = {"type": "error", "message": str(e)}
@@ -2763,6 +2805,10 @@ async def stream_agent_with_thinking(
                 skip_types.update(["thinking_start", "thinking_token", "thinking_end"])
             
             while True:
+                # Wave 1 §2.4: 每轮循环开始检测客户端断开
+                if await request.is_disconnected():
+                    logger.info(f"[stream_agent_with_thinking DB-poll] Client disconnected for task {task_id}")
+                    break
                 try:
                     async with async_session_factory() as session:
                         # 查询新事件

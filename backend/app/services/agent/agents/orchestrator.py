@@ -1292,26 +1292,41 @@ Action Input: {{"参数": "值"}}
 
 
     async def _run_semgrep_prescan(self) -> dict[str, Any]:
-        """Phase 0: Semgrep full scan before Recon (direct subprocess, not sandbox)."""
+        """Phase 0: Semgrep full scan before Recon (async subprocess, not sandbox)."""
         import json as _json
         import os
-        import subprocess
         project_root = self._runtime_context.get("project_root", ".")
 
         # Build clean env: remove empty proxy vars that crash semgrep OCaml runtime
         _proxy_keys = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"]
         clean_env = {k: v for k, v in os.environ.items() if not (k in _proxy_keys and not v.strip())}
 
+        # 版本检查：异步子进程，避免阻塞事件循环
         try:
-            check = subprocess.run(["semgrep", "--version"], capture_output=True, timeout=10, env=clean_env)
-            if check.returncode != 0:
+            proc = await asyncio.create_subprocess_exec(
+                "semgrep", "--version",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=clean_env,
+            )
+            try:
+                stdout_bytes, _stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=10
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise
+            if proc.returncode != 0:
                 logger.warning("[Orchestrator] Semgrep not installed, skipping prescan")
                 return {"findings": [], "hot_files": [], "scan_success": False}
-            semgrep_ver = check.stdout.decode().strip()
+            semgrep_ver = stdout_bytes.decode(errors="replace").strip() if stdout_bytes else ""
             logger.info(f"[Orchestrator] Semgrep version: {semgrep_ver}")
             await self.emit_event("info", f"Semgrep v{semgrep_ver} detected, starting pre-scan...")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
             logger.warning("[Orchestrator] Semgrep not found in PATH, skipping prescan")
+            return {"findings": [], "hot_files": [], "scan_success": False}
+        except asyncio.TimeoutError:
+            logger.warning("[Orchestrator] Semgrep version check timed out, skipping prescan")
             return {"findings": [], "hot_files": [], "scan_success": False}
 
         all_raw = []
@@ -1326,23 +1341,41 @@ Action Input: {{"参数": "值"}}
             "p/sql-injection",
         ]
         for ruleset in rulesets:
+            ruleset_tool_name = f"semgrep_prescan_{ruleset.replace('/', '_').replace('-', '_')}"
+            await self.emit_event(
+                "tool_call_start",
+                f"运行 Semgrep 规则集: {ruleset}",
+                metadata={"tool": {"name": ruleset_tool_name, "input": {"ruleset": ruleset}}},
+            )
+            findings_count = 0
             try:
-                cmd = ["semgrep", "--config", ruleset, "--json", "--quiet",
-                       "--max-target-bytes", "1000000", project_root]
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=180, cwd=project_root, env=clean_env)
-                if proc.stdout:
-                    results = _json.loads(proc.stdout[proc.stdout.find('{'):] if '{' in proc.stdout else '{}')
-                    findings = results.get("results", [])
-                    all_raw.extend(findings)
-                    logger.info(f"[Orchestrator] Semgrep {ruleset}: {len(findings)} findings")
-                    await self.emit_event("info", f"Semgrep {ruleset}: {len(findings)} findings")
-                if proc.returncode not in (0, 1):
-                    logger.warning(f"[Orchestrator] Semgrep {ruleset} exit code {proc.returncode}: {proc.stderr[:200]}")
-            except subprocess.TimeoutExpired:
-                logger.warning(f"[Orchestrator] Semgrep {ruleset} timed out (180s)")
+                findings = await self._run_single_semgrep_ruleset(
+                    ruleset, project_root, clean_env
+                )
+                all_raw.extend(findings)
+                findings_count = len(findings)
+                await self.emit_event(
+                    "info", f"Semgrep {ruleset}: {len(findings)} findings"
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[Orchestrator] Semgrep {ruleset} timed out (180s)"
+                )
             except Exception as e:
-                logger.warning(f"[Orchestrator] Semgrep {ruleset} failed: {e}")
+                logger.warning(
+                    f"[Orchestrator] Semgrep {ruleset} failed: {e}"
+                )
+            finally:
+                await self.emit_event(
+                    "tool_call_end",
+                    f"Semgrep {ruleset} 完成",
+                    metadata={
+                        "tool": {
+                            "name": ruleset_tool_name,
+                            "findings_count": findings_count,
+                        }
+                    },
+                )
 
         seen = set()
         unique = []
@@ -1379,6 +1412,53 @@ Action Input: {{"参数": "值"}}
             })
 
         return {"findings": semgrep_findings, "hot_files": hot_files[:30], "scan_success": True}
+
+    async def _run_single_semgrep_ruleset(
+        self, ruleset: str, project_root: str, env: dict
+    ) -> list[dict]:
+        """异步跑单个 Semgrep 规则集，返回 findings 列表。
+
+        使用 asyncio.create_subprocess_exec 替代同步 subprocess.run，
+        避免阻塞事件循环导致 SSE 心跳断连。
+        """
+        import json as _json
+
+        cmd = [
+            "semgrep", "--config", ruleset, "--json", "--quiet",
+            "--max-target-bytes", "1000000", project_root,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_root,
+            env=env,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=180
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else ""
+        stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        if stdout:
+            results = _json.loads(
+                stdout[stdout.find("{"):] if "{" in stdout else "{}"
+            )
+            findings = results.get("results", [])
+            logger.info(
+                f"[Orchestrator] Semgrep {ruleset}: {len(findings)} findings"
+            )
+            return findings
+        if proc.returncode not in (0, 1):
+            logger.warning(
+                f"[Orchestrator] Semgrep {ruleset} exit code "
+                f"{proc.returncode}: {stderr[:200]}"
+            )
+        return []
 
     def _build_initial_message(
         self,

@@ -650,6 +650,12 @@ class EventManager:
         except GeneratorExit:
             # SSE 连接断开
             logger.info(f"[StreamEvents] Task {task_id}: SSE stream closed by client (GeneratorExit)")
+        except asyncio.CancelledError:
+            # Wave 1 §2.4 修复：Starlette 内部取消或客户端断开会触发 CancelledError，
+            # 必须显式捕获后 re-raise，让上层 StreamingResponse 正常清理。
+            # 若不捕获，异常会未处理地传播到上层，可能导致 event_manager 队列引用泄漏。
+            logger.info(f"[StreamEvents] Task {task_id}: Stream cancelled (client disconnect or task cancel)")
+            raise
         except Exception as stream_err:
             logger.error(f"[StreamEvents] Task {task_id}: Stream error: {stream_err}", exc_info=True)
         # 🔥 不要移除队列，让 AgentRunner 管理队列的生命周期

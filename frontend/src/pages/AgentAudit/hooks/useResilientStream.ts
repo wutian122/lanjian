@@ -202,6 +202,17 @@ export function useResilientStream(
 
       if (line.startsWith('event:')) {
         currentEvent.type = line.slice(6).trim() as StreamEventData['type'];
+      } else if (line.startsWith('id:')) {
+        // FIX SSE Wave 1 §2.5: 解析 SSE 标准 id: 字段
+        // 后端 SSE 流中 id: 字段的语义与 data 中的 sequence 等价，
+        // 用于支持 Last-Event-ID header 的重连续传。
+        const idStr = line.slice(3).trim();
+        if (idStr.length > 0) {
+          const idNum = Number(idStr);
+          if (!Number.isNaN(idNum)) {
+            currentEvent.sequence = idNum;
+          }
+        }
       } else if (line.startsWith('data:')) {
         try {
           const data = JSON.parse(line.slice(5).trim());
@@ -386,6 +397,13 @@ export function useResilientStream(
         headers: {
           'Authorization': `Bearer ${token}`,
           'Accept': 'text/event-stream',
+          // FIX SSE Wave 1 §2.5: 重连时携带 Last-Event-ID header
+          // SSE 标准：客户端通过 Last-Event-ID 告知服务端最后收到的事件 ID，
+          // 服务端可从该位置之后继续推送，避免重复事件。值来自 latestSeenSequenceRef，
+          // 在 disconnect 时不再清零，确保重连后从正确位置继续。
+          ...(latestSeenSequenceRef.current > 0 && {
+            'Last-Event-ID': String(latestSeenSequenceRef.current),
+          }),
         },
         signal: abortControllerRef.current.signal,
       });
@@ -494,7 +512,10 @@ export function useResilientStream(
     }
 
     setReconnectAttempts(0);
-    latestSeenSequenceRef.current = 0;
+    // FIX SSE Wave 1 §2.5: 保留 latestSeenSequenceRef 高水位，不再清零
+    // 之前 latestSeenSequenceRef.current = 0 导致重连时 getEffectiveAfterSequence
+    // 取到较小值，回补大量已处理的老事件，造成日志重复和性能浪费。
+    // 重连时应携带 Last-Event-ID header 从最新 sequence 继续。
     inLongOperationRef.current = false;
   }, [updateConnectionState]);
 

@@ -811,6 +811,10 @@ function AgentAuditPageContent() {
     return () => {
       console.log('[AgentAudit] Cleanup: disconnecting stream');
       disconnectStream();
+      // FIX SSE Wave 1 §2.5: 复位 hasConnectedRef，允许 React 18 StrictMode 双挂载
+      // 以及运行时断开后重新连接。若不复位，第二次 mount 时 hasConnectedRef.current === true
+      // 会直接 early return，导致断流后（心跳超时、fetch 失败）无法自愈。
+      hasConnectedRef.current = false;
     };
     // 🔥 CRITICAL FIX: 移除 afterSequence 依赖！
     // afterSequence 通过 streamOptions 传递，不需要在这里触发重连
