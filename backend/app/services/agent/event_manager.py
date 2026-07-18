@@ -262,6 +262,9 @@ class EventManager:
     # Wave 2 §3.3 事件队列有界化配置
     QUEUE_MAX_SIZE = 10000  # 单任务队列上限（覆盖 ~15 分钟正常任务事件量）
     IMPORTANT_PUT_TIMEOUT_SECONDS = 5.0  # 重要事件入队最长等待时间
+    # Wave 2 Review Finding 1: 终态事件超时保护（30s）
+    # 消费者永久离线时避免 Orchestrator 永久挂死；事件已落 DB，重连时回补可送达
+    TERMINAL_PUT_TIMEOUT_SECONDS = 30.0
     TERMINAL_EVENT_TYPES = frozenset({"task_complete", "task_error", "task_cancel"})
     DROPPABLE_EVENT_TYPES = frozenset({"thinking_token"})  # 可安全丢弃的事件
 
@@ -344,11 +347,23 @@ class EventManager:
                             f"(queue full, size={q.qsize()}/{q.maxsize}); consumer likely slow or disconnected"
                         )
             elif event_type in self.TERMINAL_EVENT_TYPES:
-                # 终态事件：MUST 送达。无条件阻塞直到成功（前端必须能感知任务结束）
-                await q.put(event_data)
-                logger.info(
-                    f"[EventQueue] Added terminal event {event_type} to queue for task {task_id}, size: {q.qsize()}"
-                )
+                # 终态事件：MUST 送达；无消费者时会阻塞。为避免 Orchestrator 因消费者永久
+                # 离线而永久挂死（Review Wave 2 Finding 1），加长超时保护：30 秒内还入不了队，
+                # 则放弃入队。事件已落 DB（terminal 不在 skip_db_events），重连时 DB 回补
+                # 可送达；同时打 CRITICAL 日志便于运维定位。
+                try:
+                    await asyncio.wait_for(
+                        q.put(event_data), timeout=self.TERMINAL_PUT_TIMEOUT_SECONDS
+                    )
+                    logger.info(
+                        f"[EventQueue] Added terminal event {event_type} to queue for task {task_id}, size: {q.qsize()}"
+                    )
+                except asyncio.TimeoutError:
+                    logger.critical(
+                        f"[EventQueue] Terminal event {event_type} timed out ({self.TERMINAL_PUT_TIMEOUT_SECONDS}s) "
+                        f"waiting to enqueue for task {task_id} (size={q.qsize()}/{q.maxsize}); "
+                        f"consumer offline. Event persisted in DB, will be delivered on next SSE reconnect."
+                    )
             else:
                 # 重要事件：最多等 5s。超时则放弃入队（DB 已落，重连时 DB 回补可拿到）
                 try:

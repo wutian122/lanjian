@@ -88,3 +88,111 @@ class TestHeartbeatIndependent:
         assert has_pump or has_wait, (
             "心跳应与队列消费解耦：_pump_heartbeats 独立协程 或 asyncio.wait FIRST_COMPLETED"
         )
+
+
+# ============ Runtime integration tests (Wave 2 Review Finding 4) ============
+
+import asyncio
+import pytest
+
+
+class TestGradedDropRuntime:
+    """运行时验证 add_event 分级丢弃语义（Wave 2 Review Finding 4）"""
+
+    @pytest.mark.asyncio
+    async def test_thinking_token_dropped_when_full(self):
+        """队列满时 thinking_token 被丢弃且计数递增，add_event 不抛异常"""
+        from app.services.agent.event_manager import EventManager
+
+        # 小容量队列便于测试
+        mgr = EventManager(db_session_factory=None)
+        mgr.QUEUE_MAX_SIZE = 3  # override class attr on instance
+        # 创建队列时使用 override 值
+        task_id = "t_drop"
+        # 直接构造 3 容量队列，覆盖 create_queue 的默认
+        mgr._event_queues[task_id] = asyncio.Queue(maxsize=3)
+        # 填满队列
+        q = mgr._event_queues[task_id]
+        for _ in range(3):
+            q.put_nowait({"filler": True})
+        assert q.full()
+
+        # 再发 5 个 thinking_token：应被全部丢弃，不阻塞不抛错
+        for i in range(5):
+            await asyncio.wait_for(
+                mgr.add_event(task_id, "thinking_token", sequence=i),
+                timeout=1.0,
+            )
+
+        # 5 个都被丢弃
+        assert mgr.dropped_thinking_tokens.get(task_id, 0) == 5, (
+            f"预期丢弃 5 个 thinking_token，实际 {mgr.dropped_thinking_tokens.get(task_id, 0)}"
+        )
+        # 队列大小未变（仍是 3）
+        assert q.qsize() == 3
+
+    @pytest.mark.asyncio
+    async def test_important_event_gives_up_after_timeout(self):
+        """重要事件（非终态非丢弃）在队列满时等待后放弃"""
+        from app.services.agent.event_manager import EventManager
+
+        mgr = EventManager(db_session_factory=None)
+        task_id = "t_imp"
+        mgr._event_queues[task_id] = asyncio.Queue(maxsize=2)
+        q = mgr._event_queues[task_id]
+        for _ in range(2):
+            q.put_nowait({"filler": True})
+        assert q.full()
+
+        # 缩短超时便于测试
+        mgr.IMPORTANT_PUT_TIMEOUT_SECONDS = 0.5
+
+        start = asyncio.get_event_loop().time()
+        await mgr.add_event(task_id, "tool_call", sequence=1)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        # 大约等待 0.5 秒后放弃（允许 0.4-1.0 秒容差）
+        assert 0.4 < elapsed < 1.5, f"预期 ~0.5s 后放弃，实际 {elapsed:.2f}s"
+        # 队列未变
+        assert q.qsize() == 2
+
+    @pytest.mark.asyncio
+    async def test_terminal_event_times_out_and_survives(self):
+        """终态事件（Finding 1 修复验证）：消费者永久离线时终态事件在超时后放弃，
+        Orchestrator 不会因此挂死。事件已落 DB（DB session factory 时）。"""
+        from app.services.agent.event_manager import EventManager
+
+        mgr = EventManager(db_session_factory=None)
+        task_id = "t_term"
+        mgr._event_queues[task_id] = asyncio.Queue(maxsize=1)
+        q = mgr._event_queues[task_id]
+        q.put_nowait({"filler": True})
+        assert q.full()
+
+        # 缩短终态超时便于测试
+        mgr.TERMINAL_PUT_TIMEOUT_SECONDS = 0.5
+
+        start = asyncio.get_event_loop().time()
+        await mgr.add_event(task_id, "task_complete", sequence=1)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        # 大约等待 0.5 秒后放弃（Wave 2 Review Finding 1 关键：不会永久挂死）
+        assert 0.4 < elapsed < 1.5, (
+            f"预期终态事件超时 ~0.5s 后放弃，实际 {elapsed:.2f}s；"
+            "若 >1.5s 说明 Orchestrator 可能挂死"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_event_enqueues_when_space_available(self):
+        """终态事件在队列有空间时正常入队（正常路径）"""
+        from app.services.agent.event_manager import EventManager
+
+        mgr = EventManager(db_session_factory=None)
+        task_id = "t_term_ok"
+        mgr._event_queues[task_id] = asyncio.Queue(maxsize=5)
+        q = mgr._event_queues[task_id]
+
+        await mgr.add_event(task_id, "task_complete", sequence=1)
+        assert q.qsize() == 1
+        got = q.get_nowait()
+        assert got["event_type"] == "task_complete"

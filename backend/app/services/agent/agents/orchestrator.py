@@ -1332,7 +1332,19 @@ Action Input: {{"参数": "值"}}
 
         while True:
             try:
-                await registry.set_alive(task_id, event_manager_local=True)
+                # Wave 2 Review Finding 2: 单次 set_alive 加 2s 超时，避免 Redis 慢
+                # 时 finally 块 cancel 心跳后 await 阻塞过久，拖慢 pause/异常响应
+                await asyncio.wait_for(
+                    registry.set_alive(task_id, event_manager_local=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[Orchestrator] Alive heartbeat set_alive timed out (>2s) for task {task_id}"
+                )
+            except asyncio.CancelledError:
+                # 取消发生在 set_alive 中：立即退出，不继续循环
+                return
             except Exception as e:
                 # 单次失败不阻断心跳循环（内部已 fallback）
                 logger.debug(f"[Orchestrator] Alive heartbeat set_alive error: {e}")
