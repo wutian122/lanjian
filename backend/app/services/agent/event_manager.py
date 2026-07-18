@@ -476,15 +476,19 @@ class EventManager:
                 if "type" in evt and "event_type" not in evt:
                     evt["event_type"] = evt["type"]
 
-                # 达到累计上限保护，yield notice 事件后停止回补
+                # 达到累计上限保护，yield notice 事件后停止回补。
+                # 注意：字段 `sent` 表示"已成功回补数"（= max_events），
+                # 不是"被丢弃数"—— 后者需额外 COUNT 查询才能精确得知，
+                # 前端可推断"至少还有更多事件未回补，需通过 after_sequence 手动拉取"。
                 if total >= max_events:
                     yield {
                         "event_type": "notice",
                         "sequence": cursor,
                         "metadata": {
                             "kind": "backfill_truncated",
-                            "dropped": total,
+                            "sent": total,
                             "limit": max_events,
+                            "after_sequence": cursor,
                         },
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }

@@ -57,7 +57,7 @@
 
 #### Scenario: 达到保护上限时截断
 - **WHEN** 断连期间累积事件超过 `max_backfill_events=20000`
-- **THEN** 回补最多发送 20000 条最新事件；后端日志 WARNING 记录被截断的事件数；发送一条 `event: notice\ndata: {"kind": "backfill_truncated", "dropped": ...}` 提示客户端
+- **THEN** 回补最多发送 20000 条最新事件；后端日志 WARNING 记录被截断的事件数；发送一条 `event: notice\ndata: {"kind": "backfill_truncated", "sent": 20000, "limit": 20000, "after_sequence": N}` 提示客户端。客户端 SHALL 用 `after_sequence` 值继续拉取或提示用户"部分历史事件未回补"
 
 ### Requirement: 事件队列有界与分级丢弃
 

@@ -58,3 +58,59 @@ class TestSSETerminalStatuses:
         assert AgentTaskStatus.FAILED in _SSE_TERMINAL_STATUSES
         assert AgentTaskStatus.CANCELLED in _SSE_TERMINAL_STATUSES
         assert AgentTaskStatus.PAUSED in _SSE_TERMINAL_STATUSES
+
+    def test_exhaustive_status_partition(self):
+        """穷举划分：遍历 AgentTaskStatus 所有常量，逐一确认终态/非终态归属。
+
+        若未来在 AgentTaskStatus 新增常量，本测试必须失败（强制维护者显式
+        决定新状态是否属于终态），防止 _SSE_TERMINAL_STATUSES 遗漏。
+        """
+        from app.api.v1.endpoints.agent_tasks import _SSE_TERMINAL_STATUSES
+        from app.models.agent_task import AgentTaskStatus
+
+        # 期望的完整分区，覆盖 AgentTaskStatus 所有当前常量
+        expected_terminal = {
+            "completed",
+            "completed_with_gaps",
+            "failed",
+            "cancelled",
+            "paused",
+        }
+        expected_non_terminal = {
+            "pending",
+            "initializing",
+            "running",
+            "planning",
+            "indexing",
+            "analyzing",
+            "verifying",
+            "reporting",
+        }
+        expected_all = expected_terminal | expected_non_terminal
+
+        # 通过反射收集 AgentTaskStatus 全部 str 常量
+        actual_all = {
+            v for k, v in vars(AgentTaskStatus).items()
+            if not k.startswith("_") and isinstance(v, str)
+        }
+
+        # 若新增了常量，这里会失败并给出提示
+        missing = actual_all - expected_all
+        extra = expected_all - actual_all
+        assert not missing, (
+            f"AgentTaskStatus 新增了未在测试预期分区中的常量: {sorted(missing)}。"
+            f"请显式决定这些新状态是否属于终态并同步更新 _SSE_TERMINAL_STATUSES 与本测试。"
+        )
+        assert not extra, (
+            f"测试预期的常量在 AgentTaskStatus 中不存在（可能已被删除）: {sorted(extra)}"
+        )
+
+        # 逐一断言分区正确性
+        for status in expected_terminal:
+            assert status in _SSE_TERMINAL_STATUSES, (
+                f"终态 {status!r} 缺失于 _SSE_TERMINAL_STATUSES"
+            )
+        for status in expected_non_terminal:
+            assert status not in _SSE_TERMINAL_STATUSES, (
+                f"非终态 {status!r} 错误地包含在 _SSE_TERMINAL_STATUSES 中"
+            )

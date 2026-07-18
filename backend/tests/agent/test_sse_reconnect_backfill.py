@@ -162,23 +162,29 @@ class TestSSEReconnectBackfill:
         ]
 
         # RED 断言：当前实现仅回补 500 条，远小于 20000 上限
-        assert len(db_yielded) <= 20000, (
-            f"Bug: 预期最多回补 20000 条，实际 {len(db_yielded)} 条。"
-            f" 当前缺少上限保护。"
+        assert len(db_yielded) == 20000, (
+            f"Bug: 预期恰好回补 20000 条（触发上限），实际 {len(db_yielded)} 条。"
         )
 
         # RED 断言：当前实现不会发送 notice 事件
-        assert len(notice_events) >= 1, (
-            "Bug: 预期回补截断时发送 notice/backfill_truncated 事件，"
-            " 当前实现未发送。"
+        assert len(notice_events) == 1, (
+            f"预期恰好 1 个 notice/backfill_truncated 事件，实际 {len(notice_events)} 个"
         )
 
-        # 额外验证：notice 事件包含 dropped 字段
-        if notice_events:
-            notice = notice_events[0]
-            assert "dropped" in notice.get("metadata", {}), (
-                "notice 事件 metadata 应包含 dropped 字段"
-            )
-            assert notice["metadata"]["dropped"] > 0, (
-                "dropped 数量应大于 0"
-            )
+        # 严格验证 notice 事件字段语义（防止字段名 dropped/sent 混淆再次出现）
+        notice = notice_events[0]
+        meta = notice.get("metadata", {})
+        assert meta.get("sent") == 20000, (
+            f"notice.metadata.sent 应等于已成功回补数 20000，实际 {meta.get('sent')}"
+        )
+        assert meta.get("limit") == 20000, (
+            f"notice.metadata.limit 应等于配置的 max_events 20000，实际 {meta.get('limit')}"
+        )
+        assert meta.get("after_sequence") == 20000, (
+            f"notice.metadata.after_sequence 应等于最后回补的 sequence 20000，"
+            f"实际 {meta.get('after_sequence')}"
+        )
+        # 明确不再期望有 dropped 字段（该字段语义误导，已移除）
+        assert "dropped" not in meta, (
+            "notice.metadata 不应含 dropped 字段（语义误导，已改为 sent）"
+        )
