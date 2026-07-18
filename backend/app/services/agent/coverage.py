@@ -71,7 +71,7 @@ COVERAGE_DIMENSIONS: tuple[CoverageDimension, ...] = (
     CoverageDimension(
         "D8",
         "config",
-        ("sensitive_data_exposure",),
+        ("sensitive_data_exposure", "security_misconfiguration", "config", "misconfiguration"),
         ("cors", "debug", "config", "allow_origins"),
     ),
     CoverageDimension(
@@ -83,7 +83,7 @@ COVERAGE_DIMENSIONS: tuple[CoverageDimension, ...] = (
     CoverageDimension(
         "D10",
         "supply_chain",
-        ("dependency",),
+        ("dependency", "supply_chain", "outdated_dependency", "vulnerable_dependency"),
         ("package.json", "requirements.txt", "pom.xml", "npm_audit", "safety", "osv"),
     ),
 )

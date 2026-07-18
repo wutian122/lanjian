@@ -38,6 +38,7 @@ from app.services.git_ssh_service import GitSSHOperations
 from app.core.encryption import decrypt_sensitive_data
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.llm.service import LLMService
+from app.services.agent.agents.base import AgentResult
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -206,7 +207,9 @@ class AgentFindingResponse(BaseModel):
     
     suggestion: Optional[str] = None
     poc: Optional[dict] = None
-    
+    sandbox_attempts: Optional[List[dict]] = None
+    verification_status: Optional[str] = None
+
     created_at: datetime
     
     model_config = {
@@ -261,6 +264,106 @@ def is_task_cancelled(task_id: str) -> bool:
     """检查任务是否已被取消"""
     return task_id in _cancelled_tasks
 
+
+async def _re_audit_task(task_id: str, finding_ids: list[str]):
+    """Bug E: Re-run verification only for specified unverified findings.
+
+    Uses the existing _execute_agent_task resume mechanism by creating
+    a checkpoint that instructs the Orchestrator to dispatch Verification
+    for the specified findings.
+    """
+    logger.info(f"[ReAudit] Starting re-audit for task {task_id}, {len(finding_ids)} findings")
+    try:
+        async with async_session_factory() as db:
+            task = await db.get(AgentTask, task_id)
+            if not task:
+                logger.error(f"[ReAudit] Task {task_id} not found")
+                return
+
+            # Load unverified findings from DB
+            result = await db.execute(
+                select(AgentFinding).where(AgentFinding.id.in_(finding_ids))
+            )
+            db_findings = result.scalars().all()
+
+            if not db_findings:
+                logger.info("[ReAudit] No findings to verify")
+                task.status = AgentTaskStatus.COMPLETED
+                await db.commit()
+                return
+
+            # Build finding summaries for the verification task
+            finding_summaries = []
+            for f in db_findings:
+                finding_summaries.append(
+                    f"{f.file_path or 'unknown'}:{f.line_start or 0} "
+                    f"[{f.vulnerability_type}] {f.title or ''}"
+                )
+            finding_list_str = "\n".join(finding_summaries)
+
+            # Create a checkpoint with re-audit instructions
+            import json as _json
+            resume_state = {
+                "all_findings": [
+                    {
+                        "id": f.id,
+                        "title": f.title,
+                        "vulnerability_type": f.vulnerability_type,
+                        "severity": f.severity,
+                        "file_path": f.file_path,
+                        "line_start": f.line_start,
+                        "line_end": f.line_end,
+                        "code_snippet": f.code_snippet,
+                        "description": f.description,
+                        "is_verified": False,
+                        "verification_status": None,
+                    }
+                    for f in db_findings
+                ],
+                "_re_audit_mode": True,
+                "_re_audit_finding_ids": finding_ids,
+            }
+
+            checkpoint = AgentCheckpoint(
+                id=str(uuid4()),
+                task_id=task_id,
+                agent_id="re_audit",
+                agent_name="ReAudit",
+                agent_type="orchestrator",
+                iteration=0,
+                status="paused",
+                total_tokens=0,
+                tool_calls=0,
+                findings_count=len(finding_ids),
+                checkpoint_type="manual",
+                checkpoint_name="re_audit",
+                state_data=_json.dumps(resume_state, default=str),
+                checkpoint_metadata={"re_audit_finding_ids": finding_ids, "resume_state": resume_state},
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(checkpoint)
+            await db.flush()
+
+            task.last_checkpoint_id = checkpoint.id
+            task.status = AgentTaskStatus.RUNNING
+            task.paused = False
+            task.resume_count = int(getattr(task, "resume_count", 0) or 0) + 1
+            await db.commit()
+
+            checkpoint_id = checkpoint.id
+
+        # Launch the standard execution with resume from checkpoint
+        asyncio.create_task(_execute_agent_task(task_id, resume_checkpoint_id=checkpoint_id))
+        logger.info(f"[ReAudit] Task {task_id} launched with checkpoint {checkpoint_id}")
+
+    except Exception as e:
+        logger.error(f"[ReAudit] Outer error: {e}", exc_info=True)
+        async with async_session_factory() as db:
+            task = await db.get(AgentTask, task_id)
+            if task:
+                task.status = AgentTaskStatus.COMPLETED_WITH_GAPS
+                task.last_error_code = "re_audit_failed"
+                await db.commit()
 
 async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] = None):
     """
@@ -322,6 +425,11 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
 
             # 🔥 发送任务开始事件 - 使用 phase_start 让前端知道进入准备阶段
             await event_emitter.emit_phase_start("preparation", f"🚀 任务开始执行: {project.name}")
+
+            # Init progress: set status to INITIALIZING so frontend shows progress
+            task.status = AgentTaskStatus.INITIALIZING
+            await db.commit()
+            await event_emitter.emit_info("Docker sandbox ready", metadata={"init_step": "Docker sandbox", "init_status": "done"})
 
             resume_state = None
             if resume_checkpoint_id:
@@ -447,6 +555,8 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
                     task.target_files = valid_target_files
 
             logger.info(f"🚀 Task {task_id} started with Dynamic Agent Tree architecture")
+            await event_emitter.emit_info("Code indexing complete", metadata={"init_step": "Indexing code", "init_status": "done"})
+            await event_emitter.emit_info("Preparing AI agents", metadata={"init_step": "Preparing agents", "init_status": "start"})
 
             # 🔥 获取项目根目录后检查取消
             if is_task_cancelled(task_id):
@@ -519,6 +629,8 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
                 llm_rate_per_minute=task_rpm,
             )
 
+            await event_emitter.emit_info("AI agents ready", metadata={"init_step": "Preparing agents", "init_status": "done"})
+            await event_emitter.emit_info("Starting audit engine", metadata={"init_step": "Starting audit", "init_status": "start"})
             # 创建 Orchestrator Agent
             orchestrator = OrchestratorAgent(
                 llm_service=llm_service,
@@ -560,6 +672,7 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
             
             await event_emitter.emit_info("🧠 动态 Agent 树架构启动")
             await event_emitter.emit_info(f"📁 项目路径: {project_root}")
+            await event_emitter.emit_info("Project files ready", metadata={"init_step": "Extracting project", "init_status": "done"})
             
             # 收集项目信息 - 传递排除模式和目标文件
             project_info = await _collect_project_info(
@@ -599,7 +712,28 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
             _running_asyncio_tasks[task_id] = run_task
             
             try:
-                result = await run_task
+                # Fix: 总体超时保护，防止任务无限运行
+                task_timeout = task.timeout_seconds or 1800
+                try:
+                    result = await asyncio.wait_for(run_task, timeout=task_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[AgentTask] Task {task_id} timed out after {task_timeout}s, cancelling and marking as COMPLETED_WITH_GAPS")
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    await event_emitter.emit_event("warning", f"任务超时（{task_timeout}秒），已强制结束并保存已有发现")
+                    # 构造超时结果，保存已有发现
+                    result = AgentResult(
+                        success=True,
+                        data={"findings": getattr(orchestrator, '_all_findings', [])},
+                        iterations=getattr(orchestrator, '_iteration', 0),
+                        tool_calls=getattr(orchestrator, '_tool_calls', 0),
+                        tokens_used=getattr(orchestrator, '_total_tokens', 0) + getattr(orchestrator, '_sub_agent_total_tokens', 0),
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        metadata={"coverage_bypassed": True, "coverage_info": {"reason": "task_timeout", "timeout_seconds": task_timeout}},
+                    )
             except AgentExecutionPaused as e:
                 task.status = AgentTaskStatus.PAUSED
                 task.paused = True
@@ -1575,6 +1709,7 @@ async def _save_findings(
                 poc_steps=poc_steps,
                 verification_method=verification_method,
                 verification_result=verification_result,
+                sandbox_attempts=finding.get("sandbox_attempts"),
                 cvss_score=cvss_score,
                 # References for CWE
                 references=[{"cwe": cwe_id}] if cwe_id else None,
@@ -2311,6 +2446,99 @@ async def resume_agent_task(
         "message": "任务已继续",
         "task_id": task_id,
         "checkpoint_id": checkpoint_id,
+    }
+
+
+@router.post("/{task_id}/re-audit")
+async def re_audit_agent_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Bug E: Re-audit completed_with_gaps task - re-run verification on unverified findings."""
+    task = await db.get(AgentTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    project = await db.get(Project, task.project_id)
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="no permission")
+
+    if task.status != AgentTaskStatus.COMPLETED_WITH_GAPS:
+        raise HTTPException(
+            status_code=400,
+            detail="only completed_with_gaps tasks can be re-audited"
+        )
+
+    # Find unverified findings
+    unverified_result = await db.execute(
+        select(AgentFinding)
+        .where(AgentFinding.task_id == task_id)
+        .where(AgentFinding.is_verified == False)
+    )
+    unverified_findings = unverified_result.scalars().all()
+    if not unverified_findings:
+        raise HTTPException(
+            status_code=400,
+            detail="all findings already verified"
+        )
+
+    task.status = AgentTaskStatus.RUNNING
+    task.paused = False
+    task.resume_count = int(getattr(task, "resume_count", 0) or 0) + 1
+    await db.commit()
+
+    asyncio.create_task(
+        _re_audit_task(task_id, [f.id for f in unverified_findings])
+    )
+
+    return {
+        "message": "re-audit started",
+        "task_id": task_id,
+        "unverified_count": len(unverified_findings),
+    }
+
+
+@router.post("/{task_id}/recover")
+async def recover_stale_agent_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Bug F: Recover stale running task (process died but DB status not updated)."""
+    task = await db.get(AgentTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    project = await db.get(Project, task.project_id)
+    if not project or project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="no permission")
+
+    if task.status != AgentTaskStatus.RUNNING:
+        raise HTTPException(
+            status_code=400,
+            detail="only running tasks can be recovered"
+        )
+
+    # Check if orchestrator is actually running
+    orchestrator = _running_orchestrators.get(task_id)
+    if orchestrator:
+        raise HTTPException(
+            status_code=400,
+            detail="task is actually running, no recovery needed"
+        )
+
+    # Stale running: process died but DB status not updated
+    task.status = AgentTaskStatus.PAUSED
+    task.paused = True
+    task.paused_at = datetime.now(timezone.utc)
+    task.pause_reason = "stale_running_recovered"
+    task.last_error_code = "stale_running"
+    await db.commit()
+
+    return {
+        "message": "task recovered to paused state, can resume",
+        "task_id": task_id,
     }
 
 

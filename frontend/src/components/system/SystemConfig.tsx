@@ -1069,13 +1069,13 @@ export function SystemConfig() {
               <div className={`relative overflow-hidden rounded-xl border-2 transition-all duration-300 ${
                 config.sandboxNetworkEnabled
                   ? 'border-green-400/60 bg-gradient-to-br from-green-50 to-emerald-50 dark:from-green-950/30 dark:to-emerald-950/20 dark:border-green-600/40'
-                  : 'border-border bg-card hover:border-muted-foreground/30'
+                  : 'border-red-200/60 bg-gradient-to-br from-red-50/50 to-orange-50/30 dark:from-red-950/20 dark:to-orange-950/10 dark:border-red-800/30'
               }`}>
                 {/* Decorative background circle */}
                 <div className={`absolute -right-6 -top-6 h-24 w-24 rounded-full transition-all duration-500 ${
                   config.sandboxNetworkEnabled
                     ? 'bg-green-400/10 scale-100'
-                    : 'bg-muted/20 scale-75'
+                    : 'bg-red-400/10 scale-100'
                 }`} />
 
                 <div className="relative flex items-center justify-between p-5">
@@ -1083,7 +1083,7 @@ export function SystemConfig() {
                     <div className={`flex h-11 w-11 items-center justify-center rounded-xl transition-all duration-300 ${
                       config.sandboxNetworkEnabled
                         ? 'bg-green-500 text-white shadow-lg shadow-green-500/25'
-                        : 'bg-muted text-muted-foreground'
+                        : 'bg-red-100 dark:bg-red-950/40 text-red-500 dark:text-red-400 border border-red-200 dark:border-red-800/50'
                     }`}>
                       {config.sandboxNetworkEnabled ? (
                         <Wifi className="h-5 w-5" />
@@ -1097,10 +1097,10 @@ export function SystemConfig() {
                         <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium transition-colors duration-300 ${
                           config.sandboxNetworkEnabled
                             ? 'bg-green-500/15 text-green-700 dark:text-green-400'
-                            : 'bg-muted text-muted-foreground'
+                            : 'bg-red-500/15 text-red-700 dark:text-red-400'
                         }`}>
                           <span className={`inline-block h-1.5 w-1.5 rounded-full ${
-                            config.sandboxNetworkEnabled ? 'bg-green-500 animate-pulse' : 'bg-muted-foreground/50'
+                            config.sandboxNetworkEnabled ? 'bg-green-500 animate-pulse' : 'bg-red-500'
                           }`} />
                           {config.sandboxNetworkEnabled ? '已开启' : '已关闭'}
                         </span>
@@ -1111,7 +1111,7 @@ export function SystemConfig() {
                   <Switch
                     checked={config.sandboxNetworkEnabled}
                     onCheckedChange={(v) => updateConfig('sandboxNetworkEnabled', v)}
-                    className="data-[state=checked]:bg-green-500"
+                    className="data-[state=checked]:bg-green-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600 data-[state=unchecked]:border-gray-300 dark:data-[state=unchecked]:border-gray-600"
                   />
                 </div>
               </div>

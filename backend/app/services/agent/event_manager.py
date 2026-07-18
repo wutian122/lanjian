@@ -503,7 +503,34 @@ class EventManager:
             logger.info(f"[StreamEvents] Task {task_id}: Terminal event seen, exiting stream")
             return
 
-        # 🔥 进入实时循环前，记录队列状态
+        # 🔥 DB 回补：重连时内存队列中可能已无事件，但 DB 中存在 after_sequence 之后的事件
+        # 从 DB 查询断连期间未送达的事件，按序补发给前端
+        if self.db_session_factory:
+            try:
+                db_events = await self.get_events(task_id, after_sequence=after_sequence, limit=500)
+                if db_events:
+                    # 转换格式：to_sse_dict 返回 'type'，统一为 'event_type'
+                    db_backfill_count = 0
+                    for db_evt in db_events:
+                        # 统一为内存事件格式
+                        if "type" in db_evt and "event_type" not in db_evt:
+                            db_evt["event_type"] = db_evt["type"]
+                        yield db_evt
+                        db_backfill_count += 1
+                        # 更新 after_sequence 以便后续实时循环不重复发送
+                        seq = db_evt.get("sequence", 0)
+                        if seq > after_sequence:
+                            after_sequence = seq
+                        # 检查终端事件
+                        if db_evt.get("event_type") in ["task_complete", "task_error", "task_cancel"]:
+                            logger.info(f"[StreamEvents] Task {task_id}: Terminal event during DB backfill, exiting")
+                            return
+                    if db_backfill_count > 0:
+                        logger.info(f"[StreamEvents] Task {task_id}: DB backfilled {db_backfill_count} events (after_sequence now={after_sequence})")
+            except Exception as db_err:
+                logger.warning(f"[StreamEvents] Task {task_id}: DB backfill failed (non-fatal): {db_err}")
+
+        # 🔥 进入实时循环前，记录队列状态（DB 回补之后，因为回补期间生产者可能添加新事件）
         remaining = queue.qsize()
         logger.info(f"[StreamEvents] Task {task_id}: Entering real-time loop, remaining in queue: {remaining}")
 

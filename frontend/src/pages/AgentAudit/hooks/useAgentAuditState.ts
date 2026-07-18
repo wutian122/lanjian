@@ -7,6 +7,7 @@ import { useReducer, useCallback, useMemo, useRef } from "react";
 import type {
   AgentAuditState,
   AgentAuditAction,
+  InitStep,
   LogItem,
   AgentTask,
   AgentFinding,
@@ -23,6 +24,7 @@ const initialState: AgentAuditState = {
   findings: [],
   agentTree: null,
   logs: [],
+  initSteps: [] as InitStep[],
   selectedAgentId: null,
   showAllLogs: true,
   isLoading: false,
@@ -199,6 +201,20 @@ function agentAuditReducer(state: AgentAuditState, action: AgentAuditAction): Ag
       return { ...state, logs: updatedLogs };
     }
 
+    case 'ADD_INIT_STEP': {
+      const step = action.payload;
+      const existing = state.initSteps.find(s => s.name === step.name);
+      if (existing) {
+        return {
+          ...state,
+          initSteps: state.initSteps.map(s =>
+            s.name === step.name ? { ...s, status: step.status } : s
+          ),
+        };
+      }
+      return { ...state, initSteps: [...state.initSteps, step] };
+    }
+
     case 'RESET':
       return { ...initialState };
 
@@ -314,8 +330,21 @@ export function useAgentAuditState() {
     return state.task?.status === 'running' || state.task?.status === 'pending';
   }, [state.task?.status]);
 
+  const isInitializing = useMemo(() => {
+    const status = state.task?.status;
+    return status === 'pending' || status === 'initializing';
+  }, [state.task?.status]);
+
   const isPaused = useMemo(() => {
     return state.task?.status === 'paused';
+  }, [state.task?.status]);
+
+  const canReAudit = useMemo(() => {
+    return state.task?.status === 'completed_with_gaps';
+  }, [state.task?.status]);
+
+  const canRecover = useMemo(() => {
+    return state.task?.status === 'running';
   }, [state.task?.status]);
 
   const isComplete = useMemo(() => {
@@ -329,8 +358,11 @@ export function useAgentAuditState() {
     treeNodes,
     filteredLogs,
     isRunning,
+    isInitializing,
     isPaused,
     isComplete,
+    canReAudit,
+    canRecover,
 
     // Actions
     setTask,

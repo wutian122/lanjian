@@ -19,6 +19,8 @@ import {
   getAgentFindings,
   pauseAgentTask,
   resumeAgentTask,
+  reAuditAgentTask,
+  recoverAgentTask,
   getAgentTree,
   getAgentEvents,
   AgentEvent,
@@ -28,6 +30,7 @@ import CreateAgentTaskDialog from "@/components/agent/CreateAgentTaskDialog";
 
 // Local imports
 import {
+  InitProgress,
   SplashScreen,
   Header,
   LogEntry,
@@ -49,7 +52,8 @@ function AgentAuditPageContent() {
   const {
     task, findings, agentTree, logs, selectedAgentId, showAllLogs,
     isLoading, connectionStatus, isAutoScroll, expandedLogIds,
-    treeNodes, filteredLogs, isRunning, isPaused, isComplete,
+    treeNodes, filteredLogs, isRunning, isInitializing, isPaused, isComplete, canReAudit, canRecover,
+    initSteps,
     setTask, setFindings, setAgentTree, addLog, updateLog, removeLog,
     selectAgent, setLoading, setConnectionStatus, setAutoScroll, toggleLogExpanded,
     setCurrentAgentName, getCurrentAgentName, setCurrentThinkingId, getCurrentThinkingId,
@@ -520,6 +524,16 @@ function AgentAuditPageContent() {
       // 🔥 处理 info、warning、error 类型事件（克隆进度、索引进度等）
       const infoEvents = ['info', 'warning', 'error', 'progress'];
       if (infoEvents.includes(event.type)) {
+        // Handle init step events
+        if (event.metadata?.init_step) {
+          dispatch({
+            type: 'ADD_INIT_STEP',
+            payload: {
+              name: event.metadata.init_step as string,
+              status: (event.metadata.init_status as 'start' | 'done') || 'start',
+            }
+          });
+        }
         const message = event.message || event.type;
 
         // 🔥 检测进度类型消息，使用更新而不是添加
@@ -775,7 +789,8 @@ function AgentAuditPageContent() {
   // Stream connection - 🔥 在历史事件加载完成后连接
   useEffect(() => {
     // 等待历史事件加载完成，且任务正在运行
-    if (!taskId || !task?.status || task.status !== 'running') return;
+    if (!taskId || !task?.status) return;
+    if (!['pending', 'initializing', 'running'].includes(task.status)) return;
 
     // 🔥 使用 state 变量确保在历史事件加载完成后才连接
     if (!historicalEventsLoaded) return;
@@ -888,6 +903,37 @@ function AgentAuditPageContent() {
       dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `暂停失败: ${errorMessage}` } });
     } finally {
       setIsPausing(false);
+    }
+  };
+
+  const [isReAuditing, setIsReAuditing] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
+
+  const handleReAudit = async () => {
+    if (!taskId) return;
+    setIsReAuditing(true);
+    try {
+      const result = await reAuditAgentTask(taskId);
+      toast.success(result.message || 'Re-audit started');
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      toast.error('Re-audit failed: ' + errorMessage);
+    } finally {
+      setIsReAuditing(false);
+    }
+  };
+
+  const handleRecover = async () => {
+    if (!taskId) return;
+    setIsRecovering(true);
+    try {
+      const result = await recoverAgentTask(taskId);
+      toast.success(result.message || 'Task recovered');
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      toast.error('Recovery failed: ' + errorMessage);
+    } finally {
+      setIsRecovering(false);
     }
   };
 
@@ -1023,6 +1069,16 @@ function AgentAuditPageContent() {
     );
   }
 
+  if (isInitializing && task) {
+    return (
+      <div className="h-screen bg-background flex items-center justify-center relative overflow-hidden">
+        <div className="absolute inset-0 cyber-grid opacity-30" />
+        <div className="absolute inset-0 vignette pointer-events-none" />
+        <InitProgress steps={initSteps} />
+      </div>
+    );
+  }
+
   return (
     <div className="h-full bg-background flex flex-col overflow-hidden relative">
 
@@ -1077,6 +1133,34 @@ function AgentAuditPageContent() {
             </div>
             <Button size="sm" onClick={handleResume} disabled={isResuming}>
               {isResuming ? "继续中..." : "继续执行"}
+            </Button>
+          </div>
+        )}
+
+        {canReAudit && (
+          <div className="absolute top-0 left-0 right-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-blue-600" />
+              <span className="text-sm text-blue-700">
+                {"任务已完成但存在未验证的漏洞，可补充审计。"}
+              </span>
+            </div>
+            <Button size="sm" onClick={handleReAudit} disabled={isReAuditing}>
+              {isReAuditing ? "审计中..." : "补充审计"}
+            </Button>
+          </div>
+        )}
+
+        {canRecover && !isRunning && (
+          <div className="absolute top-0 left-0 right-0 z-10 bg-red-50 border-b border-red-200 px-4 py-2 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-600" />
+              <span className="text-sm text-red-700">
+                {"任务可能已断开，点击恢复后可继续执行。"}
+              </span>
+            </div>
+            <Button size="sm" onClick={handleRecover} disabled={isRecovering}>
+              {isRecovering ? "恢复中..." : "恢复任务"}
             </Button>
           </div>
         )}

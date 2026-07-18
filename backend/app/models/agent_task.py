@@ -393,6 +393,7 @@ class AgentFinding(Base):
     verification_method = Column(Text, nullable=True)
     verification_result = Column(JSON, nullable=True)
     verified_at = Column(DateTime(timezone=True), nullable=True)
+    sandbox_attempts = Column(JSON, nullable=True)  # [{tool, success, exit_code, command, evidence_summary, ...}]
     
     # PoC
     has_poc = Column(Boolean, default=False)
@@ -475,6 +476,7 @@ class AgentFinding(Base):
             "fix_code": self.fix_code,
             "ai_explanation": self.ai_explanation,
             "ai_confidence": self.ai_confidence,
+            "verification_status": self.verification_status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

@@ -269,6 +269,7 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_force_verified: bool = False  # P3: Semgrep 发现是否已强制通过验证门禁
         self._semgrep_hot_files: list[str] = []
         self._semgrep_findings: list[dict[str, Any]] = []
+        self._full_verification_dispatched: bool = False
 
         self._pause_requested: bool = False
         self._pause_future: asyncio.Future[str] | None = None
@@ -434,21 +435,26 @@ class OrchestratorAgent(BaseAgent):
         )
 
     def _has_valid_sandbox_evidence(self) -> bool:
-        """检查是否至少有一条发现具有有效沙箱验证证据。"""
+        """检查是否至少有一条发现具有有效沙箱验证证据。
+
+        Bug C fix: removed is_verified=True bypass. Only accept:
+        1. confirmed with actual sandbox_attempts evidence, or
+        2. static_confirmed (code reasoning, B3 strict standard)
+        """
         for finding in self._all_findings:
             if not isinstance(finding, dict):
                 continue
             if finding.get("verification_status") == "confirmed":
-                return True
-            sandbox_attempts = finding.get("sandbox_attempts", [])
-            if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
-                has_success = any(
-                    isinstance(a, dict) and a.get("success") is True and a.get("exit_code") == 0
-                    for a in sandbox_attempts
-                )
-                if has_success:
-                    return True
-            if finding.get("is_verified") is True:
+                sandbox_attempts = finding.get("sandbox_attempts", [])
+                if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
+                    has_success = any(
+                        isinstance(a, dict) and a.get("success") is True and a.get("exit_code") == 0
+                        for a in sandbox_attempts
+                    )
+                    if has_success:
+                        return True
+                # Bug C fix: confirmed without sandbox evidence is not enough
+            if finding.get("verification_status") == "static_confirmed":
                 return True
         return False
 
@@ -905,6 +911,38 @@ Action Input: {{"参数": "值"}}
                         })
                         continue
 
+                    # Bug D fix: 全量验证门禁 - 确保所有 findings 都被发送给 Verification
+                    unverified_findings = [
+                        f for f in self._all_findings
+                        if not f.get("verification_status")
+                        and f.get("is_verified") is not True
+                    ]
+                    if unverified_findings and verification_count > 0 and not self._full_verification_dispatched:
+                        self._full_verification_dispatched = True
+                        await self.emit_event(
+                            "warning",
+                            f"⚠️ 发现 {len(unverified_findings)} 个未验证的漏洞，强制调度 Verification"
+                        )
+                        unverified_summary = "\n".join(
+                            f"- {f.get('file_path', '?')}:{f.get('line_start', 0)} "
+                            f"[{f.get('vulnerability_type', '?')}] {f.get('title', '')[:60]}"
+                            for f in unverified_findings
+                        )
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": (
+                                f"⚠️ **全量验证门禁**: 你已发现 {len(self._all_findings)} 个漏洞，"
+                                f"但其中 {len(unverified_findings)} 个尚未经过沙箱验证。\n\n"
+                                f"未验证的漏洞:\n{unverified_summary}\n\n"
+                                "请立即调度 verification Agent 验证这些未验证的漏洞。\n"
+                                "Action: dispatch_agent\n"
+                                f"Action Input: {{\"agent\": \"verification\", "
+                                f"\"task\": \"验证剩余 {len(unverified_findings)} 个未验证的漏洞，"
+                                f"必须使用 sandbox_exec\"}}"
+                            ),
+                        })
+                        continue
+
                     # 🔥 P3: 覆盖率过低时，禁止无休止的 Verification 重试，优先补充 Analysis
                     coverage_check = self._evaluate_current_coverage()
                     if (coverage_check.covered_count < 4
@@ -934,8 +972,8 @@ Action Input: {{"参数": "值"}}
                         continue
 
                     coverage_report = self._evaluate_current_coverage()
-                    # ✅ FIX: 如果 auto-bypass 已触发（_hard_coverage_block_count >= 5），跳过软门禁
-                    if not coverage_report.is_sufficient and self._hard_coverage_block_count < 5:
+                    # ✅ FIX: 如果 auto-bypass 已触发（_hard_coverage_block_count >= 3），跳过软门禁
+                    if not coverage_report.is_sufficient and self._hard_coverage_block_count < 3:
                         round_context = RoundContext.from_coverage(
                             coverage_report,
                             previous_findings=self._all_findings,
@@ -962,13 +1000,13 @@ Action Input: {{"参数": "值"}}
                             coverage_matrix.mark_shallow(dim, evidence=f"grep: {pattern}")
                     hard_coverage = coverage_matrix.to_report()
 
-                    if len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 5:
+                    if len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 3:
                         self._hard_coverage_block_count += 1
                         try:
                             await self.emit_event(
                                 "warning",
                                 f"⚠️ 覆盖率不足：{hard_coverage.covered_count}/10，"
-                                f"D1/D2/D3 必须全部覆盖，要求补漏后再完成（第{self._hard_coverage_block_count}次拦截，最多5次）"
+                                f"D1/D2/D3 必须全部覆盖，要求补漏后再完成（第{self._hard_coverage_block_count}次拦截，最多3次）"
                             )
                         except Exception:
                             logger.warning("Failed to emit coverage warning event")
@@ -1019,7 +1057,7 @@ Action Input: {{"参数": "值"}}
                             ),
                         })
                         continue
-                    elif len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 5:
+                    elif len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 3:
                         logger.warning(
                             f"Coverage gate bypassed after {self._hard_coverage_block_count} blocks: "
                             f"{hard_coverage.covered_count}/10 covered"
@@ -1484,11 +1522,11 @@ Action Input: {{"参数": "值"}}
         # 🔥 检查是否重复调度同一个 Agent
         dispatch_count = self._dispatched_tasks.get(agent_name, 0)
         # 动态调度上限：覆盖率门禁拦截 ≥3 次时提升上限到 4，给 LLM 补漏机会
-        max_dispatch = 4 if self._hard_coverage_block_count >= 3 else 3
+        max_dispatch = 3
         if dispatch_count >= max_dispatch:
             # ✅ FIX: 当重复调度时，自动提升 _hard_coverage_block_count 到 5，放行 finish
-            if agent_name == "analysis" and self._hard_coverage_block_count < 5:
-                self._hard_coverage_block_count = 5
+            if agent_name == "analysis" and self._hard_coverage_block_count < 3:
+                self._hard_coverage_block_count = 3
                 logger.info(f"[Orchestrator] Analysis dispatched {dispatch_count} times, auto-bypassing coverage gate")
             return f"""## ⚠️ 重复调度警告
 
@@ -1892,7 +1930,22 @@ Action Input: {{"参数": "值"}}
                                 # 🔥 FIX: Smart merge - don't overwrite good data with empty values
                                 merged = dict(existing_f)  # Start with existing data
                                 for key, value in normalized_new.items():
-                                    # Only overwrite if new value is meaningful
+                                    # Bug B fix: is_verified uses explicit priority (Verification > Analysis)
+                                    # Python False == 0 is True, so the generic guard skips False values.
+                                    if key == "is_verified":
+                                        if normalized_new.get("verification_status") or normalized_new.get("verdict"):
+                                            merged[key] = value
+                                        continue
+                                    # Bug B fix: verification_status also uses explicit priority
+                                    if key == "verification_status":
+                                        if value is not None and value != "":
+                                            merged[key] = value
+                                        continue
+                                    # Bug B fix: sandbox_attempts merge (list, not scalar)
+                                    if key == "sandbox_attempts" and isinstance(value, list) and len(value) > 0:
+                                        merged[key] = (merged.get(key) or []) + value
+                                        continue
+                                    # Default: skip None/empty/zero
                                     if value is not None and value != "" and value != 0:
                                         merged[key] = value
                                     elif key not in merged or merged[key] is None:
@@ -1902,9 +1955,7 @@ Action Input: {{"参数": "值"}}
                                 # Keep the better title
                                 if normalized_new.get("title") and len(normalized_new.get("title", "")) > len(existing_f.get("title", "")):
                                     merged["title"] = normalized_new["title"]
-                                # Keep verified status if either is verified
-                                if existing_f.get("is_verified") or normalized_new.get("is_verified"):
-                                    merged["is_verified"] = True
+                                # Bug B fix: removed forced is_verified=True override; Verification priority handled in merge guard above
                                 # 🔥 FIX: Preserve non-zero line numbers
                                 if existing_f.get("line_start") and not normalized_new.get("line_start"):
                                     merged["line_start"] = existing_f["line_start"]

@@ -75,11 +75,17 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 're
 
 // ============ State Types ============
 
-export interface AgentAuditState {
+export interface InitStep {
+  name: string;
+  status: 'start' | 'done';
+}
+
+interface AgentAuditState {
   task: AgentTask | null;
   findings: AgentFinding[];
   agentTree: AgentTreeResponse | null;
   logs: LogItem[];
+  initSteps: InitStep[];
   selectedAgentId: string | null;
   showAllLogs: boolean;
   isLoading: boolean;
@@ -122,7 +128,8 @@ export type AgentAuditAction =
   | { type: 'SET_AUTO_SCROLL'; payload: boolean }
   | { type: 'TOGGLE_LOG_EXPANDED'; payload: string }
   | { type: 'COMPLETE_ALL_RUNNING_TOOLS' }
-  | { type: 'RESET' };
+  | { type: 'RESET' }
+  | { type: 'ADD_INIT_STEP'; payload: InitStep };
 
 // ============ Component Props ============
 
@@ -222,6 +229,18 @@ export interface StreamOptions {
   onFinding?: (finding: Record<string, unknown>) => void;
   onComplete?: () => void;
   onError?: (error: string) => void;
+}
+
+
+export interface SandboxAttempt {
+  tool: string;
+  success: boolean;
+  exit_code: number | null;
+  command: string;
+  evidence_summary: string;
+  target_ref?: string;
+  finding_id?: string;
+  weak_evidence?: boolean;
 }
 
 // Re-export from API

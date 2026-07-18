@@ -526,3 +526,12 @@ export async function downloadAgentReport(taskId: string, format: "markdown" | "
   window.URL.revokeObjectURL(url);
 }
 
+export async function reAuditAgentTask(taskId: string): Promise<{ message: string; task_id: string; unverified_count: number }> {
+  const response = await apiClient.post(`/agent-tasks/${taskId}/re-audit`);
+  return response.data;
+}
+
+export async function recoverAgentTask(taskId: string): Promise<{ message: string; task_id: string }> {
+  const response = await apiClient.post(`/agent-tasks/${taskId}/recover`);
+  return response.data;
+}

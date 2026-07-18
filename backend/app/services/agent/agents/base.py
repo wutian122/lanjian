@@ -828,7 +828,7 @@ class BaseAgent(ABC):
         """发射工具结果事件"""
         # 🔥 修复：确保 result 不为 None，避免显示 "None" 字符串
         safe_result = result if result and result != "None" else ""
-        tool_output_dict = {"result": safe_result[:2000] if safe_result else ""}  # 截断长输出
+        tool_output_dict = {"result": safe_result[:10000] if safe_result else ""}  # Opt-2: 增大截断到10000字符，保留完整沙箱输出
         await self.emit_event(
             "tool_result",
             f"[{self.name}] 工具 {tool_name} 完成 ({duration_ms}ms)",
@@ -903,7 +903,7 @@ class BaseAgent(ABC):
         result = await tool.execute(**kwargs)
         
         duration_ms = int((time.time() - start) * 1000)
-        await self.emit_tool_result(tool_name, str(result.data)[:500], duration_ms)
+        await self.emit_tool_result(tool_name, str(result.data), duration_ms)
         
         return result
     
@@ -1218,6 +1218,7 @@ class BaseAgent(ABC):
                 """包装工具执行，定期检查取消状态"""
                 # 创建工具执行任务
                 execute_task = asyncio.create_task(tool.execute(**tool_input))
+                _heartbeat_counter = 0
 
                 try:
                     # 使用循环定期检查取消状态
@@ -1237,6 +1238,14 @@ class BaseAgent(ABC):
                                 timeout=0.5  # 每0.5秒检查一次取消状态
                             )
                         except asyncio.TimeoutError:
+                            # Fix: 每 15 秒推送一次 tool_progress 心跳，防止前端误判断连
+                            _heartbeat_counter += 1
+                            if _heartbeat_counter % 30 == 0:  # 0.5s * 30 = 15s
+                                elapsed = int((time.time() - start))
+                                await self.emit_event(
+                                    "info",
+                                    f"⏳ {tool_name} 执行中... ({elapsed}s)"
+                                )
                             continue  # 继续循环检查
 
                     return await execute_task
@@ -1261,7 +1270,7 @@ class BaseAgent(ABC):
 
             duration_ms = int((time.time() - start) * 1000)
             # 🔥 修复：确保传递有意义的结果字符串，避免 "None"
-            result_preview = str(result.data)[:200] if result.data is not None else (result.error[:200] if result.error else "")
+            result_preview = str(result.data) if result.data is not None else (result.error if result.error else "")
             await self.emit_tool_result(tool_name, result_preview, duration_ms)
 
             # 🔥 工具执行后再次检查取消
@@ -1279,8 +1288,9 @@ class BaseAgent(ABC):
                         output += f"\n\n发现:\n{json.dumps(result.metadata['findings'][:10], ensure_ascii=False, indent=2)}"
 
                 # 截断过长输出
-                if len(output) > 6000:
-                    output = output[:6000] + f"\n\n... [输出已截断，共 {len(str(result.data))} 字符]"
+                # Fix: 与 emit_tool_result 的 10000 保持一致，确保 LLM 能看到完整沙箱输出
+                if len(output) > 10000:
+                    output = output[:10000] + f"\n\n... [输出已截断，共 {len(str(result.data))} 字符]"
                 return output
             else:
                 # 🔥 输出详细的错误信息，包括原始错误

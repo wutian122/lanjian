@@ -49,6 +49,14 @@ _VULN_TYPE_MAP = {
     "insecure_deserialization": "D4_deserialization",
     "broken_access_control": "D3_authz",
     "other": "D9_business_logic",
+    # Fix: 补充 Analysis Agent 实际产出的漏洞类型映射
+    "supply_chain": "D10_supply_chain",
+    "outdated_dependency": "D10_supply_chain",
+    "vulnerable_dependency": "D10_supply_chain",
+    "config": "D8_config",
+    "misconfiguration": "D8_config",
+    "prototype_pollution": "D1_injection",
+    "graphql_injection": "D1_injection",
 }
 
 # grep pattern → 维度映射（关键词 → 维度）

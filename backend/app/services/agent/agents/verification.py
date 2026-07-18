@@ -729,6 +729,8 @@ class VerificationAgent(BaseAgent):
         self.record_work(f"开始验证 {len(findings_to_verify)} 个漏洞发现")
 
         # 🔥 FIX: 为每个发现自动生成 sandbox_exec 命令
+        # P4 修复：将待验证 findings 存到 self._all_findings，供 _resolve_finding_id_from_command 反查
+        self._all_findings = findings_to_verify
         sandbox_commands = self._build_sandbox_commands(findings_to_verify)
         logger.info(f"[{self.name}] 已为 {len(sandbox_commands)} 个发现生成沙箱验证命令")
         # 准备沙箱文件挂载
@@ -931,7 +933,15 @@ class VerificationAgent(BaseAgent):
                     # 在第 904 行才赋值），否则 _count_skip_reasons 永远拿到 None → skip_reason 永不识别
                     skip_reasons = self._count_skip_reasons(step.final_answer)
                     effective_unverified = max(0, unverified_count - skip_reasons)
-                    if effective_unverified > 0 and (success_calls < total_to_verify or len(verified_indices) < total_to_verify) and self._iteration < self.config.max_iterations:
+                    # Fix: 弹性退出条件 - 当 sandbox_exec 总尝试次数超过 total_to_verify * 3 时，放行退出
+                    total_attempts = getattr(self, '_sandbox_exec_attempts', 0)
+                    elastic_exhausted = total_attempts >= max(total_to_verify * 3, 10)
+                    if elastic_exhausted and effective_unverified > 0:
+                        logger.info(
+                            f"[{self.name}] Elastic exit: {total_attempts} sandbox attempts for {total_to_verify} findings, allowing finish"
+                        )
+                        await self.emit_event("info", f"沙箱验证已达弹性上限（{total_attempts} 次尝试），允许完成")
+                    if effective_unverified > 0 and (success_calls < total_to_verify or len(verified_indices) < total_to_verify) and self._iteration < self.config.max_iterations and not elastic_exhausted:
                         logger.warning(
                             f"[{self.name}] LLM tried to finish with only {success_calls}/{total_to_verify} successful sandbox_exec "
                             f"(verified {len(verified_indices)}/{total_to_verify} findings)! Forcing more sandbox usage."
@@ -1369,6 +1379,17 @@ class VerificationAgent(BaseAgent):
         if not hasattr(self, "_sandbox_attempts"):
             self._sandbox_attempts = []
 
+        command = (action_input or {}).get("command") or ""
+
+        # Opt-1: Parse finding_id from command comment
+        finding_id_match = re.search(r"# FINDING_ID:(\S+)", command)
+        finding_id = finding_id_match.group(1) if finding_id_match else None
+
+        # P4 修复：LLM 自写 PoC 无 # FINDING_ID 注释时，反查 findings 显式绑定 finding_id
+        # 不再依赖命令文本注释，用命令中的 file_path/target_ref 反查 _sandbox_finding_id
+        if finding_id is None:
+            finding_id = self._resolve_finding_id_from_command(command)
+
         exit_code = None
         exit_match = re.search(r"退出码:\s*(-?\d+)", observation or "")
         if exit_match:
@@ -1385,7 +1406,7 @@ class VerificationAgent(BaseAgent):
         # success = exit_code==0 AND (有漏洞证据 OR 没有失败标记且有输出)
         has_output = len(obs_lower.strip()) >= 50  # 有实质性输出（>=50 字符，避免边界值误判）
         success = not has_failure_marker and exit_code == 0 and (has_vuln_evidence or has_output)
-        command = (action_input or {}).get("command") or ""
+        # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
 
@@ -1399,8 +1420,57 @@ class VerificationAgent(BaseAgent):
                 "language": (action_input or {}).get("language"),
                 "network_enabled": bool((action_input or {}).get("network_enabled", False)),
                 "evidence_summary": (observation or "")[:1000],
+                "finding_id": finding_id,
             }
         )
+
+    def _resolve_finding_id_from_command(self, command: str) -> Optional[str]:
+        """P4 修复：LLM 自写 PoC（无 # FINDING_ID 注释）时，从命令文本反查 finding_id。
+
+        反查策略（复用 _parse_finding_index_from_command 的路径匹配逻辑）：
+        1. poc_{index}.py -> 取 _all_findings[index] 的 _sandbox_finding_id
+        2. /workspace/src/{file_path} -> 文件路径后缀匹配 _all_findings，取 _sandbox_finding_id
+        3. 命令文本含 finding 的 file_path 关键词 -> 取 _sandbox_finding_id
+        无法关联返回 None（后续由 _attach_runtime_sandbox_attempts 模糊匹配兜底）。
+        """
+        if not command:
+            return None
+        findings = getattr(self, "_all_findings", None) or []
+        if not findings:
+            return None
+
+        # 1. poc_{index}.py
+        m = re.search(r"poc_(\d+)\.py", command)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(findings):
+                f = findings[idx]
+                if isinstance(f, dict):
+                    fid = f.get("_sandbox_finding_id") or f.get("id")
+                    if fid:
+                        return str(fid)
+
+        # 2. /workspace/src/{file_path} 反查
+        m = re.search(r"/workspace/src/([^\s'\"]+)", command)
+        if m:
+            ref_path = m.group(1).strip()
+            for f in findings:
+                if isinstance(f, dict) and f.get("file_path") and ref_path.endswith(str(f.get("file_path"))):
+                    fid = f.get("_sandbox_finding_id") or f.get("id")
+                    if fid:
+                        return str(fid)
+
+        # 3. 命令文本含 finding 的 file_path 关键词（宽松兜底，取首个命中）
+        cmd_lower = command.lower()
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            fp = str(f.get("file_path") or "").strip()
+            if fp and fp.lower() in cmd_lower:
+                fid = f.get("_sandbox_finding_id") or f.get("id")
+                if fid:
+                    return str(fid)
+        return None
 
     def _record_language_test_attempt(
         self, tool_name: str, action_input: dict[str, Any], observation: str
@@ -1435,6 +1505,11 @@ class VerificationAgent(BaseAgent):
         elif file_path_input:
             target_ref = str(file_path_input).strip()
 
+        # P4 修复：language_test 工具同样反查 finding_id（优先 file_path_input，其次 code 文本）
+        finding_id = self._resolve_finding_id_from_command(
+            str(file_path_input) + "\n" + code
+        )
+
         self._sandbox_attempts.append(
             {
                 "tool": tool_name,
@@ -1445,6 +1520,7 @@ class VerificationAgent(BaseAgent):
                 "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
                 "network_enabled": False,
                 "evidence_summary": (observation or "")[:1000],
+                "finding_id": finding_id,
             }
         )
 
@@ -1462,6 +1538,21 @@ class VerificationAgent(BaseAgent):
         if any(isinstance(a, dict) and a.get("success") and self._attempt_has_vuln_evidence(a) for a in existing_attempts):
             return
         attempts = getattr(self, "_sandbox_attempts", [])
+
+        # Opt-1: ID-based matching (precise, before fuzzy)
+        finding_id = finding.get("_sandbox_finding_id")
+        if finding_id:
+            id_matched = [a for a in attempts
+                          if a.get("finding_id") == finding_id
+                          and a.get("success") is True]
+            if id_matched:
+                finding["sandbox_attempts"] = existing_attempts + id_matched
+                logger.info(
+                    f"[{self.name}] ID-based sandbox match: finding_id={finding_id} "
+                    f"-> {len(id_matched)} attempts"
+                )
+                return
+
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
         if matched_attempts:
@@ -1839,6 +1930,7 @@ class VerificationAgent(BaseAgent):
 
     def _build_sandbox_commands(self, findings: List[Dict]) -> List[Dict]:
         """为每个发现自动生成 sandbox_exec 命令，确保 LLM 有可直接执行的沙箱指令"""
+        from uuid import uuid4
         commands = []
         for i, f in enumerate(findings):
             vuln_type = (f.get('vulnerability_type') or '').lower()
@@ -1846,8 +1938,16 @@ class VerificationAgent(BaseAgent):
             line = f.get('line_start', 0)
             title = f.get('title', '')
 
+            # Opt-1: Assign a finding_id for precise sandbox-to-finding matching
+            finding_id = f.get("id") or str(uuid4())[:8]
+            f["_sandbox_finding_id"] = finding_id
+
             cmd = self._gen_sandbox_command(vuln_type, file_path, line, title, i)
             if cmd:
+                # Opt-1: Embed finding_id as comment in the command
+                original_command = cmd.get("command", "")
+                cmd["command"] = "# FINDING_ID:" + finding_id + "\n" + original_command
+                cmd["finding_id"] = finding_id
                 commands.append(cmd)
         return commands
 
