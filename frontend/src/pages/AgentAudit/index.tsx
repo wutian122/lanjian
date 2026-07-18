@@ -517,6 +517,14 @@ function AgentAuditPageContent() {
             agentName: getCurrentAgentName() || undefined,
           }
         });
+        // FIX SSE Wave 1 §InitProgress: phase_start 意味着任务已进入正式执行阶段，
+        // 后端 status 已从 INITIALIZING 切换到 RUNNING。前端主动 loadTask() 更新
+        // 缓存的 task.status，触发 isInitializing 变 false，从 InitProgress 页
+        // 自动切换到主界面，无需用户手动刷新。
+        if (event.type === 'phase_start') {
+          loadTask();
+        }
+      }
         debouncedLoadAgentTree();
         return;
       }
