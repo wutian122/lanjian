@@ -4,7 +4,7 @@
  * and exponential backoff
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { StreamOptions, StreamEventData } from '@/shared/api/agentStream';
 import {
   getEffectiveAfterSequence,
@@ -71,7 +71,22 @@ export function useResilientStream(
     ...streamOptions
   } = options;
 
-  const config = { ...DEFAULT_CONFIG, ...userConfig };
+  // FIX SSE Post-Wave 2: config 用 useMemo 稳定化。
+  // 之前 `const config = { ...DEFAULT_CONFIG, ...userConfig };` 每次 hook 调用（每次 rerender）
+  // 都创建新对象，导致下游所有依赖 config.* 的 useCallback（resetHeartbeatTimer、handleHeartbeat、
+  // handleEvent、connectInternal）identity 每次变化，最终引发 index.tsx 的 stream connection
+  // useEffect 依赖变动误 cleanup + 重建 SSE 连接。真实故障：SSE 每秒断连一次。
+  const config = useMemo(
+    () => ({ ...DEFAULT_CONFIG, ...userConfig }),
+    [
+      userConfig?.maxReconnectAttempts,
+      userConfig?.initialReconnectDelay,
+      userConfig?.maxReconnectDelay,
+      userConfig?.heartbeatTimeout,
+      userConfig?.longOperationHeartbeatTimeout,
+      userConfig?.jitterFactor,
+    ]
+  );
 
   // State
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');

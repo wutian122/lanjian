@@ -66,28 +66,39 @@ class TestSSEEndpointsAcceptRequest:
 
 
 class TestGeneratorsCheckDisconnect:
-    """Wave 2.4: 生成器主循环必须包含 request.is_disconnected 检测"""
+    """Wave 2.4: 生成器主循环历史上包含 request.is_disconnected 检测。
 
-    def test_stream_agent_events_generator_checks_disconnect(self):
+    Post-Wave 2 修复：**移除**了该检查，改依赖 Starlette StreamingResponse 内建的
+    listen_for_disconnect。原实现 `await request.is_disconnected()` 会与内建监听
+    竞争 ASGI receive channel，导致前端每次 rerender 触发的短暂 fetch abort 会
+    立即杀掉 SSE stream。
+
+    本类的测试保留但改为"注释中含 is_disconnected"的存在性检查，仅为文档追溯用。
+    真正的回归防护见 `test_sse_no_manual_disconnect_check.py`。
+    """
+
+    def test_stream_agent_events_generator_has_disconnect_comment(self):
+        """stream_agent_events 函数体内应保留 is_disconnected 相关注释（历史追溯）。
+
+        Post-Wave 2 更改：Wave 1 加的 await 调用已删除，但注释保留说明为何不再检查。
+        """
         content = SRC_AGENT_TASKS.read_text(encoding="utf-8")
-        # 找到 stream_agent_events 函数体
         node = _get_func(SRC_AGENT_TASKS, "stream_agent_events")
         start = node.lineno - 1
         end = node.end_lineno if node.end_lineno else len(content.splitlines())
         body = "\n".join(content.splitlines()[start:end])
         assert "is_disconnected" in body, (
-            "stream_agent_events 内的生成器应调用 request.is_disconnected() 检测客户端断开"
+            "stream_agent_events 内应保留 is_disconnected 相关注释以说明 Post-Wave 2 修复"
         )
 
-    def test_stream_agent_with_thinking_generator_checks_disconnect(self):
+    def test_stream_agent_with_thinking_generator_has_disconnect_comment(self):
+        """stream_agent_with_thinking 函数体内应保留 is_disconnected 相关注释（历史追溯）"""
         content = SRC_AGENT_TASKS.read_text(encoding="utf-8")
         node = _get_func(SRC_AGENT_TASKS, "stream_agent_with_thinking")
         start = node.lineno - 1
         end = node.end_lineno if node.end_lineno else len(content.splitlines())
         body = "\n".join(content.splitlines()[start:end])
-        assert "is_disconnected" in body, (
-            "stream_agent_with_thinking 内的生成器应调用 request.is_disconnected() 检测客户端断开"
-        )
+        assert "is_disconnected" in body
 
 
 class TestStreamEventsCatchesCancelledError:

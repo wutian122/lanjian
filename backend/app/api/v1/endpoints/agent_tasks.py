@@ -2646,11 +2646,11 @@ async def stream_agent_events(
         idle_time = 0
 
         while True:
-            # Wave 1 §2.4: 每轮循环开始时检测客户端断开，5 秒内即可响应
-            if await request.is_disconnected():
-                logger.info(f"[stream_agent_events] Client disconnected for task {task_id}")
-                break
-
+            # Post-Wave 2 修复：删除 Wave 1 §2.4 的 `if await request.is_disconnected(): break`。
+            # 该检查会消费 ASGI receive channel，与 Starlette StreamingResponse 内建的
+            # listen_for_disconnect 竞争，导致每次 rerender 触发的短暂 fetch abort 会被
+            # 误判为永久断开，立即 cancel 整个 stream_events。Starlette 内建的
+            # listen_for_disconnect 已自动检测客户端断开并 cancel body_iterator，无需重复。
             # 查询新事件
             async with async_session_factory() as session:
                 result = await session.execute(
@@ -2779,10 +2779,10 @@ async def stream_agent_with_thinking(
                     skip_types.update(["tool_call_start", "tool_call_input", "tool_call_output", "tool_call_end"])
 
                 async for event in event_manager.stream_events(task_id, after_sequence=after_sequence):
-                    # Wave 1 §2.4: 每个事件出队后立即检测客户端断开，避免僵尸连接
-                    if await request.is_disconnected():
-                        logger.info(f"[stream_agent_with_thinking] Client disconnected for task {task_id}")
-                        break
+                    # Post-Wave 2 修复：删除 Wave 1 §2.4 的 is_disconnected 检查。
+                    # 该检查会消费 ASGI receive channel 与 Starlette 内建 listen_for_disconnect
+                    # 竞争，前端每次 rerender 引发的短暂 fetch abort 会立即杀掉整个 SSE stream。
+                    # 依赖 stream_events 自身对 CancelledError 的捕获（真正断开时会正确关闭）。
 
                     event_type = event.get("event_type")
 
@@ -2820,10 +2820,7 @@ async def stream_agent_with_thinking(
                 skip_types.update(["thinking_start", "thinking_token", "thinking_end"])
             
             while True:
-                # Wave 1 §2.4: 每轮循环开始检测客户端断开
-                if await request.is_disconnected():
-                    logger.info(f"[stream_agent_with_thinking DB-poll] Client disconnected for task {task_id}")
-                    break
+                # Post-Wave 2 修复：删除 is_disconnected 检查（同前面两处原因）。
                 try:
                     async with async_session_factory() as session:
                         # 查询新事件

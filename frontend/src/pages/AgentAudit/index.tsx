@@ -76,6 +76,7 @@ function AgentAuditPageContent() {
   const lastAgentTreeRefreshTime = useRef<number>(0);
   const previousTaskIdRef = useRef<string | undefined>(undefined);
   const disconnectStreamRef = useRef<(() => void) | null>(null);
+  const connectStreamRef = useRef<(() => void) | null>(null);
   const lastEventSequenceRef = useRef<number>(0);
   const hasConnectedRef = useRef<boolean>(false); // 🔥 追踪是否已连接 SSE
   const hasLoadedHistoricalEventsRef = useRef<boolean>(false); // 🔥 追踪是否已加载历史事件
@@ -743,10 +744,14 @@ function AgentAuditPageContent() {
   isFailed,
 } = useResilientStream(taskId || null, streamOptions);
 
-  // 保存 disconnect 函数到 ref，以便在 taskId 变化时使用
+  // 保存 disconnect / connect 函数到 ref，以便在 taskId 变化时使用
+  // FIX SSE Post-Wave 2: connectStreamRef 也保存，让 stream connection useEffect
+  // 依赖 ref 而不是 connect/disconnect 函数本身，避免因 useResilientStream 内部
+  // useCallback 依赖变化（如 config 引用变化）导致 useEffect cleanup 误触发。
   useEffect(() => {
     disconnectStreamRef.current = disconnectStream;
-  }, [disconnectStream]);
+    connectStreamRef.current = connectStream;
+  }, [disconnectStream, connectStream]);
 
   // ============ Effects ============
 
@@ -814,29 +819,35 @@ function AgentAuditPageContent() {
 
     hasConnectedRef.current = true;
     console.log(`[AgentAudit] Connecting to stream (afterSequence will be passed via streamOptions)`);
-    connectStream();
+    // FIX SSE Post-Wave 2: 使用 connectStreamRef 而非 connectStream 直接闭包，
+    // 避免 useResilientStream 内部 useCallback identity 变化导致本 useEffect
+    // 依赖变化触发 cleanup+重连循环。SSE 会因此每几秒断连一次。
+    connectStreamRef.current?.();
     dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: 'Connected to audit stream' } });
 
     return () => {
       console.log('[AgentAudit] Cleanup: disconnecting stream');
-      disconnectStream();
+      disconnectStreamRef.current?.();
       // FIX SSE Wave 1 §2.5: 复位 hasConnectedRef，允许 React 18 StrictMode 双挂载
       // 以及运行时断开后重新连接。若不复位，第二次 mount 时 hasConnectedRef.current === true
       // 会直接 early return，导致断流后（心跳超时、fetch 失败）无法自愈。
       hasConnectedRef.current = false;
     };
-    // 🔥 CRITICAL FIX: 移除 afterSequence 依赖！
-    // afterSequence 通过 streamOptions 传递，不需要在这里触发重连
-    // 如果包含它，当 loadHistoricalEvents 更新 afterSequence 时会触发断开重连
+    // 🔥 CRITICAL FIX (Post-Wave 2): 依赖数组去掉 connectStream/disconnectStream/dispatch。
+    // 用 ref 引用它们（connectStreamRef/disconnectStreamRef）稳定获取最新实现。
+    // 之前依赖这些函数导致 useResilientStream 内部 config 每次 rerender 新对象引发
+    // useCallback 链变化 → 本 effect 每次 rerender 都 cleanup+reconnect → SSE 卡断。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId, task?.status, historicalEventsLoaded, connectStream, disconnectStream, dispatch]);
+  }, [taskId, task?.status, historicalEventsLoaded]);
 
   useEffect(() => {
     if (!isPaused) return;
-    disconnectStream();
+    // FIX SSE Post-Wave 2: 用 ref 而非 disconnectStream 闭包，避免 identity 变化触发本 effect
+    disconnectStreamRef.current?.();
     hasConnectedRef.current = false;
     setConnectionStatus('disconnected');
-  }, [disconnectStream, isPaused, setConnectionStatus]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPaused, setConnectionStatus]);
 
   // Polling
   useEffect(() => {
@@ -869,7 +880,8 @@ function AgentAuditPageContent() {
           return;
         }
         hasCompletedViaSSE.current = true;
-        disconnectStream();
+        // FIX SSE Post-Wave 2: 用 ref 而非闭包，避免 identity 变化触发本 effect
+        disconnectStreamRef.current?.();
         hasConnectedRef.current = false;
         dispatch({ type: 'COMPLETE_ALL_RUNNING_TOOLS' });
         await Promise.all([loadTask(), loadFindings(), loadAgentTree()]);
@@ -877,7 +889,8 @@ function AgentAuditPageContent() {
       };
       finalizeTask();
     }
-  }, [taskId, task?.status, disconnectStream, loadTask, loadFindings, loadAgentTree, loadHistoricalEvents]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskId, task?.status, loadTask, loadFindings, loadAgentTree, loadHistoricalEvents]);
 
   // Auto scroll（仅滚动 Log Content 容器本身，不牵连任何祖先）
   useEffect(() => {
