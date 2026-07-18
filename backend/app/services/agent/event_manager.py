@@ -258,13 +258,24 @@ class EventManager:
     事件管理器
     负责事件的存储和检索
     """
-    
+
+    # Wave 2 §3.3 事件队列有界化配置
+    QUEUE_MAX_SIZE = 10000  # 单任务队列上限（覆盖 ~15 分钟正常任务事件量）
+    IMPORTANT_PUT_TIMEOUT_SECONDS = 5.0  # 重要事件入队最长等待时间
+    TERMINAL_EVENT_TYPES = frozenset({"task_complete", "task_error", "task_cancel"})
+    DROPPABLE_EVENT_TYPES = frozenset({"thinking_token"})  # 可安全丢弃的事件
+
+    # Wave 2 §3.4 心跳配置
+    HEARTBEAT_INTERVAL = 10  # 秒；前端 45s 心跳窗口 4.5x 余量
+
     def __init__(self, db_session_factory=None):
         self.db_session_factory = db_session_factory
         self._event_queues: Dict[str, asyncio.Queue] = {}
         self._event_callbacks: Dict[str, List[Callable]] = {}
         self._heartbeat_sent: Dict[str, bool] = {}  # task_id -> 本周期是否已发心跳
         self._terminal_tasks: set = set()  # 已终态的 task_id 集合
+        # Wave 2 §3.3 分级丢弃计数器：追踪被丢弃的 thinking_token 数量
+        self.dropped_thinking_tokens: Dict[str, int] = {}
     
     async def add_event(
         self,
@@ -310,18 +321,51 @@ class EventManager:
             except Exception as e:
                 logger.error(f"Failed to save event to database: {e}")
         
-        # 推送到队列（无限队列 + 背压：所有事件用 await put，生产者等消费者，永不丢失）
+        # Wave 2 §3.3 分级入队策略：
+        # - 可丢弃事件（thinking_token）: put_nowait，QueueFull 直接丢弃并计数
+        # - 终态事件（task_complete/task_error/task_cancel）: 无条件 await 直到成功
+        # - 其他重要事件: await wait_for(put, 5s)，超时后放弃入队但已落 DB（DB 回补兜底）
         if task_id in self._event_queues:
             q = self._event_queues[task_id]
-            await q.put(event_data)  # 背压：队列满时阻塞生产者，等消费者跟上
-            
-            if event_type in {"thinking_start", "thinking_end", "dispatch", "task_complete",
-                              "task_error", "tool_call", "tool_result", "llm_action"}:
-                logger.info(f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {q.qsize()}")
-            elif event_type == "thinking_token":
-                if sequence % 1000 == 0:
-                    logger.debug(f"[EventQueue] Added thinking_token #{sequence} to queue, size: {q.qsize()}")
-        
+
+            if event_type in self.DROPPABLE_EVENT_TYPES:
+                # 可丢弃事件：立即入队，满则丢弃（thinking_token 只是 UX 增强）
+                try:
+                    q.put_nowait(event_data)
+                except asyncio.QueueFull:
+                    self.dropped_thinking_tokens[task_id] = (
+                        self.dropped_thinking_tokens.get(task_id, 0) + 1
+                    )
+                    dropped_total = self.dropped_thinking_tokens[task_id]
+                    # 每 100 条 WARNING 一次，避免日志刷屏
+                    if dropped_total % 100 == 0:
+                        logger.warning(
+                            f"[EventQueue] Dropped {dropped_total} thinking_token events for task {task_id} "
+                            f"(queue full, size={q.qsize()}/{q.maxsize}); consumer likely slow or disconnected"
+                        )
+            elif event_type in self.TERMINAL_EVENT_TYPES:
+                # 终态事件：MUST 送达。无条件阻塞直到成功（前端必须能感知任务结束）
+                await q.put(event_data)
+                logger.info(
+                    f"[EventQueue] Added terminal event {event_type} to queue for task {task_id}, size: {q.qsize()}"
+                )
+            else:
+                # 重要事件：最多等 5s。超时则放弃入队（DB 已落，重连时 DB 回补可拿到）
+                try:
+                    await asyncio.wait_for(
+                        q.put(event_data), timeout=self.IMPORTANT_PUT_TIMEOUT_SECONDS
+                    )
+                    if event_type in {"thinking_start", "thinking_end", "dispatch",
+                                      "tool_call", "tool_result", "llm_action"}:
+                        logger.info(
+                            f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {q.qsize()}"
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[EventQueue] Timed out (5s) waiting to enqueue {event_type} for task {task_id} "
+                        f"(size={q.qsize()}/{q.maxsize}); event dropped from queue but persisted in DB"
+                    )
+
         # 调用回调
         if task_id in self._event_callbacks:
             for callback in self._event_callbacks[task_id]:
@@ -395,10 +439,11 @@ class EventManager:
             await db.commit()
     
     def create_queue(self, task_id: str) -> asyncio.Queue:
-        """创建或获取事件队列"""
+        """创建或获取事件队列（Wave 2 §3.3：有界队列 + 分级丢弃策略）"""
         if task_id not in self._event_queues:
-            # 🔥 使用较大的队列容量，缓存更多 token 事件
-            self._event_queues[task_id] = asyncio.Queue()  # 无限队列：永不丢失事件，靠背压调节
+            # Wave 2 §3.3：有界队列 maxsize=QUEUE_MAX_SIZE（10000），
+            # add_event 按事件类型分级处理满队情况（可丢弃/重要/终态）
+            self._event_queues[task_id] = asyncio.Queue(maxsize=self.QUEUE_MAX_SIZE)
         return self._event_queues[task_id]
     
     def remove_queue(self, task_id: str):
@@ -617,11 +662,29 @@ class EventManager:
                 logger.info(f"[StreamEvents] Task {task_id}: Fast-drained {fast_drain_count} backlog events")
 
         # 然后实时推送新事件（不再过滤 after_sequence，因为初始排空阶段已处理）
+        # Wave 2 §3.4: 心跳与队列消费解耦。用 asyncio.wait({queue_get, heartbeat_timer},
+        # FIRST_COMPLETED) 模式：即使消费者慢，心跳也能按 10s 周期发出，不再依赖
+        # queue.get 超时。
         try:
             while True:
+                queue_get_task = asyncio.ensure_future(queue.get())
+                heartbeat_task = asyncio.ensure_future(asyncio.sleep(self.HEARTBEAT_INTERVAL))
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    done, pending = await asyncio.wait(
+                        {queue_get_task, heartbeat_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    # 上游取消：清理待处理任务后向上传播
+                    for t in (queue_get_task, heartbeat_task):
+                        if not t.done():
+                            t.cancel()
+                    raise
 
+                if queue_get_task in done:
+                    # 有新事件：yield 并取消心跳定时器（下次循环重开）
+                    heartbeat_task.cancel()
+                    event = queue_get_task.result()
                     yield event
 
                     # 检查是否是结束事件
@@ -635,16 +698,17 @@ class EventManager:
                             try:
                                 backlog_event = queue.get_nowait()
                                 yield backlog_event
-                                
+
                                 if backlog_event.get("event_type") in ["task_complete", "task_error", "task_cancel"]:
                                     logger.info(f"[StreamEvents] Task {task_id}: Terminal event during backlog drain")
                                     return
                             except asyncio.QueueEmpty:
                                 break
-
-                except asyncio.TimeoutError:
-                    # Send heartbeat every 15s to keep SSE connection alive
-                    logger.debug(f"[StreamEvents] Task {task_id}: Sending heartbeat (idle > 15s)")
+                else:
+                    # 心跳定时器先到：yield 心跳事件，取消 queue.get（它的结果本轮不用了）
+                    queue_get_task.cancel()
+                    # 记录 heartbeat_task 已 done 但结果无关紧要
+                    logger.debug(f"[StreamEvents] Task {task_id}: Sending heartbeat (interval={self.HEARTBEAT_INTERVAL}s)")
                     yield {"event_type": "heartbeat", "timestamp": datetime.now(timezone.utc).isoformat()}
 
         except GeneratorExit:

@@ -74,6 +74,9 @@ export interface AgentTask {
 
   // 错误信息
   error_message: string | null;
+
+  // Wave 2 §3.2: 后端返回 orchestrator 存活状态，用于前端判断 stale running
+  orchestrator_alive?: boolean;
 }
 
 export interface AgentFinding {

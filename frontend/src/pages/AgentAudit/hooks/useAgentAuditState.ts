@@ -32,6 +32,9 @@ const initialState: AgentAuditState = {
   connectionStatus: 'disconnected',
   isAutoScroll: true,
   expandedLogIds: new Set(),
+  // Wave 2 §3.5: 重连与断流状态
+  reconnectAttempt: 0,
+  streamDied: false,
 };
 
 // ============ Reducer ============
@@ -215,6 +218,22 @@ function agentAuditReducer(state: AgentAuditState, action: AgentAuditAction): Ag
       return { ...state, initSteps: [...state.initSteps, step] };
     }
 
+    // Wave 2 §3.5: 追踪 SSE 重连尝试与断流原因，供 UI 显示重连横幅
+    case 'RECONNECT_ATTEMPT':
+      return {
+        ...state,
+        reconnectAttempt: action.payload.attempt,
+        reconnectReason: action.payload.reason,
+        streamDied: false,
+      };
+
+    case 'SSE_STREAM_DIED':
+      return {
+        ...state,
+        streamDied: true,
+        streamDiedReason: action.payload.reason,
+      };
+
     case 'RESET':
       return { ...initialState };
 
@@ -344,8 +363,8 @@ export function useAgentAuditState() {
   }, [state.task?.status]);
 
   const canRecover = useMemo(() => {
-    return state.task?.status === 'running';
-  }, [state.task?.status]);
+    return state.task?.status === 'running' && state.task?.orchestrator_alive === false;
+  }, [state.task?.status, state.task?.orchestrator_alive]);
 
   const isComplete = useMemo(() => {
     const status = state.task?.status;

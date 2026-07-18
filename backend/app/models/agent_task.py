@@ -268,7 +268,10 @@ class AgentEvent(Base):
     
     # 序号（用于排序）
     sequence = Column(Integer, default=0, index=True)
-    
+
+    # SSE Last-Event-ID（断线重连时从最后一个已接收事件继续推送）
+    sse_last_id = Column(String(64), nullable=True)
+
     # 时间戳
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     
@@ -293,6 +296,7 @@ class AgentEvent(Base):
             "tokens_used": self.tokens_used,
             "metadata": self.event_metadata,
             "sequence": self.sequence,
+            "sse_last_id": self.sse_last_id,
             "timestamp": self.created_at.isoformat() if self.created_at else None,
         }
 

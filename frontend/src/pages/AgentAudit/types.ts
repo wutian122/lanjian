@@ -93,6 +93,11 @@ interface AgentAuditState {
   connectionStatus: ConnectionStatus;
   isAutoScroll: boolean;
   expandedLogIds: Set<string>;
+  // Wave 2 §3.5: stale running 检测与重连状态追踪
+  reconnectAttempt: number;
+  reconnectReason?: string;
+  streamDied: boolean;
+  streamDiedReason?: string;
 }
 
 export interface AgentTreeResponse {
@@ -129,7 +134,10 @@ export type AgentAuditAction =
   | { type: 'TOGGLE_LOG_EXPANDED'; payload: string }
   | { type: 'COMPLETE_ALL_RUNNING_TOOLS' }
   | { type: 'RESET' }
-  | { type: 'ADD_INIT_STEP'; payload: InitStep };
+  | { type: 'ADD_INIT_STEP'; payload: InitStep }
+  // Wave 2 §3.5: 重连状态与断流通知
+  | { type: 'RECONNECT_ATTEMPT'; payload: { attempt: number; reason?: string } }
+  | { type: 'SSE_STREAM_DIED'; payload: { reason: string } };
 
 // ============ Component Props ============
 

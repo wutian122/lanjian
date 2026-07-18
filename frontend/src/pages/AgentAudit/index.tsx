@@ -524,7 +524,6 @@ function AgentAuditPageContent() {
         if (event.type === 'phase_start') {
           loadTask();
         }
-      }
         debouncedLoadAgentTree();
         return;
       }
@@ -715,6 +714,7 @@ function AgentAuditPageContent() {
           title: `Stream reconnecting (${attempt}/5)${reason ? `: ${reason}` : ''}...`,
         }
       });
+      dispatch({ type: 'RECONNECT_ATTEMPT', payload: { attempt, reason } });
     },
     onMaxRetriesReached: async () => {
       dispatch({
@@ -724,6 +724,7 @@ function AgentAuditPageContent() {
           title: 'Stream connection failed after 5 retries',
         }
       });
+      dispatch({ type: 'SSE_STREAM_DIED', payload: { reason: 'heartbeat timeout or 5 retries exceeded' } });
       await loadTask();
       await loadFindings();
       await loadAgentTree();
@@ -1163,7 +1164,7 @@ function AgentAuditPageContent() {
           </div>
         )}
 
-        {canRecover && !isRunning && (
+        {canRecover && (
           <div className="absolute top-0 left-0 right-0 z-10 bg-red-50 border-b border-red-200 px-4 py-2 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <AlertCircle className="w-4 h-4 text-red-600" />

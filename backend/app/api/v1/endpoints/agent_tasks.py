@@ -151,7 +151,12 @@ class AgentTaskResponse(BaseModel):
     
     # 错误信息
     error_message: Optional[str] = None
-    
+
+    # Wave 2 §3.2: Orchestrator 存活心跳。True=后端进程在 30s 内刷新过 alive_at；
+    # False=Redis 中键已过期或 orchestrator 崩溃/重启（stale running 判定依据）。
+    # None=后端未启用 Redis registry（Redis 不可用时保持向后兼容）。
+    orchestrator_alive: Optional[bool] = None
+
     class Config:
         from_attributes = True
 
@@ -2262,7 +2267,17 @@ async def get_agent_task(
             "exclude_patterns": task.exclude_patterns,
             "target_files": task.target_files,
         }
-        
+
+        # Wave 2 §3.2: 填充 orchestrator_alive 字段。基于 Redis registry 判定；
+        # Redis 不可用时字段为 None（前端可保持向后兼容行为，不显示恢复横幅）。
+        try:
+            from app.services.agent.core.orchestrator_registry import get_registry
+            registry = await get_registry()
+            response_data["orchestrator_alive"] = await registry.is_alive(task_id)
+        except Exception as e:
+            logger.debug(f"[GetTask] orchestrator_alive check failed for {task_id}: {e}")
+            response_data["orchestrator_alive"] = None
+
         return AgentTaskResponse(**response_data)
     except Exception as e:
         logger.error(f"Error serializing task {task_id}: {e}", exc_info=True)

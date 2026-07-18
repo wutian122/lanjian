@@ -567,6 +567,16 @@ class OrchestratorAgent(BaseAgent):
         self._register_to_registry(task='Orchestrator 编排审计流程')
         await self.emit_thinking("🧠 Orchestrator Agent 启动，LLM 开始自主编排决策...")
 
+        # Wave 2 §3.2 心跳协程：每 5 秒刷新 Redis 中的 alive_at 字段。
+        # 上层前端通过 GET /agent-tasks/{id} 响应的 orchestrator_alive 字段
+        # 判定 stale running 任务。心跳失败非致命（fallback 到进程内 dict）。
+        _heartbeat_task_id = input_data.get("task_id")
+        _heartbeat_alive_task: asyncio.Task | None = None
+        if _heartbeat_task_id:
+            _heartbeat_alive_task = asyncio.create_task(
+                self._pump_orchestrator_alive(_heartbeat_task_id)
+            )
+
         try:
 
             if not resume_state:
@@ -1289,6 +1299,47 @@ Action Input: {{"参数": "值"}}
                 success=False,
                 error=str(e),
             )
+        finally:
+            # Wave 2 §3.2 停止心跳协程 + 清理 Redis registry key
+            if _heartbeat_alive_task is not None and not _heartbeat_alive_task.done():
+                _heartbeat_alive_task.cancel()
+                try:
+                    await _heartbeat_alive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if _heartbeat_task_id:
+                try:
+                    from app.services.agent.core.orchestrator_registry import get_registry
+                    registry = await get_registry()
+                    await registry.clear(_heartbeat_task_id)
+                except Exception as e:
+                    logger.warning(f"[Orchestrator] Failed to clear registry for {_heartbeat_task_id}: {e}")
+
+
+    async def _pump_orchestrator_alive(self, task_id: str, interval_seconds: int = 5) -> None:
+        """Wave 2 §3.2 心跳协程：每 interval_seconds 秒调用 registry.set_alive 刷新 TTL。
+
+        Redis 键 lanjian:orch:{task_id} TTL 为 60 秒（远大于 interval），
+        任务进程被杀 / uvicorn --reload 重启后，key 会自然过期，前端通过
+        orchestrator_alive=false 感知 stale running。
+        """
+        try:
+            from app.services.agent.core.orchestrator_registry import get_registry
+            registry = await get_registry()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Alive heartbeat cannot init registry: {e}")
+            return
+
+        while True:
+            try:
+                await registry.set_alive(task_id, event_manager_local=True)
+            except Exception as e:
+                # 单次失败不阻断心跳循环（内部已 fallback）
+                logger.debug(f"[Orchestrator] Alive heartbeat set_alive error: {e}")
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                return
 
 
     async def _run_semgrep_prescan(self) -> dict[str, Any]:
