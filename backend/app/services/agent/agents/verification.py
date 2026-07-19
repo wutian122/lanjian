@@ -380,6 +380,7 @@ Action Input: {"file_path": "search.php"}
     {
         "success": true,
         "exit_code": 0,
+        "command": "python3 -c \"print('VULNERABILITY_CONFIRMED: ...')\"",
         "evidence_summary": "VULNERABILITY_CONFIRMED: <PoC 输出的证据摘要>",
         "target_ref": "文件路径:行号"
     }
@@ -1419,7 +1420,7 @@ class VerificationAgent(BaseAgent):
                 "target_ref": target_ref,
                 "language": (action_input or {}).get("language"),
                 "network_enabled": bool((action_input or {}).get("network_enabled", False)),
-                "evidence_summary": (observation or "")[:1000],
+                "evidence_summary": (observation or "")[:5000],
                 "finding_id": finding_id,
             }
         )
