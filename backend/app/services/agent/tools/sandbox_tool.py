@@ -196,8 +196,8 @@ class SandboxManager:
                     
                     return {
                         "success": result["StatusCode"] == 0,
-                        "stdout": stdout.decode('utf-8', errors='ignore')[:10000],
-                        "stderr": stderr.decode('utf-8', errors='ignore')[:2000],
+                        "stdout": stdout.decode('utf-8', errors='ignore')[:50000],
+                        "stderr": stderr.decode('utf-8', errors='ignore')[:10000],
                         "exit_code": result["StatusCode"],
                         "error": None,
                     }
