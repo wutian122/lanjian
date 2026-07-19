@@ -481,6 +481,9 @@ class AgentFinding(Base):
             "ai_explanation": self.ai_explanation,
             "ai_confidence": self.ai_confidence,
             "verification_status": self.verification_status,
+            "verification_method": self.verification_method,
+            "verification_result": self.verification_result,
+            "sandbox_attempts": self.sandbox_attempts,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

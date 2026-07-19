@@ -6,6 +6,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useParams } from "react-router-dom";
+import { isAxiosError } from "axios";
 import { Terminal, Bot, Loader2, Radio, Filter, Maximize2, ArrowDown, RefreshCw, AlertCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -42,10 +43,12 @@ import {
   AICollaborationPanel,
 } from "./components";
 import ReportExportDialog from "./components/ReportExportDialog";
+import { FindingDetailPanel } from "./components/FindingDetailPanel";
 import { useAgentAuditState } from "./hooks";
 import { ACTION_VERBS, POLLING_INTERVALS } from "./constants";
 import { buildAiContextSummary, cleanThinkingContent, truncateOutput, createLogItem } from "./utils";
 import type { LogItem } from "./types";
+import type { AgentFinding } from "@/shared/api/agentTasks";
 
 function AgentAuditPageContent() {
   const { taskId } = useParams<{ taskId: string }>();
@@ -934,16 +937,35 @@ function AgentAuditPageContent() {
 
   const [isReAuditing, setIsReAuditing] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
+  const [selectedFinding, setSelectedFinding] = useState<AgentFinding | null>(null);
 
   const handleReAudit = async () => {
-    if (!taskId) return;
+    if (!taskId || isReAuditing) return;
     setIsReAuditing(true);
     try {
       const result = await reAuditAgentTask(taskId);
-      toast.success(result.message || 'Re-audit started');
+      toast.success(result.message || '补充审计已启动');
+      // 后端已把 status 切到 RUNNING，主动 refetch 让 canReAudit 立即收敛
+      await loadTask();
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      toast.error('Re-audit failed: ' + errorMessage);
+      const status = isAxiosError(err) ? err.response?.status : undefined;
+      const detail = isAxiosError(err) ? (err.response?.data as { detail?: string } | undefined)?.detail : undefined;
+      // 中文文案映射：把后端英文 detail 转成用户可读提示
+      let friendly: string;
+      if (status === 400 && typeof detail === 'string' && detail.includes('only completed_with_gaps')) {
+        friendly = '任务当前状态已变化，无法补充审计。已刷新最新状态。';
+      } else if (status === 400 && typeof detail === 'string' && detail.includes('all findings already verified')) {
+        friendly = '所有漏洞均已验证，无需补充审计。';
+      } else if (status === 403) {
+        friendly = '无权限对该任务发起补充审计。';
+      } else if (status === 404) {
+        friendly = '任务不存在或已被清理。';
+      } else {
+        friendly = detail || (err instanceof Error ? err.message : '未知错误');
+      }
+      toast.error(`补充审计失败：${friendly}`);
+      // 不论何种错误，都拉一次最新状态，避免陈旧 state 让按钮继续可点
+      await loadTask();
     } finally {
       setIsReAuditing(false);
     }
@@ -1171,7 +1193,7 @@ function AgentAuditPageContent() {
                 {"任务已完成但存在未验证的漏洞，可补充审计。"}
               </span>
             </div>
-            <Button size="sm" onClick={handleReAudit} disabled={isReAuditing}>
+            <Button size="sm" onClick={handleReAudit} disabled={isReAuditing || !canReAudit}>
               {isReAuditing ? "审计中..." : "补充审计"}
             </Button>
           </div>
@@ -1413,6 +1435,39 @@ function AgentAuditPageContent() {
             </div>
           </div>
 
+          {/* Middle section - Findings */}
+          {findings.length > 0 && (
+            <div className="flex-shrink-0 border-t border-border max-h-[200px] overflow-y-auto custom-scrollbar">
+              <div className="px-3 py-2 border-b border-border bg-muted/50 flex items-center justify-between">
+                <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                  Findings ({findings.length})
+                </span>
+              </div>
+              <div className="divide-y divide-border">
+                {findings.map((finding) => (
+                  <div
+                    key={finding.id}
+                    onClick={() => setSelectedFinding(finding)}
+                    className="px-3 py-2 hover:bg-muted/30 cursor-pointer transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium truncate flex-1">{finding.title}</span>
+                      <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${
+                        finding.severity === 'critical' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' :
+                        finding.severity === 'high' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400' :
+                        finding.severity === 'medium' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
+                        'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'
+                      }`}>{finding.severity}</span>
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-0.5 truncate">
+                      {finding.file_path}{finding.line_start ? `:${finding.line_start}` : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Middle section - Stats */}
           <div className="flex-shrink-0 border-t border-border bg-card p-3">
             <StatsPanel task={task} findings={findings} compact />
@@ -1457,6 +1512,14 @@ function AgentAuditPageContent() {
         task={task}
         findings={findings}
       />
+
+      {/* Finding Detail Panel */}
+      {selectedFinding && (
+        <FindingDetailPanel
+          finding={selectedFinding}
+          onClose={() => setSelectedFinding(null)}
+        />
+      )}
     </div>
   );
 }

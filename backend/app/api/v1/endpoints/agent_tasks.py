@@ -214,6 +214,8 @@ class AgentFindingResponse(BaseModel):
     poc: Optional[dict] = None
     sandbox_attempts: Optional[List[dict]] = None
     verification_status: Optional[str] = None
+    verification_result: Optional[dict] = None
+    verification_method: Optional[str] = None
 
     created_at: datetime
     
