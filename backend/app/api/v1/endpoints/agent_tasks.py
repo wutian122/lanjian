@@ -1616,14 +1616,18 @@ async def _save_findings(
                         continue  # 跳过这个发现
 
             # 🔥 Handle line numbers (support multiple formats)
-            line_start = finding.get("line_start") or finding.get("line")
+            line_start = finding.get("line_start")
+            if line_start is None:
+                line_start = finding.get("line")
             if not line_start and ":" in finding.get("location", ""):
                 try:
                     line_start = int(finding.get("location", "").split(":")[1])
                 except (ValueError, IndexError):
                     line_start = None
 
-            line_end = finding.get("line_end") or line_start
+            line_end = finding.get("line_end")
+            if line_end is None:
+                line_end = line_start
 
             # 🔥 Handle code snippet (support multiple field names)
             code_snippet = (
@@ -1660,7 +1664,11 @@ async def _save_findings(
             )
 
             # 🔥 Handle confidence (map to ai_confidence field in model)
-            confidence = finding.get("confidence") or finding.get("ai_confidence") or 0.5
+            confidence = finding.get("confidence")
+            if confidence is None:
+                confidence = finding.get("ai_confidence")
+            if confidence is None:
+                confidence = 0.5
             if isinstance(confidence, str):
                 try:
                     confidence = float(confidence)
@@ -1689,30 +1697,15 @@ async def _save_findings(
             # 🔥 Handle verification details
             verification_method = finding.get("verification_method")
             verification_result = None
-            if finding.get("verification_details"):
-                vr = {
-                    "details": finding.get("verification_details"),
-                    "verdict": finding.get("verdict"),
-                    "verification_status": finding.get("verification_status"),
-                    "verification_note": finding.get("verification_note"),
-                    "failure_reason": finding.get("failure_reason"),
-                }
-                # 只保留非 None 的字段
-                vr = {k: v for k, v in vr.items() if v is not None}
-                # 尝试附加 sandbox_attempts 摘要
-                attempts = finding.get("sandbox_attempts")
-                if isinstance(attempts, list) and len(attempts) > 0:
-                    vr["sandbox_attempts_summary"] = [
-                        {
-                            "success": a.get("success"),
-                            "exit_code": a.get("exit_code"),
-                            "command": (a.get("command") or "")[:500],
-                            "target_ref": a.get("target_ref"),
-                            "weak_evidence": a.get("weak_evidence", False),
-                        }
-                        for a in attempts
-                        if isinstance(a, dict)
-                    ]
+            vr = {
+                "details": finding.get("verification_details"),
+                "verdict": finding.get("verdict"),
+                "verification_status": finding.get("verification_status"),
+                "verification_note": finding.get("verification_note"),
+                "failure_reason": finding.get("failure_reason"),
+            }
+            vr = {k: v for k, v in vr.items() if v is not None}
+            if vr:
                 verification_result = vr
 
             # FIX-BUG-A: Extract verification_status for DB storage
@@ -4187,6 +4180,10 @@ async def generate_audit_report(
                     "confidence": f.ai_confidence,
                     "suggestion": f.suggestion,
                     "fix_code": f.fix_code,
+                    "verification_status": f.verification_status,
+                    "verification_result": f.verification_result,
+                    "verification_method": f.verification_method,
+                    "sandbox_attempts": f.sandbox_attempts,
                     "created_at": f.created_at.isoformat() if f.created_at else None,
                 } for f in findings
             ]
