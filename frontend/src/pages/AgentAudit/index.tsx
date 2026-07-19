@@ -926,7 +926,7 @@ function AgentAuditPageContent() {
       disconnectStream();
       hasConnectedRef.current = false;
     } catch (error) {
-      const detail = (error as any)?.response?.data?.detail;
+      const detail = isAxiosError(error) ? (error.response?.data as { detail?: string } | undefined)?.detail : undefined;
       const errorMessage = detail || (error instanceof Error ? error.message : 'Unknown error');
       toast.error(`暂停任务失败: ${errorMessage}`);
       dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `暂停失败: ${errorMessage}` } });
@@ -939,14 +939,27 @@ function AgentAuditPageContent() {
   const [isRecovering, setIsRecovering] = useState(false);
   const [selectedFinding, setSelectedFinding] = useState<AgentFinding | null>(null);
 
+  // Sync selectedFinding with latest findings when findings array refreshes
+  useEffect(() => {
+    if (!selectedFinding) return;
+    const updated = findings.find((f: AgentFinding) => f.id === selectedFinding.id);
+    if (updated && updated !== selectedFinding) {
+      setSelectedFinding(updated);
+    }
+  }, [findings, selectedFinding]);
+
   const handleReAudit = async () => {
     if (!taskId || isReAuditing) return;
     setIsReAuditing(true);
+    let reAuditSucceeded = false;
     try {
       const result = await reAuditAgentTask(taskId);
+      reAuditSucceeded = true;
       toast.success(result.message || '补充审计已启动');
-      // 后端已把 status 切到 RUNNING，主动 refetch 让 canReAudit 立即收敛
-      await loadTask();
+      // 重置转场 ref，允许二次完成正常触发 completion transition
+      hasConnectedRef.current = false;
+      hasTransitionedRef.current = false;
+      hasCompletedViaSSE.current = false;
     } catch (err) {
       const status = isAxiosError(err) ? err.response?.status : undefined;
       const detail = isAxiosError(err) ? (err.response?.data as { detail?: string } | undefined)?.detail : undefined;
@@ -964,9 +977,14 @@ function AgentAuditPageContent() {
         friendly = detail || (err instanceof Error ? err.message : '未知错误');
       }
       toast.error(`补充审计失败：${friendly}`);
-      // 不论何种错误，都拉一次最新状态，避免陈旧 state 让按钮继续可点
-      await loadTask();
     } finally {
+      // loadTask 独立 try/catch，失败不影响 re-audit 成功状态
+      try {
+        await loadTask();
+      } catch (loadErr) {
+        // 静默失败——re-audit 本身状态已由上方 toast 反映
+        console.error('[handleReAudit] loadTask refresh failed:', loadErr);
+      }
       setIsReAuditing(false);
     }
   };
@@ -999,7 +1017,7 @@ function AgentAuditPageContent() {
       hasCompletedViaSSE.current = false;
       await Promise.all([loadTask(), loadFindings(), loadAgentTree()]);
     } catch (error) {
-      const detail = (error as any)?.response?.data?.detail;
+      const detail = isAxiosError(error) ? (error.response?.data as { detail?: string } | undefined)?.detail : undefined;
       const errorMessage = detail || (error instanceof Error ? error.message : 'Unknown error');
       toast.error(`继续任务失败: ${errorMessage}`);
       dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `继续失败: ${errorMessage}` } });
@@ -1460,7 +1478,7 @@ function AgentAuditPageContent() {
                       }`}>{finding.severity}</span>
                     </div>
                     <div className="text-xs text-muted-foreground mt-0.5 truncate">
-                      {finding.file_path}{finding.line_start ? `:${finding.line_start}` : ''}
+                      {finding.file_path || '-'}{finding.line_start != null ? `:${finding.line_start}` : ''}
                     </div>
                   </div>
                 ))}
