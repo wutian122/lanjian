@@ -828,7 +828,7 @@ class BaseAgent(ABC):
         """发射工具结果事件"""
         # 🔥 修复：确保 result 不为 None，避免显示 "None" 字符串
         safe_result = result if result and result != "None" else ""
-        tool_output_dict = {"result": safe_result[:10000] if safe_result else ""}  # Opt-2: 增大截断到10000字符，保留完整沙箱输出
+        tool_output_dict = {"result": safe_result[:50000] if safe_result else ""}  # 上限50000，与沙箱源头对齐
         await self.emit_event(
             "tool_result",
             f"[{self.name}] 工具 {tool_name} 完成 ({duration_ms}ms)",
