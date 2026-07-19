@@ -1621,6 +1621,9 @@ class VerificationAgent(BaseAgent):
         """
         evidence_summary = str(attempt.get("evidence_summary") or "")
         ev_lower = evidence_summary.lower()
+        # 排除 (static) 变体：静态分析降级输出不应被当作动态铁证
+        if "vulnerability_confirmed(static)" in ev_lower:
+            return False
         return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
     def _sandbox_attempt_matches_finding(self, attempt: dict[str, Any], finding: dict[str, Any]) -> bool:
@@ -2091,13 +2094,13 @@ class VerificationAgent(BaseAgent):
                     f"    if ssti_confirmed:\n"
                     f"        print('VULNERABILITY_CONFIRMED: SSTI dynamically verified (Jinja2 rendered {{{{7*7}}}}=49)')\n"
                     f"    elif sink_found:\n"
-                    f"        print('VULNERABILITY_CONFIRMED(static): dangerous XSS/SSTI sink present; verify it reaches user input')\n"
+                    f"        print('VULNERABILITY_STATIC_ONLY: dangerous XSS/SSTI sink present; verify it reaches user input')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: no XSS/SSTI sink found in source')\n"
                     f"except ImportError:\n"
                     f"    print('NOTE: jinja2 not installed in sandbox, falling back to static analysis')\n"
                     f"    if sink_found:\n"
-                    f"        print('VULNERABILITY_CONFIRMED(static): dangerous XSS/SSTI sink present; verify it reaches user input')\n"
+                    f"        print('VULNERABILITY_STATIC_ONLY: dangerous XSS/SSTI sink present; verify it reaches user input')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: no XSS/SSTI sink found in source')\n"
                     f"print('=== Verification Complete ===')\n"
