@@ -1688,15 +1688,40 @@ async def _save_findings(
             verification_method = finding.get("verification_method")
             verification_result = None
             if finding.get("verification_details"):
-                verification_result = {"details": finding.get("verification_details")}
+                vr = {
+                    "details": finding.get("verification_details"),
+                    "verdict": finding.get("verdict"),
+                    "verification_status": finding.get("verification_status"),
+                    "verification_note": finding.get("verification_note"),
+                    "failure_reason": finding.get("failure_reason"),
+                }
+                # 只保留非 None 的字段
+                vr = {k: v for k, v in vr.items() if v is not None}
+                # 尝试附加 sandbox_attempts 摘要
+                attempts = finding.get("sandbox_attempts")
+                if isinstance(attempts, list) and len(attempts) > 0:
+                    vr["sandbox_attempts_summary"] = [
+                        {
+                            "success": a.get("success"),
+                            "exit_code": a.get("exit_code"),
+                            "command": (a.get("command") or "")[:500],
+                            "target_ref": a.get("target_ref"),
+                            "weak_evidence": a.get("weak_evidence", False),
+                        }
+                        for a in attempts
+                        if isinstance(a, dict)
+                    ]
+                verification_result = vr
 
             # FIX-BUG-A: Extract verification_status for DB storage
             raw_vstatus = str(finding.get('verification_status') or finding.get('verdict') or 'needs_context').lower().strip()
             if raw_vstatus in ('confirmed', 'verified', 'true_positive'):
                 db_verification_status = 'confirmed'
-            elif raw_vstatus in ('false_positive',):
+            elif raw_vstatus == 'static_confirmed':
+                db_verification_status = 'static_confirmed'
+            elif raw_vstatus == 'false_positive':
                 db_verification_status = 'false_positive'
-            elif raw_vstatus in ('not_reproducible',):
+            elif raw_vstatus == 'not_reproducible':
                 db_verification_status = 'not_reproducible'
             else:
                 db_verification_status = 'needs_context'
