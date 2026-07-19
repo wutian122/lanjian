@@ -1231,7 +1231,10 @@ class VerificationAgent(BaseAgent):
                         obs_str = str(result)
                         obs_lower_fb = obs_str.lower()
                         fb_has_failure = any(m in obs_str for m in SANDBOX_FAILURE_MARKERS)
-                        fb_has_vuln = any(m.lower() in obs_lower_fb for m in VULN_EVIDENCE_MARKERS)
+                        fb_has_vuln = (
+                            "vulnerability_confirmed(static)" not in obs_lower_fb
+                            and any(m.lower() in obs_lower_fb for m in VULN_EVIDENCE_MARKERS)
+                        )
                         fb_has_output = len(obs_lower_fb.strip()) >= 50
                         fb_exit = None
                         _exit_match = re.search(r"退出码:\s*(-?\d+)", obs_str)
@@ -1403,10 +1406,17 @@ class VerificationAgent(BaseAgent):
         # ✅ P2-1: 增加语义检查 - 仅 exit_code==0 不够，还需检查 PoC 输出是否包含漏洞触发证据
         # 注意：marker 与 observation 都转小写比较，避免大小写不匹配漏判
         obs_lower = (observation or "").lower()
-        has_vuln_evidence = any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
+        has_vuln_evidence = (
+            "vulnerability_confirmed(static)" not in obs_lower
+            and any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
+        )
         # success = exit_code==0 AND (有漏洞证据 OR 没有失败标记且有输出)
         has_output = len(obs_lower.strip()) >= 50  # 有实质性输出（>=50 字符，避免边界值误判）
-        success = not has_failure_marker and exit_code == 0 and (has_vuln_evidence or has_output)
+        # 修复：exit_code None（regex 未匹配）时，仅依据证据判定，避免 None==0 假阴性
+        if exit_code is None:
+            success = not has_failure_marker and (has_vuln_evidence or has_output)
+        else:
+            success = not has_failure_marker and exit_code == 0 and (has_vuln_evidence or has_output)
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
@@ -1494,7 +1504,11 @@ class VerificationAgent(BaseAgent):
                 exit_code = None
 
         has_failure_marker = any(marker in (observation or "") for marker in SANDBOX_FAILURE_MARKERS)
-        success = not has_failure_marker and exit_code == 0
+        # 修复：exit_code None（regex 未匹配）时，仅依据失败标记判定，避免 None==0 假阴性
+        if exit_code is None:
+            success = not has_failure_marker
+        else:
+            success = not has_failure_marker and exit_code == 0
 
         code = (action_input or {}).get("code") or ""
         file_path_input = (action_input or {}).get("file_path") or ""
@@ -1520,7 +1534,7 @@ class VerificationAgent(BaseAgent):
                 "target_ref": target_ref,
                 "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
                 "network_enabled": False,
-                "evidence_summary": (observation or "")[:1000],
+                "evidence_summary": (observation or "")[:5000],
                 "finding_id": finding_id,
             }
         )
