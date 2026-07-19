@@ -5,6 +5,8 @@
 
 import { apiClient } from "./serverClient";
 
+import type { SandboxAttempt } from "@/pages/AgentAudit/types";
+
 // ============ Types ============
 
 export interface AgentTask {
@@ -79,6 +81,21 @@ export interface AgentTask {
   orchestrator_alive?: boolean;
 }
 
+export interface VerificationResult {
+  details?: string;
+  verdict?: string;
+  verification_status?: string;
+  verification_note?: string;
+  failure_reason?: string;
+  sandbox_attempts_summary?: Array<{
+    success?: boolean;
+    exit_code?: number;
+    command?: string;
+    target_ref?: string;
+    weak_evidence?: boolean;
+  }>;
+}
+
 export interface AgentFinding {
   id: string;
   task_id: string;
@@ -94,6 +111,10 @@ export interface AgentFinding {
 
   status: string;
   is_verified: boolean;
+  verification_status?: string;
+  verification_method?: string;
+  verification_result?: VerificationResult;
+  sandbox_attempts?: SandboxAttempt[];
   has_poc: boolean;
   poc_code: string | null;
 
