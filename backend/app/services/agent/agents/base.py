@@ -1288,9 +1288,9 @@ class BaseAgent(ABC):
                         output += f"\n\n发现:\n{json.dumps(result.metadata['findings'][:10], ensure_ascii=False, indent=2)}"
 
                 # 截断过长输出
-                # Fix: 与 emit_tool_result 的 10000 保持一致，确保 LLM 能看到完整沙箱输出
-                if len(output) > 10000:
-                    output = output[:10000] + f"\n\n... [输出已截断，共 {len(str(result.data))} 字符]"
+                # 上限 50000，与 emit_tool_result 和沙箱源头对齐，确保 LLM 能看到完整沙箱输出
+                if len(output) > 50000:
+                    output = output[:50000] + f"\n\n... [输出已截断，共 {len(str(result.data))} 字符]"
                 return output
             else:
                 # 🔥 输出详细的错误信息，包括原始错误

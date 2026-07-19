@@ -37,6 +37,7 @@ export interface AgentTask {
   // Q1: 验证状态分布（confirmed/not_reproducible/needs_context/false_positive）
   verification_status_breakdown?: {
     confirmed: number;
+    static_confirmed: number;
     not_reproducible: number;
     needs_context: number;
     false_positive: number;

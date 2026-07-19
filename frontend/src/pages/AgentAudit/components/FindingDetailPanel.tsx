@@ -40,7 +40,8 @@ export function FindingDetailPanel({ finding, onClose }: FindingDetailPanelProps
         <div>
           <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">文件位置</div>
           <div className="text-sm font-mono text-blue-700 dark:text-blue-400 break-all">
-            {finding.file_path}:{finding.line_start}
+            {finding.file_path || "-"}
+            {finding.line_start != null && `:${finding.line_start}`}
           </div>
         </div>
 
