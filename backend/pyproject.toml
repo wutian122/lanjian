@@ -14,7 +14,6 @@ dependencies = [
     # ============ Web Framework ============
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
-    "sse-starlette>=1.8.2",
 
     # ============ Database ============
     "sqlalchemy>=2.0.0",
@@ -42,19 +41,12 @@ dependencies = [
     "tiktoken>=0.5.2",
 
     # ============ Report Generation ============
-    "reportlab>=4.0.0",
     "weasyprint>=60.0",
     "jinja2>=3.1.6",
 
     # ============ Utilities ============
     "json-repair>=0.30.0",
-    "aiofiles>=23.2.1",
-
-    # ============ LangChain & LangGraph ============
-    "langchain>=0.1.0",
-    "langchain-community>=0.0.20",
-    "langchain-openai>=0.0.5",
-    "langgraph>=0.0.40",
+    "pyyaml>=6.0",
 
     # ============ Vector Database ============
     "chromadb>=0.4.22",
@@ -63,34 +55,17 @@ dependencies = [
     # 使用 tree-sitter-language-pack 替代已废弃的 tree-sitter-languages
     "tree-sitter>=0.23.0",
     "tree-sitter-language-pack>=0.4.0",
-    "pygments>=2.17.0",
 
     # ============ Docker Sandbox ============
     "docker>=7.0.0",
 
     # ============ Security Tools ============
-    "bandit>=1.7.0",
     "safety>=2.3.0",
     "pip-audit>=2.6.0",
 
-    # ============ Kunlun-M Dependencies (MIT License) ============
-    # https://github.com/LoRexxar/Kunlun-M
-    "pyjsparser>=2.7.1",
-    "phply>=1.2.6",
-    "esprima>=4.0.1",
-    "jsbeautifier>=1.14.0",
-    "colorlog>=6.0.0",
-    "portalocker>=2.0.0",
-    "prettytable>=3.0.0",
-    "rarfile>=4.0",
-    "beautifulsoup4>=4.12.0",
-    "django>=4.2.0",
 ]
 
 [project.optional-dependencies]
-# MySQL support for Kunlun-M web mode
-mysql = ["mysqlclient>=2.2.0"]
-
 # Development tools
 dev = [
     "pytest>=7.4.0",
@@ -100,13 +75,6 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.5.0",
     "pre-commit>=3.5.0",
-]
-
-# Documentation
-docs = [
-    "mkdocs>=1.5.0",
-    "mkdocs-material>=9.4.0",
-    "mkdocstrings[python]>=0.23.0",
 ]
 
 [build-system]
