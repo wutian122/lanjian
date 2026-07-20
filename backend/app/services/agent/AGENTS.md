@@ -44,7 +44,6 @@ agent/
 │   ├── sandbox_language.py # 多语言沙箱支持（Python/Node/Java/Go/Ruby/PHP/Shell）
 │   ├── run_code.py        # 代码执行
 │   ├── external_tools.py  # 外部安全工具（Semgrep/Bandit/Gitleaks/npm audit/Safety/OSV/TruffleHog）
-│   ├── kunlun_tool.py     # Kunlun-M 静态代码分析
 │   ├── reporting_tool.py  # 审计报告生成
 │   ├── thinking_tool.py   # LLM 思考链工具（ThinkTool、ReflectTool）
 │   ├── finish_tool.py     # Agent 任务终结
@@ -103,7 +102,6 @@ Task → Orchestrator（制定计划）
          输出：tech_stack, entry_points, recommended_tools, high_risk_areas
      → Orchestrator（评估结果，调度 Analysis）
      → Analysis（深度审计，发现漏洞）
-         第一优先级：外部专业工具（Semgrep/Bandit/Gitleaks/Safety/npm audit/Kunlun-M）
          第二优先级：智能扫描工具（smart_scan、quick_audit）
          第三优先级：内置分析工具（pattern_match、dataflow_analysis）
          输出：findings[]（漏洞列表）
@@ -146,7 +144,6 @@ class TaskHandoff:
 | **模式匹配** | `PatternMatchTool` | 危险模式匹配 |
 | **代码分析** | `CodeAnalysisTool`、`DataFlowAnalysisTool`、`VulnerabilityValidationTool` | AST 分析、数据流追踪 |
 | **外部工具** | `SemgrepTool`、`BanditTool`、`GitleaksTool`、`NpmAuditTool`、`SafetyTool`、`OSVScannerTool`、`TruffleHogTool` | 专业安全扫描 |
-| **Kunlun-M** | `KunlunMTool`、`KunlunRuleListTool`、`KunlunPluginTool` | 深度代码审计 |
 | **沙箱** | `SandboxTool`、`SandboxHttpTool`、`VulnerabilityVerifyTool` | Docker 沙箱执行 |
 | **多语言测试** | `PythonTestTool`、`PhpTestTool`、`JavaScriptTestTool`、`JavaTestTool`、`GoTestTool`、`RubyTestTool`、`ShellTestTool` | 多语言代码测试 |
 | **漏洞专用** | `CommandInjectionTestTool`、`SqlInjectionTestTool`、`XssTestTool`、`PathTraversalTestTool`、`SstiTestTool`、`DeserializationTestTool` | 漏洞类型测试 |

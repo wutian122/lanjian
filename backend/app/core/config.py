@@ -129,13 +129,6 @@ class Settings(BaseSettings):
 
     # ============ v3.1 Fusion: code-audit-main 铻嶅悎閰嶇疆 ============
 
-    # Security Controls Engine
-    CONTROLS_CONFIG_DIR: str = "./app/services/controls/data"
-    CONTROLS_ENABLED: bool = True  # 鏄惁鍚敤瀹夊叏鎺у埗寮曟搸
-
-    # Knowledge Base (鏉ヨ嚜 code-audit-main)
-    KB_DOCUMENTS_PATH: str = "./app/services/controls/data/knowledge"
-
     # Feature Flags 鈥?鍚勭粍浠跺彲鐙珛寮€鍏?
     ENABLE_COVERAGE_TRACKING: bool = True       # D1-D10 瑕嗙洊鐭╅樀
     ENABLE_ANTI_HALLUCINATION: bool = True      # 澧炲己闃插够瑙夎鍒?
