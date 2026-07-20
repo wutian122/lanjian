@@ -48,6 +48,7 @@ import {
 import { apiClient } from "@/shared/api/serverClient";
 import { downloadAgentReport } from "@/shared/api/agentTasks";
 import type { AgentTask, AgentFinding } from "@/shared/api/agentTasks";
+import { VerificationStatusBreakdown } from "@/shared/components/VerificationStatusBreakdown";
 
 // ============ Types ============
 
@@ -281,6 +282,12 @@ const EnhancedStatsPanel = memo(function EnhancedStatsPanel({
           </div>
         ))}
       </div>
+
+      {/* Q1: 验证状态分布 */}
+      <VerificationStatusBreakdown
+        breakdown={task.verification_status_breakdown}
+        className="flex-1 items-center"
+      />
     </div>
   );
 });

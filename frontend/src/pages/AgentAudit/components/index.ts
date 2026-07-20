@@ -12,7 +12,6 @@ export { StatsPanel } from './StatsPanel';
 export { Header } from './Header';
 export { AgentErrorBoundary } from './AgentErrorBoundary';
 export { ConnectionStatus } from './ConnectionStatus';
-export { ReportExportDialog } from './ReportExportDialog';
 export { AICollaborationPanel } from './AICollaborationPanel';
 export { InitProgress } from './InitProgress';
 export { FindingSandboxEvidence } from "./FindingSandboxEvidence";
