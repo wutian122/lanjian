@@ -37,7 +37,7 @@ export default defineConfig({
           ],
           charts: ['recharts'],
           icons: ['lucide-react'],
-          utils: ['clsx', 'tailwind-merge', 'sonner', 'marked', 'qrcode']
+          utils: ['clsx', 'tailwind-merge', 'sonner', 'marked']
         },
       },
     },
