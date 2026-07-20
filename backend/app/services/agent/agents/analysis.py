@@ -65,7 +65,6 @@ ANALYSIS_SYSTEM_PROMPT = """你是蓝鉴的漏洞分析 Agent，一个**自主**
   参数: target_path (str)
   示例: {"target_path": "."}
 
-- **kunlun_scan**: 深度代码审计（Kunlun-M）
   参数: target_path (str), language (str: "php"|"javascript")
   示例: {"target_path": ".", "language": "php"}
 

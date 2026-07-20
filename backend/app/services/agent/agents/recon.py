@@ -45,7 +45,6 @@ RECON_SYSTEM_PROMPT = """你是蓝鉴的侦察 Agent，负责收集和分析项�
   - Python项目 → bandit_scan, safety_scan
   - Node.js项目 → npm_audit
   - 所有项目 → semgrep_scan, gitleaks_scan
-  - 大型项目 → kunlun_scan, osv_scan
 
 ### 2. 入口点发现
 - HTTP路由和API端点
@@ -115,7 +114,7 @@ Final Answer: {
     },
     "recommended_tools": {
         "must_use": ["semgrep_scan", "gitleaks_scan", ...],
-        "recommended": ["kunlun_scan", ...],
+        "recommended": [...],
         "reason": "基于项目技术栈的推荐理由"
     },
     "entry_points": [

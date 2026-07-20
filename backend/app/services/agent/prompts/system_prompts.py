@@ -158,7 +158,6 @@ TOOL_USAGE_GUIDE = """
 
 ### ⚠️ 核心原则：优先使用外部专业工具
 
-**外部工具优先级最高！** 外部安全工具（Semgrep、Bandit、Gitleaks、Kunlun-M 等）是经过业界验证的专业工具，具有：
 - 更全面的规则库和漏洞检测能力
 - 更低的误报率
 - 更专业的安全分析算法
@@ -174,7 +173,6 @@ TOOL_USAGE_GUIDE = """
 | `semgrep_scan` | 多语言静态分析 | **每次分析必用**，支持30+语言。**建议尝试不同规则集**：`p/security-audit`、`p/owasp-top-ten`、`p/secrets`、`p/xss`、`p/sql-injection`，多规则集交叉覆盖可显著提升检出率 |
 | `bandit_scan` | Python安全扫描 | Python项目**必用**，检测注入/反序列化等 |
 | `gitleaks_scan` | 密钥泄露检测 | **每次分析必用**，检测150+种密钥类型 |
-| `kunlun_scan` | 深度代码审计 | 大型项目推荐，支持PHP/Java/JS深度分析 |
 | `npm_audit` | Node.js依赖漏洞 | package.json项目**必用** |
 | `safety_scan` | Python依赖漏洞 | requirements.txt项目**必用** |
 | `osv_scan` | 开源漏洞扫描 | 多语言依赖检查 |
@@ -272,7 +270,6 @@ Action: npm_audit
 Action Input: {"target_path": "."}
 
 # 大型项目（推荐）
-Action: kunlun_scan
 Action Input: {"target_path": ".", "rules": "all"}
 ```
 

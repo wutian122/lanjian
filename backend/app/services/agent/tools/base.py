@@ -132,44 +132,6 @@ class AgentTool(ABC):
         
         return result
     
-    def get_langchain_tool(self):
-        """转换为 LangChain Tool"""
-        from langchain.tools import Tool, StructuredTool
-        import asyncio
-        
-        def sync_wrapper(**kwargs):
-            """同步包装器"""
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self.execute(**kwargs))
-                    result = future.result()
-            else:
-                result = asyncio.run(self.execute(**kwargs))
-            return result.to_string()
-        
-        async def async_wrapper(**kwargs):
-            """异步包装器"""
-            result = await self.execute(**kwargs)
-            return result.to_string()
-        
-        if self.args_schema:
-            return StructuredTool(
-                name=self.name,
-                description=self.description,
-                func=sync_wrapper,
-                coroutine=async_wrapper,
-                args_schema=self.args_schema,
-            )
-        else:
-            return Tool(
-                name=self.name,
-                description=self.description,
-                func=lambda x: sync_wrapper(query=x),
-                coroutine=lambda x: async_wrapper(query=x),
-            )
-    
     @property
     def stats(self) -> Dict[str, Any]:
         """工具使用统计"""

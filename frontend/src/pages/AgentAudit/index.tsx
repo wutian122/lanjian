@@ -42,7 +42,7 @@ import {
   ConnectionStatus,
   AICollaborationPanel,
 } from "./components";
-import ReportExportDialog from "./components/ReportExportDialog";
+import ReportExportDialog from "@/components/reports/AgentReportExportDialog";
 import { FindingDetailPanel } from "./components/FindingDetailPanel";
 import { useAgentAuditState } from "./hooks";
 import { ACTION_VERBS, POLLING_INTERVALS } from "./constants";

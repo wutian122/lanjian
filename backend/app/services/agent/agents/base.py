@@ -1200,7 +1200,6 @@ class BaseAgent(ABC):
                 "gitleaks_scan": 60,
                 "npm_audit": 90,
                 "safety_scan": 60,
-                "kunlun_scan": 180,
                 "osv_scanner": 60,
                 "trufflehog_scan": 90,
                 "sandbox_exec": 60,

@@ -10,11 +10,4 @@ from .agent_task import (
     AgentTaskStatus, AgentTaskPhase, AgentEventType,
     VulnerabilitySeverity, VulnerabilityType, FindingStatus
 )
-# v3.1 Fusion: code-audit-main 融合模型
-from .security_control import (
-    SecurityControlModel, SensitiveOperationModel,
-    OperationRequiredControlModel, LanguageAdapterModel,
-)
-from .coverage import CoverageTrack
 from .audit_log import AuditLog
-
