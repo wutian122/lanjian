@@ -4,6 +4,9 @@
 
 FROM docker.m.daocloud.io/python:3.11-bullseye
 
+# ?????arm64/amd64 ?????buildx ?????legacy build ? --build-arg TARGETARCH=
+ARG TARGETARCH
+
 LABEL maintainer="XCodeReviewer Team"
 LABEL description="Secure sandbox environment for vulnerability verification and security scanning"
 
@@ -44,7 +47,7 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
 ENV PATH=$PATH:/usr/local/go/bin
 ENV GOPROXY=https://goproxy.cn,direct
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    curl -L https://mirrors.aliyun.com/golang/go1.21.6.linux-amd64.tar.gz -o go.tar.gz && \
+    curl -L https://mirrors.aliyun.com/golang/go1.21.6.linux-${TARGETARCH:-amd64}.tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && \
     rm go.tar.gz
 
@@ -98,8 +101,10 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
 
 # Gitleaks: 检测代码中的硬编码密钥、Token、私钥
 # 🔥 使用本地预下载的二进制包，避免沙箱构建时访问 GitHub
-COPY gitleaks_8.30.1_linux_x64.tar.gz /tmp/gitleaks.tar.gz
-RUN tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin/ && \
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+    GL_ARCH="$([ "${TARGETARCH:-amd64}" = "arm64" ] && echo arm64 || echo x64)" && \
+    curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" -o /tmp/gitleaks.tar.gz && \
+    tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin/ && \
     chmod +x /usr/local/bin/gitleaks && \
     rm /tmp/gitleaks.tar.gz
 
