@@ -420,7 +420,7 @@ lanjian/
 │   ├── package.json            # 前端依赖与脚本
 │   └── pnpm-lock.yaml          # 前端锁定依赖
 ├── docker/                     # 沙箱 Dockerfile 与安全配置
-├── docs/                       # 架构、流程、删除清单
+├── docs/                       # 架构与流程文档
 ├── e2e/                        # Playwright E2E 规格
 ├── openspec/                   # OpenSpec 规格与变更记录
 ├── rules/                      # 安全规则配置
@@ -450,19 +450,14 @@ Agent 审计核心位于 `backend/app/services/agent/`，主流程如下：
 
 ## 当前仓库状态
 
-这个仓库已经做过一次初始化清理，当前默认不包含：
+仓库仅保留核心运行必需的源码与配置，默认不追踪：
 
-- `.git`
-- 前端 `node_modules`
-- 前端 `dist`
-- Python `__pycache__`
-- 本地构建缓存和临时目录
+- 前端 `node_modules` 与 `dist`
+- Python `__pycache__`、`.pytest_cache`、`.mypy_cache`、`.ruff_cache`
+- 本地日志、审计中间产物（`agent_checkpoints/`、`audit_remote.log` 等）
+- IDE、Codex/Claude、OpenSpec 临时状态目录
 
-如果要运行源码开发流程，需要重新安装本地依赖。
-
-删除清单保留在：
-
-- [deleted-paths.txt](</E:/Trae code/python-use/项目/lanjian/docs/deleted-paths.txt:1>)
+如果要运行源码开发流程，需要按“本地源码开发”一节重新安装依赖。
 
 ## 质量验证
 
@@ -486,8 +481,6 @@ uv run pytest
 docker compose config
 docker compose up -d
 ```
-
-当前这台本地工作机没有 Docker CLI，因此本次 Compose 变更只做了文件级静态复核，没有执行 `docker compose config`。
 
 ## 贡献规范
 

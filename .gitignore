@@ -12,6 +12,11 @@ Thumbs.db
 # Local agent / tool metadata
 .agents/
 .codex/
+.claude/
+.codegraph/
+.superpowers/
+.pnpm-store/
+docs/superpowers/
 
 # Python
 __pycache__/
@@ -47,6 +52,8 @@ frontend/.env.*
 logs/
 tmp/
 temp/
+backend/agent_checkpoints/
+frontend/audit_remote.log
 
 # Build / runtime outputs
 backend/uploads/*
