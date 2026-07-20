@@ -36,9 +36,8 @@ export default defineConfig({
             '@radix-ui/react-accordion'
           ],
           charts: ['recharts'],
-          ai: ['@google/generative-ai'],
           icons: ['lucide-react'],
-          utils: ['clsx', 'tailwind-merge', 'date-fns', 'sonner', 'marked', 'qrcode']
+          utils: ['clsx', 'tailwind-merge', 'sonner', 'marked', 'qrcode']
         },
       },
     },
@@ -95,7 +94,6 @@ export default defineConfig({
       'react',
       'react-dom',
       'react-router-dom',
-      '@google/generative-ai',
       'recharts',
       'sonner'
     ],
