@@ -32,7 +32,7 @@ services:
       - lanjian-network
 
   db-migrate:
-    image: wutian449/lanjian-backend:init
+    image: wutian449/lanjian-backend:${IMAGE_TAG:-latest}
     restart: "no"
     env_file:
       - ./backend/.env
@@ -50,7 +50,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:init
+    image: wutian449/lanjian-backend:${IMAGE_TAG:-latest}
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -63,7 +63,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       AGENT_ENABLED: "true"
       SANDBOX_ENABLED: "true"
-      SANDBOX_IMAGE: wutian449/lanjian-sandbox:latest
+      SANDBOX_IMAGE: wutian449/lanjian-sandbox:${IMAGE_TAG:-latest}
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
@@ -90,7 +90,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:init
+    image: wutian449/lanjian-frontend:${IMAGE_TAG:-latest}
     restart: unless-stopped
     ports:
       - "80:80"
@@ -102,7 +102,7 @@ services:
       - lanjian-network
 
   sandbox:
-    image: wutian449/lanjian-sandbox:latest
+    image: wutian449/lanjian-sandbox:${IMAGE_TAG:-latest}
     restart: "no"
     command: ["sh", "-c", "echo Sandbox image ready"]
 
