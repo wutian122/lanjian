@@ -90,13 +90,23 @@ cd lanjian
 cp backend/env.example backend/.env
 # 编辑 backend/.env：设置 POSTGRES_PASSWORD、SUPERADMIN_USERNAME、SUPERADMIN_PASSWORD、LLM_API_KEY 等
 
-# 3. 启动全部服务
+# 3. 拉取 Docker Hub 上的最新镜像并启动全部服务
+docker compose pull
 docker compose up -d
 
 # 4. 访问
 #    前端: http://localhost
 #    后端 API 文档: http://localhost:8000/docs
 ```
+
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 通过 `${IMAGE_TAG:-latest}` 解析，默认拉取 Docker Hub 上的 `wutian449/lanjian-*:latest`。若需锁定到某个具体版本，用环境变量：
+
+```bash
+IMAGE_TAG=v3.6.0 docker compose pull
+IMAGE_TAG=v3.6.0 docker compose up -d
+```
+
+可选：在部署机根目录建 `.env` 文件永久锁版本 —— `echo "IMAGE_TAG=v3.6.0" > .env`。
 
 ### 方式 B：本地开发
 
