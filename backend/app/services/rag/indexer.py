@@ -152,6 +152,7 @@ class VectorStore:
         embeddings: List[List[float]],
         documents: List[str],
         metadatas: List[Dict[str, Any]],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         """更新或插入文档"""
         raise NotImplementedError
@@ -355,6 +356,7 @@ class ChromaVectorStore(VectorStore):
         embeddings: List[List[float]],
         documents: List[str],
         metadatas: List[Dict[str, Any]],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         """更新或插入文档（用于增量更新）"""
         if not ids:
@@ -363,7 +365,11 @@ class ChromaVectorStore(VectorStore):
         cleaned_metadatas = self._clean_metadatas(metadatas)
 
         # 分批 upsert
-        batch_size = 500
+        # 减小批大小：从 500 -> 100，避免 ARM/Docker 上单批阻塞太久
+        batch_size = 100
+        total = len(ids)
+        processed = 0
+        
         for i in range(0, len(ids), batch_size):
             batch_ids = ids[i:i + batch_size]
             batch_embeddings = embeddings[i:i + batch_size]
@@ -377,6 +383,13 @@ class ChromaVectorStore(VectorStore):
                 documents=batch_documents,
                 metadatas=batch_metadatas,
             )
+            
+            processed += len(batch_ids)
+            if progress_callback:
+                progress_callback(processed, total)
+            
+            # 让出事件循环，让 SSE 进度事件能及时发送
+            await asyncio.sleep(0)
 
     async def delete_by_file_path(self, file_path: str) -> int:
         """删除指定文件的所有文档"""
@@ -579,6 +592,7 @@ class InMemoryVectorStore(VectorStore):
         embeddings: List[List[float]],
         documents: List[str],
         metadatas: List[Dict[str, Any]],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         """更新或插入文档"""
         await self.add_documents(ids, embeddings, documents, metadatas)
@@ -1353,6 +1367,7 @@ class CodeIndexer:
                 embeddings=embeddings,
                 documents=documents,
                 metadatas=metadatas,
+                progress_callback=embedding_progress_callback,
             )
         else:
             await self.vector_store.add_documents(
