@@ -181,10 +181,12 @@ export interface HeaderProps {
   isPaused: boolean;
   isPausing: boolean;
   isResuming: boolean;
+  isDeleting?: boolean;
   onPause: () => void;
   onResume: () => void;
   onExport: () => void;
   onNewAudit: () => void;
+  onDelete?: () => void;
   onOpenAiPanel?: () => void;
 }
 

@@ -16,6 +16,7 @@ from enum import Enum
 
 from .base import AgentTool, ToolResult
 from .sandbox_tool import SandboxManager
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,11 @@ class CommandInjectionTestTool(AgentTool):
             return ToolResult(success=False, error="沙箱环境不可用")
 
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 
@@ -521,7 +526,11 @@ class SqlInjectionTestTool(AgentTool):
             return ToolResult(success=False, error="沙箱环境不可用")
 
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 
@@ -724,7 +733,11 @@ class XssTestTool(AgentTool):
             return ToolResult(success=False, error="沙箱环境不可用")
 
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 
@@ -936,7 +949,11 @@ class PathTraversalTestTool(AgentTool):
             return ToolResult(success=False, error="沙箱环境不可用")
 
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 
@@ -1151,7 +1168,11 @@ class SstiTestTool(AgentTool):
             return ToolResult(success=False, error="沙箱环境不可用")
 
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 
@@ -1339,7 +1360,11 @@ class DeserializationTestTool(AgentTool):
     ) -> ToolResult:
         """执行反序列化漏洞检测"""
         # 读取目标文件
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-1: 用 resolve_safe_path 挡 Path Traversal（LLM 可能返回 ../../etc/passwd）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {target_file}")
 

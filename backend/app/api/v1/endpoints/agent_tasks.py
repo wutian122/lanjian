@@ -36,6 +36,7 @@ from app.services.agent.strict_finding import is_strict_finding, MIN_CONFIDENCE_
 from app.services.agent.streaming import StreamHandler, StreamEvent, StreamEventType
 from app.services.git_ssh_service import GitSSHOperations
 from app.core.encryption import decrypt_sensitive_data
+from app.core.rbac import build_agent_task_filter, get_subordinate_user_ids, assert_can_access_project
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.llm.service import LLMService
 from app.services.agent.agents.base import AgentResult
@@ -48,6 +49,45 @@ _running_tasks: Dict[str, Any] = {}
 
 # 🔥 运行中的 asyncio Tasks（用于强制取消）
 _running_asyncio_tasks: Dict[str, asyncio.Task] = {}
+
+
+# P2-5: 后台任务异常保护 —— fire-and-forget 的 asyncio.create_task 如果内部抛异常，
+# 只留一条 "Task exception was never retrieved" warning 就静默丢失，SSE 客户端和
+# 后端日志都收不到确切错误。用 _launch_task_bg 包装：
+#   - 加 done_callback 打 logger.exception
+#   - 保留强引用避免被 GC（asyncio.create_task 只弱引用 task 本身，coro 也可能被 GC）
+_background_task_refs: Set[asyncio.Task] = set()
+
+
+def _launch_task_bg(coro, task_name: str) -> asyncio.Task:
+    """
+    fire-and-forget 地启动一个协程，异常时打 logger.exception。
+
+    与 ``asyncio.create_task`` 的区别：
+      - 保留强引用 —— 避免 asyncio.Task 被 GC 导致协程被静默中断；
+      - 加 done_callback —— 任务完成后自动打异常日志并解引用。
+
+    Args:
+        coro: 要运行的协程。
+        task_name: 异常日志里显示的任务名，便于定位。
+    """
+    task = asyncio.create_task(coro, name=task_name)
+    _background_task_refs.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_task_refs.discard(t)
+        if t.cancelled():
+            logger.debug(f"[BgTask] {task_name} cancelled")
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.exception(
+                f"[BgTask] {task_name} raised unhandled exception",
+                exc_info=exc,
+            )
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 # ============ Schemas ============
@@ -260,7 +300,33 @@ _running_orchestrators: Dict[str, Any] = {}
 # 运行中的事件管理器（用于 SSE 流）
 _running_event_managers: Dict[str, EventManager] = {}
 # 🔥 已取消的任务集合（用于前置操作的取消检查）
-_cancelled_tasks: Set[str] = set()
+# P2-8: 从 set() 换成带 TTL 的 dict —— 旧版如果任务在标记为 cancelled 后从未走到
+# _execute_agent_task 的 finally 分支（例如根本没启动就 cancel），task_id 会永远留在集合里，
+# 长时间运行的进程内会累积成不可控的内存泄漏。这里给每个 entry 记录 added_at，
+# 每次 is_task_cancelled 顺手扫掉超过 TTL 的条目（惰性清理，零后台线程）。
+_CANCELLED_TASK_TTL_SECONDS = 24 * 3600  # 24h 足够任何合理的重试窗口
+_cancelled_tasks: Dict[str, float] = {}
+
+
+def _cancelled_tasks_add(task_id: str) -> None:
+    import time as _time
+    _cancelled_tasks[task_id] = _time.monotonic()
+
+
+def _cancelled_tasks_discard(task_id: str) -> None:
+    _cancelled_tasks.pop(task_id, None)
+
+
+def _cancelled_tasks_prune() -> None:
+    """惰性清理：移除超过 TTL 的条目。"""
+    import time as _time
+    now = _time.monotonic()
+    expired = [
+        tid for tid, t in _cancelled_tasks.items()
+        if now - t > _CANCELLED_TASK_TTL_SECONDS
+    ]
+    for tid in expired:
+        _cancelled_tasks.pop(tid, None)
 
 # SSE 流的终态状态集合：任务进入这些状态时，SSE 流推送 task_end 并断开。
 # 注意：
@@ -279,6 +345,8 @@ _SSE_TERMINAL_STATUSES: set[str] = {
 
 def is_task_cancelled(task_id: str) -> bool:
     """检查任务是否已被取消"""
+    # P2-8: 顺手做惰性 TTL 清理
+    _cancelled_tasks_prune()
     return task_id in _cancelled_tasks
 
 
@@ -370,7 +438,11 @@ async def _re_audit_task(task_id: str, finding_ids: list[str]):
             checkpoint_id = checkpoint.id
 
         # Launch the standard execution with resume from checkpoint
-        asyncio.create_task(_execute_agent_task(task_id, resume_checkpoint_id=checkpoint_id))
+        # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception
+        _launch_task_bg(
+            _execute_agent_task(task_id, resume_checkpoint_id=checkpoint_id),
+            task_name=f"reaudit-{task_id}",
+        )
         logger.info(f"[ReAudit] Task {task_id} launched with checkpoint {checkpoint_id}")
 
     except Exception as e:
@@ -412,6 +484,42 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
     # 这样可以确保整个任务生命周期内使用同一个管理器，并且尽早发现 Docker 问题
     logger.info(f"🚀 Starting execution for task {task_id}")
     sandbox_manager = SandboxManager()
+
+    # 修复"任务已断开"横幅在 RAG 索引阶段（10+ 分钟）误报：
+    # _execute_agent_task 进入到 orchestrator.run() 之间可能长达 10+ 分钟
+    # （下载 ZIP / 解压 / RAG 索引），期间没有心跳，Redis alive key 空 →
+    # 前端 orchestrator_alive=false → 显示"任务已断开"。
+    # 这里 spawn 一个 early heartbeat 协程，每 5s 刷 alive，orchestrator.run()
+    # 里的正式心跳启动后我们 cancel 它，避免双写。
+    _early_alive_task: asyncio.Task | None = None
+
+    async def _early_pump_alive():
+        """在 orchestrator 心跳启动前的兜底心跳。"""
+        try:
+            from app.services.agent.core.orchestrator_registry import get_registry
+            registry = await get_registry()
+        except Exception as e:
+            logger.warning(f"[AgentTask] early heartbeat init failed for {task_id}: {e}")
+            return
+        while True:
+            try:
+                await asyncio.wait_for(
+                    registry.set_alive(task_id, event_manager_local=True),
+                    timeout=2.0,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(f"[AgentTask] early heartbeat set_alive error for {task_id}: {e}")
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return
+
+    try:
+        _early_alive_task = asyncio.create_task(_early_pump_alive(), name=f"early-alive-{task_id}")
+    except Exception as _spawn_err:
+        logger.debug(f"[AgentTask] early heartbeat spawn failed for {task_id}: {_spawn_err}")
     await sandbox_manager.initialize()
     logger.info(f"🐳 Global Sandbox Manager initialized (Available: {sandbox_manager.is_available})")
 
@@ -718,15 +826,41 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
             }
             if resume_state and isinstance(resume_state, dict):
                 input_data["resume_checkpoint"] = resume_state
-            
+
+            # 问题 1A 修复（心跳启动前置）：
+            # 原实现先 emit_phase_start 再 create_task(orchestrator.run)，而心跳协程在
+            # orchestrator.run() 内部才创建，导致前端收到 phase_start 后立即拉取 /agent-tasks/{id}
+            # 时 Redis 尚无 alive 键，orchestrator_alive 被误判为 False，横幅误报"任务可能已断开"。
+            # 修复：在 phase_start 之前，先由 endpoint 侧同步写入一次 alive 键，确保后续
+            # is_alive 判定为 True。心跳协程随后正常刷新 TTL。
+            try:
+                from app.services.agent.core.orchestrator_registry import get_registry as _get_registry
+                _registry = await _get_registry()
+                await asyncio.wait_for(
+                    _registry.set_alive(task_id, event_manager_local=True),
+                    timeout=2.0,
+                )
+            except Exception as _pre_alive_err:  # 不阻塞主流程；心跳协程会兜底
+                logger.debug(f"[AgentTask] pre-alive registry write failed for {task_id}: {_pre_alive_err}")
+
             # 执行 Orchestrator
             await event_emitter.emit_phase_start("orchestration", "🎯 Orchestrator 开始编排审计流程")
             task.current_phase = AgentTaskPhase.ANALYSIS
             await db.commit()
-            
+
             # 🔥 将 orchestrator.run() 包装在 asyncio.Task 中，以便可以强制取消
             run_task = asyncio.create_task(orchestrator.run(input_data))
             _running_asyncio_tasks[task_id] = run_task
+
+            # 修复"任务已断开"误报：orchestrator.run 内部会启动自己的心跳协程，
+            # 这里把 early heartbeat 取消掉避免两个协程同时写 alive key。
+            if _early_alive_task is not None and not _early_alive_task.done():
+                _early_alive_task.cancel()
+                try:
+                    await _early_alive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                _early_alive_task = None
             
             try:
                 # Fix: 总体超时保护，防止任务无限运行
@@ -909,7 +1043,12 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
             _running_tasks.pop(task_id, None)
             _running_event_managers.pop(task_id, None)
             _running_asyncio_tasks.pop(task_id, None)  # 🔥 清理 asyncio task
-            _cancelled_tasks.discard(task_id)  # 🔥 清理取消标志
+            _cancelled_tasks_discard(task_id)  # 🔥 P2-8: TTL dict 版本的 discard
+
+            # 修复"任务已断开"误报：任务异常退出（未走到 orchestrator.run() 前置 cancel）时
+            # 也要 cancel early heartbeat，避免协程泄漏。
+            if _early_alive_task is not None and not _early_alive_task.done():
+                _early_alive_task.cancel()
 
             # 🔥 清理整个 Agent 注册表（包括所有子 Agent）
             agent_registry.clear()
@@ -1273,7 +1412,10 @@ async def _initialize_tools(
     verification_tools = {
         **base_tools,
         # 🔥 沙箱验证工具
-        "sandbox_exec": SandboxTool(sandbox_manager),
+        # 修复沙箱验证空目录 bug：SandboxTool 必须传 project_root，否则 execute_tool_command
+        # 里 effective_workdir=None，永远走 execute_command 不挂载分支，
+        # 导致沙箱 /workspace/src 为空，Verification Agent 找不到项目文件，验证全部失败。
+        "sandbox_exec": SandboxTool(sandbox_manager, project_root=project_root),
         "sandbox_http": SandboxHttpTool(sandbox_manager),
         "sandbox_browser": SandboxBrowserTool(sandbox_manager),  # Q2: 浏览器验证
         "verify_vulnerability": VulnerabilityVerifyTool(sandbox_manager),
@@ -2096,8 +2238,7 @@ async def create_agent_task(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     
-    if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此项目")
+    assert_can_access_project(current_user, project)
     
     # 创建任务
     # 🔥 从用户配置读取 RPM 快照，存入 task.agent_config，供任务执行与恢复时使用（task-scoped limiter）
@@ -2159,34 +2300,43 @@ async def list_agent_tasks(
     """
     获取 Agent 任务列表
     """
-    # 获取用户的项目
-    projects_result = await db.execute(
-        select(Project.id).where(Project.owner_id == current_user.id)
-    )
-    user_project_ids = [p[0] for p in projects_result.fetchall()]
-    
-    if not user_project_ids:
-        return []
-    
-    # 构建查询
-    query = select(AgentTask).where(AgentTask.project_id.in_(user_project_ids))
-    
+    # P2-2: 按角色数据范围过滤，替代原来只查 owner_id == current_user.id 的做法。
+    # 旧逻辑存在两个 Bug：
+    #   1) SUPER_ADMIN 只能看到自己项目下的 Agent 任务，其他用户的看不到
+    #   2) ADMIN 看不到下辖用户创建的 Agent 任务
+    # 现在改用 core.rbac.build_agent_task_filter，语义与其他 list 接口一致。
+    from app.models.user import UserRole
+    if current_user.role == UserRole.ADMIN:
+        sub_ids = await get_subordinate_user_ids(db, current_user.id)
+    else:
+        sub_ids = None
+
+    query = select(AgentTask)
+    task_filter = build_agent_task_filter(current_user, sub_ids)
+    if task_filter is not None:
+        query = query.where(task_filter)
+
     if project_id:
+        # 显式指定项目时，同样要保证用户能访问该项目（否则单独用 project_id 就能越权枚举）
+        target_project = await db.get(Project, project_id)
+        from app.core.rbac import can_access_project
+        if not can_access_project(current_user, target_project):
+            return []
         query = query.where(AgentTask.project_id == project_id)
-    
+
     if status:
         try:
             status_enum = AgentTaskStatus(status)
             query = query.where(AgentTask.status == status_enum)
         except ValueError:
             pass
-    
+
     query = query.order_by(AgentTask.created_at.desc())
     query = query.offset(skip).limit(limit)
-    
+
     result = await db.execute(query)
     tasks = result.scalars().all()
-    
+
     return tasks
 
 
@@ -2205,8 +2355,7 @@ async def get_agent_task(
     
     # 检查权限
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     # 构建响应，确保所有字段都包含
     try:
@@ -2290,13 +2439,22 @@ async def get_agent_task(
 
         # Wave 2 §3.2: 填充 orchestrator_alive 字段。基于 Redis registry 判定；
         # Redis 不可用时字段为 None（前端可保持向后兼容行为，不显示恢复横幅）。
+        # 问题 1A 修复（统一存活判定）：Redis 判定为 False 时，兜底检查同进程
+        # _running_orchestrators。多 worker 部署下 Redis 可能因故未刷新，但只要本进程
+        # 持有 orchestrator 实例，任务就一定在运行，避免误报"任务可能已断开"。
         try:
             from app.services.agent.core.orchestrator_registry import get_registry
             registry = await get_registry()
-            response_data["orchestrator_alive"] = await registry.is_alive(task_id)
+            _alive = await registry.is_alive(task_id)
+            if not _alive and _running_orchestrators.get(task_id) is not None:
+                _alive = True
+            response_data["orchestrator_alive"] = _alive
         except Exception as e:
             logger.debug(f"[GetTask] orchestrator_alive check failed for {task_id}: {e}")
-            response_data["orchestrator_alive"] = None
+            # 即便 registry 抛异常，若本进程仍持有 orchestrator，也应视为存活
+            response_data["orchestrator_alive"] = (
+                True if _running_orchestrators.get(task_id) is not None else None
+            )
 
         return AgentTaskResponse(**response_data)
     except Exception as e:
@@ -2319,8 +2477,7 @@ async def cancel_agent_task(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此任务")
+    assert_can_access_project(current_user, project)
 
     if task.status in [AgentTaskStatus.COMPLETED, AgentTaskStatus.COMPLETED_WITH_GAPS, AgentTaskStatus.FAILED, AgentTaskStatus.CANCELLED]:
         raise HTTPException(status_code=400, detail="任务已结束，无法取消")
@@ -2339,7 +2496,7 @@ async def cancel_agent_task(
     )
 
     # 🔥 0. 立即标记任务为已取消（用于前置操作的取消检查）
-    _cancelled_tasks.add(task_id)
+    _cancelled_tasks_add(task_id)  # P2-8: TTL dict 版本的 add
     logger.info(f"[Cancel] Added task {task_id} to cancelled set")
 
     # 🔥 1. 设置 Agent 的取消标志
@@ -2396,8 +2553,7 @@ async def pause_agent_task(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此任务")
+    assert_can_access_project(current_user, project)
 
     if task.status == AgentTaskStatus.PAUSED:
         return {
@@ -2476,8 +2632,7 @@ async def resume_agent_task(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此任务")
+    assert_can_access_project(current_user, project)
 
     if task.status != AgentTaskStatus.PAUSED:
         raise HTTPException(status_code=400, detail="只有已暂停任务可以继续")
@@ -2505,7 +2660,11 @@ async def resume_agent_task(
     task.resume_count = int(getattr(task, "resume_count", 0) or 0) + 1
     await db.commit()
 
-    asyncio.create_task(_execute_agent_task(task_id, resume_checkpoint_id=checkpoint_id))
+    # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception
+    _launch_task_bg(
+        _execute_agent_task(task_id, resume_checkpoint_id=checkpoint_id),
+        task_name=f"resume-{task_id}",
+    )
 
     return {
         "message": "任务已继续",
@@ -2526,8 +2685,7 @@ async def re_audit_agent_task(
         raise HTTPException(status_code=404, detail="task not found")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="no permission")
+    assert_can_access_project(current_user, project)
 
     if task.status != AgentTaskStatus.COMPLETED_WITH_GAPS:
         raise HTTPException(
@@ -2553,8 +2711,10 @@ async def re_audit_agent_task(
     task.resume_count = int(getattr(task, "resume_count", 0) or 0) + 1
     await db.commit()
 
-    asyncio.create_task(
-        _re_audit_task(task_id, [f.id for f in unverified_findings])
+    # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception
+    _launch_task_bg(
+        _re_audit_task(task_id, [f.id for f in unverified_findings]),
+        task_name=f"reaudit-findings-{task_id}",
     )
 
     return {
@@ -2576,8 +2736,7 @@ async def recover_stale_agent_task(
         raise HTTPException(status_code=404, detail="task not found")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="no permission")
+    assert_can_access_project(current_user, project)
 
     if task.status != AgentTaskStatus.RUNNING:
         raise HTTPException(
@@ -2585,9 +2744,20 @@ async def recover_stale_agent_task(
             detail="only running tasks can be recovered"
         )
 
-    # Check if orchestrator is actually running
+    # 问题 1A 修复（统一存活判定）：与 GET /agent-tasks/{id} 保持一致的判定源。
+    # 原实现仅检查同进程 _running_orchestrators，在多 worker 部署下，orchestrator
+    # 可能运行在其他 worker，此处会误判为"未运行"从而错误 recover。
+    # 修复：任一存活证据（Redis alive 键 或 本进程 orchestrator 实例）成立即拒绝 recover。
     orchestrator = _running_orchestrators.get(task_id)
-    if orchestrator:
+    _alive_by_registry = False
+    try:
+        from app.services.agent.core.orchestrator_registry import get_registry as _get_registry
+        _registry = await _get_registry()
+        _alive_by_registry = await _registry.is_alive(task_id)
+    except Exception as _e:
+        logger.debug(f"[Recover] is_alive check failed for {task_id}: {_e}")
+
+    if orchestrator or _alive_by_registry:
         raise HTTPException(
             status_code=400,
             detail="task is actually running, no recovery needed"
@@ -2619,9 +2789,10 @@ async def delete_agent_task(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此任务")
+    assert_can_access_project(current_user, project)
 
+    # 注意：PAUSED 属于「已停止但可恢复」的中间态，允许直接删除。
+    # 只有真正处于活跃执行阶段的任务才拒绝删除。
     active_statuses = [
         AgentTaskStatus.PENDING,
         AgentTaskStatus.INITIALIZING,
@@ -2631,7 +2802,6 @@ async def delete_agent_task(
         AgentTaskStatus.ANALYZING,
         AgentTaskStatus.VERIFYING,
         AgentTaskStatus.REPORTING,
-        AgentTaskStatus.PAUSED,
     ]
     if task.status in active_statuses:
         raise HTTPException(status_code=400, detail="运行中的 Agent 任务不能直接删除，请先取消任务")
@@ -2655,8 +2825,7 @@ async def stream_agent_events(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
 
     async def event_generator():
         """生成 SSE 事件流"""
@@ -2763,8 +2932,7 @@ async def stream_agent_with_thinking(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
 
     # 定义 SSE 格式化函数
     def format_sse_event(event_data: Dict[str, Any]) -> str:
@@ -2953,8 +3121,7 @@ async def list_agent_events(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
 
     result = await db.execute(
         select(AgentEvent)
@@ -2993,8 +3160,7 @@ async def list_agent_findings(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     query = select(AgentFinding).where(AgentFinding.task_id == task_id)
     
@@ -3040,8 +3206,7 @@ async def get_task_summary(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     # 获取所有发现
     result = await db.execute(
@@ -3108,8 +3273,7 @@ async def update_finding_status(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作")
+    assert_can_access_project(current_user, project)
     
     finding = await db.get(AgentFinding, finding_id)
     if not finding or finding.task_id != task_id:
@@ -3202,13 +3366,22 @@ async def _get_project_root(
         if zip_path and os.path.exists(zip_path):
             try:
                 check_cancelled()  # 🔥 解压前再次检查
+                # P0-2: 先做 Zip Slip / Bomb / symlink 静态检查（assert_safe_zip），
+                # 通过后才逐条 extract；循环体内保留取消检查，两者互不干扰。
+                from app.utils.safe_extract import assert_safe_zip, SafeExtractError
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    try:
+                        safe_dest = assert_safe_zip(zip_ref, base_path)
+                    except SafeExtractError as e:
+                        logger.error(f"⛔ Agent task rejected malicious ZIP {zip_path}: {e}")
+                        await emit(f"❌ ZIP 被安全检查拒绝: {e}", "error")
+                        raise RuntimeError(f"ZIP 未通过安全检查: {e}")
                     # 🔥 逐个文件解压，支持取消检查
                     file_list = zip_ref.namelist()
                     for i, file_name in enumerate(file_list):
                         if i % 50 == 0:  # 每50个文件检查一次
                             check_cancelled()
-                        zip_ref.extract(file_name, base_path)
+                        zip_ref.extract(file_name, safe_dest)
                 logger.info(f"✅ Extracted ZIP project {project.id} to {base_path}")
                 await emit(f"✅ ZIP 文件解压完成")
             except Exception as e:
@@ -3675,8 +3848,7 @@ async def get_agent_tree(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     # 尝试从内存中获取 Agent 树（运行中的任务）
     runner = _running_tasks.get(task_id)
@@ -3863,8 +4035,7 @@ async def list_checkpoints(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     from app.models.agent_task import AgentCheckpoint
     
@@ -3914,8 +4085,7 @@ async def get_checkpoint_detail(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
     
     from app.models.agent_task import AgentCheckpoint
     
@@ -3994,8 +4164,7 @@ async def chat_with_agent_task(
         raise HTTPException(status_code=404, detail="任务不存在")
 
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
 
     findings_result = await db.execute(
         select(AgentFinding)
@@ -4099,8 +4268,7 @@ async def generate_audit_report(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     project = await db.get(Project, task.project_id)
-    if not project or project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此任务")
+    assert_can_access_project(current_user, project)
 
     # User 角色不允许下载报告
     if current_user.role == "user":

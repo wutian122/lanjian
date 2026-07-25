@@ -86,7 +86,8 @@ async def list_rule_sets(
         if rs.severity_weights:
             try:
                 severity_weights = json.loads(rs.severity_weights)
-            except:
+            except json.JSONDecodeError:
+                # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
                 pass
         
         rules = [
@@ -155,7 +156,8 @@ async def get_rule_set(
     if rule_set.severity_weights:
         try:
             severity_weights = json.loads(rule_set.severity_weights)
-        except:
+        except json.JSONDecodeError:
+            # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
             pass
     
     rules = [
@@ -323,7 +325,8 @@ async def update_rule_set(
     if rule_set.severity_weights:
         try:
             severity_weights = json.loads(rule_set.severity_weights)
-        except:
+        except json.JSONDecodeError:
+            # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
             pass
     
     rules = [
@@ -417,7 +420,8 @@ async def export_rule_set(
     if rule_set.severity_weights:
         try:
             severity_weights = json.loads(rule_set.severity_weights)
-        except:
+        except json.JSONDecodeError:
+            # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
             pass
     
     export_data = {

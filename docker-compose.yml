@@ -46,6 +46,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lanjian_change_me}
       POSTGRES_DB: ${POSTGRES_DB:-lanjian}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-lanjian_change_me}@db:5432/${POSTGRES_DB:-lanjian}
+      # P0-1: SECRET_KEY 必须由宿主环境或 backend/.env 提供；未设置时 compose 层直接失败，
+      # 强制阻止使用默认弱值启动。后端 config.py 还会再校验一次长度与黑名单。
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY not set - see backend/env.example for how to generate one}
+      # P0-3: CORS 白名单，可选透传；未设置则沿用 backend/.env。
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
       AGENT_ENABLED: "true"
       SANDBOX_ENABLED: "true"
@@ -61,6 +66,12 @@ services:
     volumes:
       - backend_uploads:/app/uploads
       - /var/run/docker.sock:/var/run/docker.sock
+      # P0-2 部署修复: /tmp/lanjian 双向绑定宿主机同名目录。
+      # 原因：backend 通过 docker.sock 让 daemon 起沙箱容器，daemon 是宿主机进程，
+      # 它挂载"源路径"时会去**宿主机**找 /tmp/lanjian/xxx。如果 backend 只在容器内
+      # 解压 ZIP（不同步到宿主机），沙箱看到的是空目录，验证失败。
+      # 加这条 bind mount 让容器内解压 = 宿主机可见。
+      - /tmp/lanjian:/tmp/lanjian:rw
     depends_on:
       db:
         condition: service_healthy

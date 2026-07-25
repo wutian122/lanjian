@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from .base import AgentTool, ToolResult
 from .sandbox_tool import SandboxManager, SandboxConfig
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +315,11 @@ class ExtractFunctionTool(AgentTool):
         import ast
         import re
 
-        full_path = os.path.join(self.project_root, file_path)
+        # P1-5: Path Traversal 防护
+        try:
+            full_path = str(resolve_safe_path(self.project_root, file_path))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {file_path}")
 

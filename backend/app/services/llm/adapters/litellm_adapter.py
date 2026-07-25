@@ -164,7 +164,8 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     code = err.get('code', '')
                     message = err.get('message', '')
                     return f"[{code}] {message}" if code else message
-            except:
+            except (AttributeError, KeyError, TypeError, ValueError):
+                # L2: 解析 error dict 常见的四类；其他异常上抛
                 pass
 
         # 尝试提取 message 字段

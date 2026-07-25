@@ -3,17 +3,50 @@ from pydantic import AnyHttpUrl, validator
 from pydantic_settings import BaseSettings
 
 
+# P0-1 已知弱值黑名单：任何撞上这些的都视为未修改的默认值，拒绝启动。
+_INSECURE_SECRET_KEYS = {
+    "changethis_in_production_to_a_long_random_string",
+    "your-super-secret-key-change-this-in-production",
+    "secret", "changeme", "changethis", "test", "dev", "development",
+}
+
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "蓝鉴"
     API_V1_STR: str = "/api/v1"
-    
+
     # SECURITY
-    SECRET_KEY: str = "changethis_in_production_to_a_long_random_string"
+    # P0-1: 必须由环境变量提供，长度 >= 32 且不在弱值黑名单，否则应用启动失败。
+    # 生成命令：python -c "import secrets; print(secrets.token_urlsafe(48))"
+    SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30  # 30 minutes
-    
+
+    @validator("SECRET_KEY")
+    def validate_secret_key(cls, v: str) -> str:
+        if not v or not isinstance(v, str):
+            raise ValueError(
+                "SECRET_KEY must be set via environment variable. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+            )
+        if len(v) < 32:
+            raise ValueError(
+                f"SECRET_KEY too short ({len(v)} chars); must be >= 32. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+            )
+        if v.strip().lower() in _INSECURE_SECRET_KEYS:
+            raise ValueError(
+                "SECRET_KEY is a well-known default and MUST be changed before starting."
+            )
+        return v
+
     # CORS
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
+
+    # P0-3: CORS 白名单（逗号分隔），优先级高于 BACKEND_CORS_ORIGINS。
+    # 未配置或为空时，main.py 会关闭 allow_credentials 并把 origins 视为 [] 。
+    # 生产必填，如：CORS_ALLOWED_ORIGINS=http://frontend-host-a.example.com,http://frontend-host-b.example.com
+    CORS_ALLOWED_ORIGINS: str = ""
 
     # REGISTRATION
     ALLOW_PUBLIC_REGISTRATION: bool = False
@@ -27,11 +60,32 @@ class Settings(BaseSettings):
         raise ValueError(v)
 
     # POSTGRES
+    # P3-1: POSTGRES_PASSWORD 强制注入 —— 旧默认值 "postgres" 是所有 PG 教程都在用的
+    # 弱密码；生产未改就发布等于给宿主 5432 开放渗透入口。
+    # POSTGRES_USER 保留 "postgres" 默认（PG 官方超管名，公开信息），只锁定密码。
     POSTGRES_SERVER: str = "db"
     POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "postgres"
+    POSTGRES_PASSWORD: str
     POSTGRES_DB: str = "lanjian"
     DATABASE_URL: str | None = None
+
+    @validator("POSTGRES_PASSWORD")
+    def validate_postgres_password(cls, v: str) -> str:
+        # P3-1: 拒绝空 / 弱值。策略比 SECRET_KEY 宽松 —— DB 密码本身不用来签名，
+        # 只要不是"postgres" / "password" / "123456"这种一撞就中的即可。
+        if not v or not isinstance(v, str):
+            raise ValueError("POSTGRES_PASSWORD must be set via environment variable")
+        weak = {"postgres", "password", "123456", "admin", "root", "test", "changeme", "postgres123"}
+        if v.strip().lower() in weak:
+            raise ValueError(
+                "POSTGRES_PASSWORD is a well-known weak value and MUST be changed. "
+                "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(24))\""
+            )
+        if len(v) < 12:
+            raise ValueError(
+                f"POSTGRES_PASSWORD too short ({len(v)} chars); must be >= 12."
+            )
+        return v
 
     @validator("DATABASE_URL", pre=True)
     def assemble_db_connection(cls, v: str | None, values: dict[str, any]) -> str:

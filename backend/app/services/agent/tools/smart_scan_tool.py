@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from dataclasses import dataclass, field
 
 from .base import AgentTool, ToolResult
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -207,10 +208,11 @@ class SmartScanTool(AgentTool):
         quick_mode: bool
     ) -> List[str]:
         """收集要扫描的文件"""
-        full_path = os.path.normpath(os.path.join(self.project_root, target))
-        
-        # 安全检查
-        if not full_path.startswith(os.path.normpath(self.project_root)):
+        # P1-4: Path Traversal 防护，替代原来的 startswith 检查（可被 /project_root_evil 绕过）
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target))
+        except UnsafePathError as e:
+            logger.warning(f"smart_scan_tool 拒绝不安全路径 {target!r}: {e}")
             return []
         
         files = []
@@ -275,7 +277,12 @@ class SmartScanTool(AgentTool):
         focus_vulnerabilities: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """扫描单个文件"""
-        full_path = os.path.join(self.project_root, file_path)
+        # P1-4: Path Traversal 防护
+        try:
+            full_path = str(resolve_safe_path(self.project_root, file_path))
+        except UnsafePathError as e:
+            logger.warning(f"smart_scan_tool 拒绝不安全路径 {file_path!r}: {e}")
+            return []
         
         try:
             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -487,12 +494,12 @@ class QuickAuditTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行快速审计"""
-        full_path = os.path.join(self.project_root, file_path)
-        
-        # 安全检查
-        if not os.path.normpath(full_path).startswith(os.path.normpath(self.project_root)):
-            return ToolResult(success=False, error="安全错误：路径越界")
-        
+        # P1-4: Path Traversal 防护，替代原来的 startswith 检查
+        try:
+            full_path = str(resolve_safe_path(self.project_root, file_path))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
+
         if not os.path.exists(full_path):
             return ToolResult(success=False, error=f"文件不存在: {file_path}")
         

@@ -23,6 +23,8 @@ from app.services.llm.service import LLMService
 from app.services.scanner import task_control, is_text_file, should_exclude, get_language_from_path, get_analysis_config
 from app.services.zip_storage import load_project_zip, save_project_zip, has_project_zip
 from app.core.config import settings
+from app.core.rbac import assert_can_access_project
+from app.utils.safe_extract import safe_extract, SafeExtractError
 
 router = APIRouter()
 
@@ -64,7 +66,16 @@ async def process_zip_task(task_id: str, file_path: str, db_session_factory, use
             extract_dir.mkdir(parents=True, exist_ok=True)
             
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
+                # P0-2: 用 safe_extract 替代直接 extractall，防 Zip Slip / Zip Bomb / 符号链接
+                try:
+                    safe_extract(zip_ref, extract_dir)
+                except SafeExtractError as e:
+                    # 恶意/异常 ZIP —— 直接把任务标失败并清理，不让主流程继续跑
+                    print(f"⛔ ZIP 任务 {task_id} 被 safe_extract 拒绝: {e}")
+                    task.status = "failed"
+                    task.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                    return
 
             # 获取用户自定义排除模式
             scan_config = (user_config or {}).get('scan_config', {})
@@ -90,8 +101,10 @@ async def process_zip_task(task_id: str, file_path: str, db_session_factory, use
                                     "path": rel_path,
                                     "content": content
                                 })
-                        except:
-                            pass
+                        except (OSError, UnicodeDecodeError) as e:
+                            # P3-3: 裸 except: pass 会吞掉 KeyboardInterrupt / SystemExit / MemoryError；
+                            # 只捕获真正会碰到的 IO 与编码异常，其他异常上抛让上层观察到。
+                            print(f"⚠️ 跳过文件 {rel_path}: {e}")
 
             # 获取分析配置（优先使用用户配置）
             analysis_config = get_analysis_config(user_config)
@@ -245,8 +258,7 @@ async def scan_zip(
         raise HTTPException(status_code=404, detail="项目不存在")
     
     # 检查权限：只有项目所有者可以上传
-    if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
+    assert_can_access_project(current_user, project)
     
     # Validate file
     if not file.filename.lower().endswith('.zip'):
@@ -331,8 +343,7 @@ async def scan_stored_zip(
         raise HTTPException(status_code=404, detail="项目不存在")
     
     # 检查权限：只有项目所有者可以扫描
-    if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
+    assert_can_access_project(current_user, project)
     
     # 检查是否有存储的ZIP文件
     stored_zip_path = await load_project_zip(project_id)
@@ -391,15 +402,15 @@ class InstantAnalysisResponse(BaseModel):
 
 async def get_user_config_dict(db: AsyncSession, user_id: str) -> dict:
     """获取用户配置字典（包含解密敏感字段）"""
-    from app.core.encryption import decrypt_sensitive_data
-    
+    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
+
     # 需要解密的敏感字段列表（与 config.py 保持一致）
     SENSITIVE_LLM_FIELDS = [
         'llmApiKey', 'geminiApiKey', 'openaiApiKey', 'claudeApiKey',
         'qwenApiKey', 'deepseekApiKey', 'zhipuApiKey', 'moonshotApiKey',
         'baiduApiKey', 'minimaxApiKey', 'doubaoApiKey'
     ]
-    SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken']
+    # P2-4: SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
     
     def decrypt_config(config: dict, sensitive_fields: list) -> dict:
         """解密配置中的敏感字段"""

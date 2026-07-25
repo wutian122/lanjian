@@ -244,3 +244,56 @@ def build_agent_task_filter(user: User, user_ids: Optional[List[str]] = None):
 require_super_admin = require_role([UserRole.SUPER_ADMIN])
 require_admin_or_above = require_role([UserRole.SUPER_ADMIN, UserRole.ADMIN])
 require_any_role = require_role([UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.USER])
+
+
+# ============ P2-1: 单资源访问助手 ============
+#
+# 现状：agent_tasks.py / scan.py / projects.py / members.py 各自写了 20+ 处
+# ``if project.owner_id != current_user.id ...`` 检查，且逻辑不统一：
+#   - agent_tasks.py 只查 owner，SUPER_ADMIN 也会被拒
+#   - projects.py 查 owner OR SUPER_ADMIN
+#   - members.py 查 owner OR is_superuser
+# 这里给出**唯一真相源**，后续 endpoint 逐步迁移到这里，避免再各写各的。
+#
+# 语义：允许访问当且仅当
+#   1) 用户是项目 owner；或
+#   2) 用户角色是 SUPER_ADMIN（is_superuser 只是布尔冗余，以 role 为准）
+# 否则抛 404 —— 用 404 而非 403 避免向未授权用户泄露资源存在性。
+
+
+class ProjectAccessDenied(HTTPException):
+    """项目访问被拒绝。默认 404，避免向未授权用户泄露资源存在性。"""
+
+    def __init__(self, project_id: Optional[str] = None) -> None:
+        detail = "项目不存在或无权访问" if project_id else "项目不存在"
+        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+def can_access_project(user: User, project) -> bool:
+    """
+    判定用户能否访问某个项目（不抛异常，只返 bool）。
+
+    Args:
+        user: 已认证用户
+        project: 项目对象（None 视为不可访问）
+    """
+    if user is None or project is None:
+        return False
+    if getattr(user, "role", None) == UserRole.SUPER_ADMIN:
+        return True
+    return getattr(project, "owner_id", None) == user.id
+
+
+def assert_can_access_project(user: User, project) -> None:
+    """
+    强制断言用户可以访问指定项目，否则抛 :class:`ProjectAccessDenied`（404）。
+
+    使用示例：
+    ```python
+    project = await db.get(Project, project_id)
+    assert_can_access_project(current_user, project)
+    ```
+    """
+    if not can_access_project(user, project):
+        # 不区分"项目不存在"与"无权访问"，返回统一 404
+        raise ProjectAccessDenied(project_id=getattr(project, "id", None) if project else None)

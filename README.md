@@ -88,7 +88,11 @@ cd lanjian
 
 # 2. 准备后端环境变量
 cp backend/env.example backend/.env
-# 编辑 backend/.env：设置 POSTGRES_PASSWORD、SUPERADMIN_USERNAME、SUPERADMIN_PASSWORD、LLM_API_KEY 等
+# ⚠️ 必须设置以下 4 个强变量，否则后端拒绝启动（P0-1/P0-3/P0-4/P3-1 强制注入）：
+#   SECRET_KEY           ≥32 位，用 `python -c "import secrets; print(secrets.token_urlsafe(48))"` 生成
+#   CORS_ALLOWED_ORIGINS 逗号分隔的前端域名（如 http://192.168.1.10）
+#   SUPERADMIN_PASSWORD  ≥12 位、大小写+数字+特殊字符
+#   POSTGRES_PASSWORD    ≥12 位、非弱值黑名单
 
 # 3. 拉取 Docker Hub 上的最新镜像并启动全部服务
 docker compose pull
@@ -177,6 +181,34 @@ docker compose logs -f backend                     # 追踪日志
 - **Token 预算**：默认 60M，超限降级为 `COMPLETED_WITH_GAPS`
 - **SSE 弹性流**：`useResilientStream` 心跳 45s、指数退避 1s→30s、Last-Event-ID 断点续传
 - **RBAC**：三级角色（super_admin / admin / user），Fernet 加密敏感字段
+
+## 安全加固
+
+**2026-07 完成 P0-P4 五批次 27 项 + L1-L4 遗留清零加固**。详细清单：[docs/security-hardening-2026-07.md](docs/security-hardening-2026-07.md)
+
+**攻击面覆盖**：
+- **P0 严重**：SECRET_KEY 强制注入 / Zip Slip / CORS 白名单 / 超管密码强制
+- **P1 Path Traversal**：新增 `resolve_safe_path()`，替换 8 个 Agent tool 里 16 处 `os.path.join(root, user_input)`
+- **P2 高危**：RBAC 助手 `assert_can_access_project` / 数据隔离 / 加密加 `enc:v1:` 前缀 / SENSITIVE 字段单一真相源 / 后台任务异常保护 / register O(N) 修 / OAuth2 tokenUrl / _cancelled_tasks TTL
+- **P3 中低**：DB 密码强制 / logout 分层异常 / 裸 except 清理 / captcha DoS 上限 / 沙箱 PoC 模板
+- **P4 治理**：交付文档 + 密钥轮换 SOP + 治理遗留清单
+- **L1-L4 遗留清零**：4 处 startswith 迁到 `resolve_safe_path` / 15+ 处裸 except 显式化 / 31 处 `owner_id` 检查统一 / `decrypt_sensitive_data` 加 strict 参数
+
+**新增测试**（`backend/tests/`）：
+- `test_config_secret_key.py` / `test_safe_extract.py` / `test_cors_config.py` / `test_super_admin_bootstrap.py`
+- `test_path_safety.py` / `test_rbac_project_access.py` / `test_encryption.py`
+
+**部署强制变量**（未设置则后端拒启动）：
+```bash
+SECRET_KEY=<python -c "import secrets; print(secrets.token_urlsafe(48))" 的输出>
+CORS_ALLOWED_ORIGINS=http://<前端 IP>[,http://<其他 IP>]
+SUPERADMIN_PASSWORD=<≥12 位强密码>
+POSTGRES_PASSWORD=<≥12 位强密码>
+```
+
+**沙箱挂载**：`docker-compose.yml` 已加 `/tmp/lanjian:/tmp/lanjian:rw` bind mount，确保 backend 容器内解压的项目文件对宿主机 docker daemon 可见（否则沙箱 `/workspace/src` 会是空目录，Verification Agent 无法验证漏洞）。
+
+**密钥轮换 SOP**：见 [docs/security-hardening-2026-07.md §3](docs/security-hardening-2026-07.md)。**警告**：直接更换 `SECRET_KEY` 而不重新加密现有 `enc:v1:` 密文会触发 `DecryptionError`（P2-3 修复后不再静默返明文）。
 
 ## 贡献规范
 

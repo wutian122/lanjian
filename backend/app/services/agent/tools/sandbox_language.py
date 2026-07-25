@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from .base import AgentTool, ToolResult
 from .sandbox_tool import SandboxManager
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,12 @@ class BaseLanguageTestTool(AgentTool):
 
     def _read_file(self, file_path: str) -> Optional[str]:
         """读取文件内容"""
-        full_path = os.path.join(self.project_root, file_path)
+        # P1-2: Path Traversal 防护
+        try:
+            full_path = str(resolve_safe_path(self.project_root, file_path))
+        except UnsafePathError as e:
+            logger.warning(f"sandbox_language 拒绝不安全路径 {file_path!r}: {e}")
+            return None
         if not os.path.exists(full_path):
             return None
         with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -308,7 +314,8 @@ class MockMultiDict(dict):
         if type and value is not None:
             try:
                 return type(value)
-            except:
+            except (ValueError, TypeError):
+                # L2: 类型转换失败常见的两类；其他异常上抛
                 return default
         return value
     def getlist(self, key):

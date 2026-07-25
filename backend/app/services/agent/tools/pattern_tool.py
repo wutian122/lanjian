@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from dataclasses import dataclass
 
 from .base import AgentTool, ToolResult
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 
 @dataclass
@@ -350,15 +351,15 @@ class PatternMatchTool(AgentTool):
                     error="无法扫描文件：未配置项目根目录"
                 )
             
-            full_path = os.path.normpath(os.path.join(self.project_root, scan_file))
-            
-            # 安全检查：防止路径遍历
-            if not full_path.startswith(os.path.normpath(self.project_root)):
+            # L1: startswith 检查可被 /root_evil 绕过，改用 resolve_safe_path
+            try:
+                full_path = str(resolve_safe_path(self.project_root, scan_file))
+            except UnsafePathError as e:
                 return ToolResult(
                     success=False,
-                    error="安全错误：不允许访问项目目录外的文件"
+                    error=f"安全错误：路径不安全 ({e})"
                 )
-            
+
             if not os.path.exists(full_path):
                 return ToolResult(
                     success=False,

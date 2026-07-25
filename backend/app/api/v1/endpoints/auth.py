@@ -1,4 +1,5 @@
 import io
+import logging
 import random
 import string
 import time
@@ -11,6 +12,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import func
 from pydantic import BaseModel, EmailStr, field_validator
 
 from app.api import deps
@@ -25,15 +27,32 @@ from app.schemas.user import User as UserSchema, UserCreate
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 # ============ 安全常量 ============
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION_MINUTES = 15
 CAPTCHA_TTL_SECONDS = 300  # 验证码 5 分钟过期
+# P3-5: 内存 captcha 存储上限。旧实现无上限，未认证用户可无限刷 /captcha 拖爆内存。
+# 命中上限时先做一次全量过期清理，仍满则拒绝新申请。
+CAPTCHA_MAX_ENTRIES = 10_000
 
 # ============ 验证码内存存储（生产环境建议替换为 Redis） ============
 _captcha_store: dict[str, dict] = {}
 
+class CaptchaStoreFull(Exception):
+    """captcha 内存池达到上限。上层应返回 503。"""
+
+
 def _store_captcha(captcha_id: str, code: str) -> None:
+    # P3-5: DoS 防护 —— 命中上限先清理过期，仍满就拒绝
+    if len(_captcha_store) >= CAPTCHA_MAX_ENTRIES:
+        _clean_expired_captchas()
+    if len(_captcha_store) >= CAPTCHA_MAX_ENTRIES:
+        raise CaptchaStoreFull(
+            f"captcha store is full ({CAPTCHA_MAX_ENTRIES}); "
+            "possible DoS. Wait for TTL expiry or restart backend."
+        )
     _captcha_store[captcha_id] = {"code": code, "expires_at": time.time() + CAPTCHA_TTL_SECONDS}
 
 def _verify_captcha(captcha_id: str, code: str) -> bool:
@@ -89,7 +108,15 @@ async def get_captcha():
     _clean_expired_captchas()
 
     # 存入内存存储
-    _store_captcha(captcha_id, code)
+    # P3-5: 命中上限 → 返回 503，让前端知道服务饱和（一般意味着遭到刷量攻击）
+    try:
+        _store_captcha(captcha_id, code)
+    except CaptchaStoreFull as e:
+        logger.warning(f"[captcha] store full: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="验证码服务繁忙，请稍后重试",
+        )
 
     # 生成简单验证码图片
     try:
@@ -247,9 +274,10 @@ async def register(
             raise HTTPException(status_code=400, detail="该邮箱已被注册")
 
     # Check if this is the first user (make them superadmin)
-    count_result = await db.execute(select(User))
-    all_users = count_result.scalars().all()
-    is_first_user = len(all_users) == 0
+    # P2-6: 改用 SELECT COUNT(*) LIMIT 1；旧版 select(User).scalars().all() 会拉全表。
+    count_result = await db.execute(select(func.count()).select_from(User).limit(1))
+    total_users = count_result.scalar() or 0
+    is_first_user = total_users == 0
 
     # Create new user
     # 第一个注册用户为超级管理员，后续注册用户为普通用户
@@ -321,6 +349,12 @@ async def logout(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """退出登录，将 refresh_token 加入黑名单"""
+    # P3-2: 旧代码用 except Exception: pass 静默吞掉所有错误 —— JWT 篡改、Redis 掉线、
+    # SECRET_KEY 不匹配都被无声跳过，登出根本没生效，客户端拿到"已退出登录"却仍能用旧 token。
+    # 现在按异常类型分级处理：
+    #   - JWT 解码失败：token 篡改/过期 → 依然当"已退出"响应（无需报错，token 不能用即目的达成）
+    #   - Redis 掉线：黑名单写不进 → 抛 503，让前端知道要重试
+    from jose import JWTError
     try:
         import jwt
         payload = jwt.decode(
@@ -329,13 +363,27 @@ async def logout(
             algorithms=[settings.ALGORITHM],
             options={"verify_exp": False},
         )
-        jti = payload.get("jti")
-        exp = payload.get("exp")
-        if jti and exp:
-            now = int(time.time())
-            ttl = max(1, exp - now)
-            redis = await get_redis()
-            await redis.setex(f"logout:blacklist:{jti}", ttl, "1")
-    except Exception:
-        pass
+    except (JWTError, Exception) as e:
+        # JWT 层面失败不影响登出语义，仅记 debug 日志
+        logger.debug(f"[logout] refresh_token 解码失败（已忽略）: {e}")
+        return {"message": "已退出登录"}
+
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if not (jti and exp):
+        # 老版本 token 没有 jti，无法拉黑；直接放行
+        return {"message": "已退出登录"}
+
+    now = int(time.time())
+    ttl = max(1, exp - now)
+    try:
+        redis = await get_redis()
+        await redis.setex(f"logout:blacklist:{jti}", ttl, "1")
+    except Exception as e:
+        # Redis 层面失败必须让客户端知道，否则前端以为登出成功但 refresh 仍可用
+        logger.exception(f"[logout] Redis 写黑名单失败: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="登出服务暂时不可用，请重试",
+        )
     return {"message": "已退出登录"}

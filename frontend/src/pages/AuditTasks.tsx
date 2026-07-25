@@ -60,6 +60,8 @@ const ZOMBIE_TIMEOUT = 180000; // 3 minutes without progress is potentially stuc
 // 任务类型标签
 type TaskTab = "regular" | "agent";
 
+// 说明：paused 属于「已停止但可恢复」的中间态，从活跃集合中移除，允许直接删除。
+// 真正处于活跃执行中的状态才禁用删除按钮。
 const ACTIVE_AGENT_TASK_STATUSES = new Set([
   "pending",
   "initializing",
@@ -69,7 +71,6 @@ const ACTIVE_AGENT_TASK_STATUSES = new Set([
   "analyzing",
   "verifying",
   "reporting",
-  "paused",
 ]);
 
 export default function AuditTasks() {
@@ -746,37 +747,36 @@ export default function AuditTasks() {
                         <Bot className="w-4 h-4 mr-2" />
                         引用到AI
                       </Button>
-                      {(task.status === 'running' || task.status === 'pending' || task.status === 'paused') && (
-                        <>
-                          <Link to={`/agent-audit/${task.id}`}>
-                            <Button size="sm" variant="default" className="h-9">
-                              <Terminal className="w-4 h-4 mr-2" />
-                              {task.status === 'paused' ? '查看详情' : '查看实时流'}
-                            </Button>
-                          </Link>
-                          {task.status === 'paused' ? (
-                            <Button
-                              size="sm"
-                              className="h-9"
-                              onClick={() => handleResumeAgentTask(task.id)}
-                              disabled={resumingAgentTaskId === task.id}
-                            >
-                              <Play className="w-4 h-4 mr-2" />
-                              {resumingAgentTaskId === task.id ? '继续中...' : '继续'}
-                            </Button>
-                          ) : task.status === 'running' ? (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-9 border-amber-200 text-amber-700 hover:bg-amber-50"
-                              onClick={() => handlePauseAgentTask(task.id)}
-                              disabled={pausingAgentTaskId === task.id}
-                            >
-                              <Pause className="w-4 h-4 mr-2" />
-                              {pausingAgentTaskId === task.id ? '暂停中...' : '暂停'}
-                            </Button>
-                          ) : null}
-                        </>
+                      {(task.status === 'running' || task.status === 'pending') && (
+                        <Link to={`/agent-audit/${task.id}`}>
+                          <Button size="sm" variant="default" className="h-9">
+                            <Terminal className="w-4 h-4 mr-2" />
+                            查看实时流
+                          </Button>
+                        </Link>
+                      )}
+                      {task.status === 'paused' && (
+                        <Button
+                          size="sm"
+                          className="h-9"
+                          onClick={() => handleResumeAgentTask(task.id)}
+                          disabled={resumingAgentTaskId === task.id}
+                        >
+                          <Play className="w-4 h-4 mr-2" />
+                          {resumingAgentTaskId === task.id ? '继续中...' : '继续'}
+                        </Button>
+                      )}
+                      {task.status === 'running' && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-9 border-amber-200 text-amber-700 hover:bg-amber-50"
+                          onClick={() => handlePauseAgentTask(task.id)}
+                          disabled={pausingAgentTaskId === task.id}
+                        >
+                          <Pause className="w-4 h-4 mr-2" />
+                          {pausingAgentTaskId === task.id ? '暂停中...' : '暂停'}
+                        </Button>
                       )}
                       {(task.status === 'completed' || (task.findings_count != null && task.findings_count > 0)) && (
                         <Button

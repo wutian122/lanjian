@@ -401,7 +401,18 @@ class EventManager:
                 self._heartbeat_sent.pop(task_id, None)
                 self._terminal_tasks.discard(task_id)
                 logger.info(f"[EventManager] Auto-cleaned queue for terminal task {task_id}")
-            asyncio.create_task(_delayed_cleanup())
+            # P2-5: 后台任务加异常日志回调，避免异常静默丢失
+            cleanup_task = asyncio.create_task(_delayed_cleanup())
+            def _on_cleanup_done(t: asyncio.Task, _tid: str = task_id) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    logger.exception(
+                        f"[EventManager] _delayed_cleanup for {_tid} raised",
+                        exc_info=exc,
+                    )
+            cleanup_task.add_done_callback(_on_cleanup_done)
         
         return event_id
     

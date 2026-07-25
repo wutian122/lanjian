@@ -3,10 +3,34 @@
  * Enterprise clean header with status badge
  */
 
-import { Pause, Play, Download, Loader2, Cpu, Sparkles, Bot } from "lucide-react";
+import { useState } from "react";
+import { Pause, Play, Download, Loader2, Cpu, Sparkles, Bot, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { StatusBadge } from "./StatusBadge";
 import type { HeaderProps } from "../types";
+
+// 与 AuditTasks.tsx ACTIVE_AGENT_TASK_STATUSES 语义保持一致：
+// 只有真正处于活跃执行阶段的任务才禁用删除按钮，paused 可以删除。
+const ACTIVE_AGENT_TASK_STATUSES = new Set([
+  "pending",
+  "initializing",
+  "running",
+  "planning",
+  "indexing",
+  "analyzing",
+  "verifying",
+  "reporting",
+]);
 
 export function Header({
   task,
@@ -14,12 +38,27 @@ export function Header({
   isPaused,
   isPausing,
   isResuming,
+  isDeleting,
   onPause,
   onResume,
   onExport,
   onNewAudit,
+  onDelete,
   onOpenAiPanel,
 }: HeaderProps) {
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
+  const deleteDisabled =
+    !onDelete ||
+    !task ||
+    !!isDeleting ||
+    ACTIVE_AGENT_TASK_STATUSES.has(task.status);
+
+  const handleConfirmDelete = () => {
+    setShowDeleteDialog(false);
+    onDelete?.();
+  };
+
   return (
     <header className="flex-shrink-0 h-14 border-b border-border flex items-center justify-between px-6 bg-card">
       <div className="flex items-center gap-4">
@@ -107,11 +146,53 @@ export function Header({
           </Button>
         )}
 
+        {onDelete && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowDeleteDialog(true)}
+            disabled={deleteDisabled}
+            className="h-8 px-3 text-xs text-red-600 border-red-200 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950/30"
+          >
+            {isDeleting ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                删除中
+              </>
+            ) : (
+              <>
+                <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                删除
+              </>
+            )}
+          </Button>
+        )}
+
         <Button size="sm" onClick={onNewAudit} className="h-8 px-3 text-xs">
           <Sparkles className="w-3.5 h-3.5 mr-1.5" />
           新建审计
         </Button>
       </div>
+
+      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除任务</AlertDialogTitle>
+            <AlertDialogDescription>
+              将永久删除该 Agent 审计任务及其关联的事件、发现、检查点等数据，此操作不可撤销。是否继续？
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleConfirmDelete}
+              className="bg-red-600 hover:bg-red-700 focus:ring-red-500"
+            >
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </header>
   );
 }

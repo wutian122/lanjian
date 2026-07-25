@@ -103,13 +103,28 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS - Allow all origins in development
+# P0-3: CORS 白名单
+# 旧配置是 allow_origins=["*"] + allow_credentials=True，等于允许任意站点携带
+# 用户 Cookie / Authorization 头访问后端 —— 直接把 JWT 全网开放。
+# 现在改成从 settings.CORS_ALLOWED_ORIGINS 读白名单（逗号分隔）；
+# 未配置时把 credentials 关掉，并将 origins 置空，浏览器会全部拒掉 preflight。
+_raw_origins = (settings.CORS_ALLOWED_ORIGINS or "").strip()
+_cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+_allow_credentials = bool(_cors_origins)
+
+if not _cors_origins:
+    logger.warning(
+        "CORS_ALLOWED_ORIGINS not configured. Frontend will be blocked by CORS. "
+        "Set it in env (comma-separated), e.g. http://frontend-host-a.example.com,http://frontend-host-b.example.com"
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=None,
+    allow_credentials=_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept"],
 )
 
 from app.api.middleware import AppNameMiddleware

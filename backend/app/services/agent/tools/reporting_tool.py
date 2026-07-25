@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 from .base import AgentTool, ToolResult
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -131,20 +132,28 @@ class CreateVulnerabilityReportTool(AgentTool):
             return ToolResult(success=False, error="文件路径不能为空")
 
         # 🔥 v2.1: 验证文件路径存在性 - 防止幻觉
+        # P1-6: Path Traversal 防护 —— 原实现还有一条 fallback 走绝对路径读文件，等于让
+        # LLM 通过 file_path 报告任意宿主文件；改为严格 resolve_safe_path。
         if self.project_root:
             # 清理路径（移除可能的行号，如 "app.py:36"）
             clean_path = file_path.split(":")[0].strip() if ":" in file_path else file_path.strip()
-            full_path = os.path.join(self.project_root, clean_path)
+
+            try:
+                full_path = str(resolve_safe_path(self.project_root, clean_path))
+            except UnsafePathError as e:
+                logger.warning(f"[ReportTool] 🚫 拒绝报告: 路径不安全 '{file_path}': {e}")
+                return ToolResult(
+                    success=False,
+                    error=f"无法创建报告：路径不安全 '{file_path}'。请传项目内的相对路径。"
+                )
 
             if not os.path.isfile(full_path):
-                # 尝试作为绝对路径
-                if not (os.path.isabs(clean_path) and os.path.isfile(clean_path)):
-                    logger.warning(f"[ReportTool] 🚫 拒绝报告: 文件不存在 '{file_path}'")
-                    return ToolResult(
-                        success=False,
-                        error=f"无法创建报告：文件 '{file_path}' 在项目中不存在。"
-                              f"请先使用 read_file 工具验证文件存在，然后再报告漏洞。"
-                    )
+                logger.warning(f"[ReportTool] 🚫 拒绝报告: 文件不存在 '{file_path}'")
+                return ToolResult(
+                    success=False,
+                    error=f"无法创建报告：文件 '{file_path}' 在项目中不存在。"
+                          f"请先使用 read_file 工具验证文件存在，然后再报告漏洞。"
+                )
 
         # 验证严重程度
         valid_severities = ["critical", "high", "medium", "low", "info"]

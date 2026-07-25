@@ -76,7 +76,8 @@ async def list_prompt_templates(
         if t.variables:
             try:
                 variables = json.loads(t.variables)
-            except:
+            except json.JSONDecodeError:
+                # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
                 pass
         
         items.append(PromptTemplateResponse(
@@ -133,7 +134,8 @@ async def get_prompt_template(
     if template.variables:
         try:
             variables = json.loads(template.variables)
-        except:
+        except json.JSONDecodeError:
+            # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
             pass
     
     return PromptTemplateResponse(
@@ -226,7 +228,8 @@ async def update_prompt_template(
                 if template.variables:
                     try:
                         variables = json.loads(template.variables)
-                    except:
+                    except json.JSONDecodeError:
+                        # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
                         pass
                 return PromptTemplateResponse(
                     id=template.id, name=template.name, description=template.description,
@@ -274,7 +277,8 @@ async def update_prompt_template(
     if template.variables:
         try:
             variables = json.loads(template.variables)
-        except:
+        except json.JSONDecodeError:
+            # L2: 裸 except 会吞 KeyboardInterrupt；只捕 JSON 解析错误
             pass
     
     return PromptTemplateResponse(

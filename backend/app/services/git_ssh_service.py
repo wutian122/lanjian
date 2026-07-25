@@ -100,7 +100,8 @@ def set_secure_file_permissions(file_path: str):
             logger.warning(f"Failed to set Windows file permissions: {e}")
             try:
                 os.chmod(file_path, 0o600)
-            except:
+            except OSError:
+                # L2: chmod 常见失败是 OSError；其他异常上抛
                 pass
     else:
         os.chmod(file_path, 0o600)

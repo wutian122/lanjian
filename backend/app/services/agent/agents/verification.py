@@ -2234,10 +2234,12 @@ class VerificationAgent(BaseAgent):
                     f"except Exception as e:\n"
                     f"    print(f'mock test error: {{type(e).__name__}}: {{e}}')\n"
                     f"finally:\n"
+                    # P3-6: 沙箱 PoC 模板里的裸 except:pass 会吞 KeyboardInterrupt；
+                    # 改成显式 Exception，让 Ctrl+C 能中断卡死的 PoC。
                     f"    try: srv.shutdown()\n"
-                    f"    except: pass\n"
+                    f"    except Exception: pass\n"
                     f"    try: srv.server_close()\n"
-                    f"    except: pass\n"
+                    f"    except Exception: pass\n"
                     f"print('=== Verification Complete ===')\n"
                     f"POC_EOF\n"
                     f"python3 /tmp/poc_{index}.py"

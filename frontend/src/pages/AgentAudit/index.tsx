@@ -5,7 +5,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { isAxiosError } from "axios";
 import { Terminal, Bot, Loader2, Radio, Filter, Maximize2, ArrowDown, RefreshCw, AlertCircle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +22,7 @@ import {
   resumeAgentTask,
   reAuditAgentTask,
   recoverAgentTask,
+  deleteAgentTask,
   getAgentTree,
   getAgentEvents,
   AgentEvent,
@@ -52,6 +53,7 @@ import type { AgentFinding } from "@/shared/api/agentTasks";
 
 function AgentAuditPageContent() {
   const { taskId } = useParams<{ taskId: string }>();
+  const navigate = useNavigate();
   const {
     task, findings, agentTree, logs, selectedAgentId, showAllLogs,
     isLoading, connectionStatus, isAutoScroll, expandedLogIds,
@@ -71,6 +73,7 @@ function AgentAuditPageContent() {
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
   const [isResuming, setIsResuming] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [statusVerb, setStatusVerb] = useState(ACTION_VERBS[0]);
   const [statusDots, setStatusDots] = useState(0);
 
@@ -86,6 +89,19 @@ function AgentAuditPageContent() {
   // 🔥 使用 state 来标记历史事件加载状态和触发 streamOptions 重新计算
   const [afterSequence, setAfterSequence] = useState<number>(0);
   const [historicalEventsLoaded, setHistoricalEventsLoaded] = useState<boolean>(false);
+
+  // 问题 1A 前端抑制：canRecover 由 false→true 后需持续 5 秒才显示横幅，
+  // 中途被后端刷新回 false 则立即取消，避免任务刚启动、心跳尚未写入 Redis
+  // 期间出现"任务可能已断开"误报。
+  const [showRecoverBanner, setShowRecoverBanner] = useState(false);
+  useEffect(() => {
+    if (!canRecover) {
+      setShowRecoverBanner(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowRecoverBanner(true), 5000);
+    return () => clearTimeout(timer);
+  }, [canRecover]);
 
   // 🔥 当 taskId 变化时立即重置状态（新建任务时清理旧日志）
   useEffect(() => {
@@ -1003,6 +1019,26 @@ function AgentAuditPageContent() {
     }
   };
 
+  const handleDelete = async () => {
+    if (!taskId || isDeleting) return;
+    setIsDeleting(true);
+    try {
+      // 删除前主动断开 SSE 流，避免后端资源清理与前端事件竞态
+      if (disconnectStreamRef.current) {
+        disconnectStreamRef.current();
+        disconnectStreamRef.current = null;
+      }
+      await deleteAgentTask(taskId);
+      toast.success("任务已删除");
+      navigate("/audit-tasks");
+    } catch (err) {
+      const detail = isAxiosError(err) ? (err.response?.data as { detail?: string } | undefined)?.detail : undefined;
+      const errorMessage = detail || (err instanceof Error ? err.message : String(err));
+      toast.error(`删除失败: ${errorMessage}`);
+      setIsDeleting(false);
+    }
+  };
+
   const handleResume = async () => {
     if (!taskId || isResuming) return;
     setIsResuming(true);
@@ -1155,10 +1191,12 @@ function AgentAuditPageContent() {
         isPaused={isPaused}
         isPausing={isPausing}
         isResuming={isResuming}
+        isDeleting={isDeleting}
         onPause={handlePause}
         onResume={handleResume}
         onExport={handleExportReport}
         onNewAudit={() => setShowCreateDialog(true)}
+        onDelete={handleDelete}
         onOpenAiPanel={() => setShowAiPanel(true)}
       />
 
@@ -1217,7 +1255,7 @@ function AgentAuditPageContent() {
           </div>
         )}
 
-        {canRecover && (
+        {showRecoverBanner && (
           <div className="absolute top-0 left-0 right-0 z-10 bg-red-50 border-b border-red-200 px-4 py-2 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <AlertCircle className="w-4 h-4 text-red-600" />

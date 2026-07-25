@@ -300,7 +300,8 @@ class CodeRetriever:
                 try:
                     import json
                     security_indicators = json.loads(security_indicators)
-                except:
+                except (json.JSONDecodeError, TypeError):
+                    # L2: 只捕 JSON 解析错误
                     security_indicators = []
             
             result = RetrievalResult(

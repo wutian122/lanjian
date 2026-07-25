@@ -340,8 +340,10 @@ async def scan_repo_task(task_id: str, db_session_factory, user_config: dict = N
             if task.exclude_patterns:
                 try:
                     task_exclude_patterns = json_module.loads(task.exclude_patterns)
-                except:
-                    pass
+                except json_module.JSONDecodeError as e:
+                    # P3-4: 裸 except: pass 会吞掉一切；只捕 JSON 解析错误，其他异常上抛
+                    print(f"⚠️ task.exclude_patterns JSON 解析失败，按空列表处理: {e}")
+                    task_exclude_patterns = []
 
             print(f"🚀 开始扫描仓库: {repo_url}, 分支: {branch}, 类型: {repo_type}, 来源: {source_type}")
             if task_exclude_patterns:

@@ -15,7 +15,7 @@ import json
 from app.api import deps
 from app.core.rbac import (
     has_permission, get_subordinate_user_ids, build_project_filter,
-    UserRole, Permission
+    UserRole, Permission, assert_can_access_project,
 )
 from app.db.session import get_db, AsyncSessionLocal
 from app.models.project import Project
@@ -114,8 +114,7 @@ async def check_project_access(db: AsyncSession, project_id: str, current_user: 
         return project
 
     # 普通用户只能访问自己的项目
-    if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="无权访问此项目")
+    assert_can_access_project(current_user, project)
 
     return project
 
@@ -315,8 +314,7 @@ async def update_project(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者或超级管理员可以更新
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权更新此项目")
+    assert_can_access_project(current_user, project)
 
     import json
     update_data = project_in.model_dump(exclude_unset=True)
@@ -343,8 +341,7 @@ async def delete_project(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者或超级管理员可以删除
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权删除此项目")
+    assert_can_access_project(current_user, project)
 
     project.is_active = False
     project.updated_at = datetime.now(timezone.utc)
@@ -363,8 +360,7 @@ async def restore_project(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者或超级管理员可以恢复
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权恢复此项目")
+    assert_can_access_project(current_user, project)
 
     project.is_active = True
     project.updated_at = datetime.now(timezone.utc)
@@ -383,8 +379,7 @@ async def permanently_delete_project(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者或超级管理员可以永久删除
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权永久删除此项目")
+    assert_can_access_project(current_user, project)
 
     # 如果是ZIP类型项目，删除关联的ZIP文件和元数据
     if project.source_type == "zip":
@@ -452,11 +447,11 @@ async def get_project_files(
             return []
 
         # Get tokens from user config
-        from app.core.encryption import decrypt_sensitive_data
+        from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
         from app.core.config import settings
         from app.services.git_ssh_service import GitSSHOperations
 
-        SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken', 'sshPrivateKey']
+        # P2-4: 使用 SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
 
         result = await db.execute(
             select(UserConfig).where(UserConfig.user_id == current_user.id)
@@ -561,7 +556,7 @@ async def scan_project(
     await db.refresh(task)
 
     # 获取用户配置（包含解密敏感字段）
-    from app.core.encryption import decrypt_sensitive_data
+    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
 
     # 需要解密的敏感字段列表
     SENSITIVE_LLM_FIELDS = [
@@ -569,7 +564,7 @@ async def scan_project(
         'qwenApiKey', 'deepseekApiKey', 'zhipuApiKey', 'moonshotApiKey',
         'baiduApiKey', 'minimaxApiKey', 'doubaoApiKey'
     ]
-    SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken']
+    # P2-4: SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
 
     def decrypt_config(config_dict: dict, sensitive_fields: list) -> dict:
         """解密配置中的敏感字段"""
@@ -656,8 +651,7 @@ async def upload_project_zip(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者可以上传
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
+    assert_can_access_project(current_user, project)
 
     # 检查项目类型
     if project.source_type != "zip":
@@ -707,8 +701,7 @@ async def delete_project_zip_file(
     project = await check_project_access(db, id, current_user)
 
     # 只有项目所有者可以删除
-    if project.owner_id != current_user.id and current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="无权操作此项目")
+    assert_can_access_project(current_user, project)
 
     deleted = await delete_project_zip(id)
 
@@ -740,7 +733,7 @@ async def get_project_branches(
 
     # 获取用户配置的 Token
     from app.core.config import settings
-    from app.core.encryption import decrypt_sensitive_data
+    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
 
     config = await db.execute(
         select(UserConfig).where(UserConfig.user_id == current_user.id)
@@ -751,7 +744,7 @@ async def get_project_branches(
     gitea_token = settings.GITEA_TOKEN
     gitlab_token = settings.GITLAB_TOKEN
 
-    SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken', 'giteaToken']
+    # P2-4: SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
 
     if config and config.other_config:
         import json

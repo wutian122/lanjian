@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 from .base import AgentTool, ToolResult
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 
 class FileReadInput(BaseModel):
@@ -135,11 +136,13 @@ class FileReadTool(AgentTool):
                 )
             
             # 安全检查：防止路径遍历
-            full_path = os.path.normpath(os.path.join(self.project_root, file_path))
-            if not full_path.startswith(os.path.normpath(self.project_root)):
+            # L1: startswith 检查可被 /root_evil 后缀绕过，改用 resolve_safe_path
+            try:
+                full_path = str(resolve_safe_path(self.project_root, file_path))
+            except UnsafePathError as e:
                 return ToolResult(
                     success=False,
-                    error="安全错误：不允许访问项目目录外的文件",
+                    error=f"安全错误：路径不安全 ({e})",
                 )
             
             if not os.path.exists(full_path):
@@ -330,11 +333,13 @@ class FileSearchTool(AgentTool):
         try:
             # 确定搜索目录
             if directory:
-                search_dir = os.path.normpath(os.path.join(self.project_root, directory))
-                if not search_dir.startswith(os.path.normpath(self.project_root)):
+                # L1: startswith 检查可被 /root_evil 绕过，改用 resolve_safe_path
+                try:
+                    search_dir = str(resolve_safe_path(self.project_root, directory))
+                except UnsafePathError as e:
                     return ToolResult(
                         success=False,
-                        error="安全错误：不允许搜索项目目录外的内容",
+                        error=f"安全错误：路径不安全 ({e})",
                     )
             else:
                 search_dir = self.project_root
@@ -530,11 +535,13 @@ class ListFilesTool(AgentTool):
             if "path" in kwargs and kwargs["path"]:
                 directory = kwargs["path"]
 
-            target_dir = os.path.normpath(os.path.join(self.project_root, directory))
-            if not target_dir.startswith(os.path.normpath(self.project_root)):
+            # L1: startswith 检查可被 /root_evil 绕过，改用 resolve_safe_path
+            try:
+                target_dir = str(resolve_safe_path(self.project_root, directory))
+            except UnsafePathError as e:
                 return ToolResult(
                     success=False,
-                    error="安全错误：不允许访问项目目录外的目录",
+                    error=f"安全错误：路径不安全 ({e})",
                 )
             
             if not os.path.exists(target_dir):

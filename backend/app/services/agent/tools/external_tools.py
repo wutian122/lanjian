@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from .base import AgentTool, ToolResult
 from .sandbox_tool import SandboxManager
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -914,8 +915,13 @@ class NpmAuditTool(AgentTool):
         safe_target_path = target_path if not target_path.startswith("/") else target_path.lstrip("/")
         if not safe_target_path:
             safe_target_path = "."
-            
-        full_path = os.path.normpath(os.path.join(self.project_root, target_path))
+
+        # P1-7: Path Traversal 防护 —— 替代原来的 normpath+join，防止 ../../../etc 逃逸
+        try:
+            full_path = str(resolve_safe_path(self.project_root, safe_target_path))
+        except UnsafePathError as e:
+            error_msg = f"路径不安全: {e}"
+            return ToolResult(success=False, data=error_msg, error=error_msg)
         
         # 宿主机预检查
         package_json = os.path.join(full_path, "package.json")
@@ -1056,16 +1062,21 @@ class SafetyTool(AgentTool):
             error_msg = f"Safety unavailable: {self.sandbox_manager.get_diagnosis()}"
             return ToolResult(success=False, data=error_msg, error=error_msg)
 
-        full_path = os.path.join(self.project_root, requirements_file)
+        # P1-7: Path Traversal 防护
+        safe_req_file = requirements_file if not requirements_file.startswith("/") else requirements_file.lstrip("/")
+        try:
+            full_path = str(resolve_safe_path(self.project_root, safe_req_file))
+        except UnsafePathError as e:
+            error_msg = f"路径不安全: {e}"
+            return ToolResult(success=False, data=error_msg, error=error_msg)
         if not os.path.exists(full_path):
             error_msg = f"未找到依赖文件: {requirements_file}"
             return ToolResult(success=False, data=error_msg, error=error_msg)
-            
+
         # commands
         # requirements_file relative path inside container is just requirements_file (assuming it's relative to root)
         # If requirements_file is absolute, we need to make it relative.
         # But for security, `requirements_file` should be relative to project_root.
-        safe_req_file = requirements_file if not requirements_file.startswith("/") else requirements_file.lstrip("/")
 
         cmd = ["safety", "check", "-r", safe_req_file, "--json"]
         cmd_str = " ".join(cmd)
@@ -1099,7 +1110,8 @@ class SafetyTool(AgentTool):
                 else:
                      return ToolResult(success=True, data=f"Safety 输出:\n{stdout[:1000]}")
 
-            except:
+            except (json.JSONDecodeError, ValueError):
+                # L2: 只捕 JSON 解析错误，其他异常上抛
                 return ToolResult(success=True, data=f"Safety 输出解析失败:\n{stdout[:1000]}")
             
             vulnerabilities = results if isinstance(results, list) else results.get("vulnerabilities", [])
@@ -1226,7 +1238,8 @@ class TruffleHogTool(AgentTool):
                 if line.strip():
                     try:
                         findings.append(json.loads(line))
-                    except:
+                    except (json.JSONDecodeError, ValueError):
+                        # L2: 只捕 JSON 解析错误
                         pass
             
             if not findings:
@@ -1337,7 +1350,8 @@ Google 开源的漏洞扫描工具。
             
             try:
                 results = json.loads(stdout)
-            except:
+            except (json.JSONDecodeError, ValueError):
+                # L2: 只捕 JSON 解析错误
                 if "no package sources found" in stdout.lower():
                     return ToolResult(success=True, data="OSV-Scanner: 未找到可扫描的包文件")
                 return ToolResult(success=True, data=f"OSV-Scanner 输出:\n{stdout[:1000]}")

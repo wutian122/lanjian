@@ -14,7 +14,11 @@ from app.db.session import get_db
 from app.models.user_config import UserConfig
 from app.models.user import User
 from app.core.config import settings
-from app.core.encryption import encrypt_sensitive_data, decrypt_sensitive_data
+from app.core.encryption import (
+    encrypt_sensitive_data,
+    decrypt_sensitive_data,
+    SENSITIVE_OTHER_FIELDS,
+)
 
 router = APIRouter()
 
@@ -24,7 +28,8 @@ SENSITIVE_LLM_FIELDS = [
     'qwenApiKey', 'deepseekApiKey', 'zhipuApiKey', 'moonshotApiKey',
     'baiduApiKey', 'minimaxApiKey', 'doubaoApiKey'
 ]
-SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken']
+# P2-4: SENSITIVE_OTHER_FIELDS 单一真相源改由 app.core.encryption 提供，
+# 现在包含 githubToken / gitlabToken / giteaToken / sshPrivateKey 四项。
 
 
 def encrypt_config(config: dict, sensitive_fields: list) -> dict:

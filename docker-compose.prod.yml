@@ -60,6 +60,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lanjian_change_me}
       POSTGRES_DB: ${POSTGRES_DB:-lanjian}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-lanjian_change_me}@db:5432/${POSTGRES_DB:-lanjian}
+      # P0-1: SECRET_KEY 必须由宿主环境或 backend/.env 提供；未设置时 compose 层直接失败，
+      # 强制阻止使用默认弱值启动。后端 config.py 还会再校验一次长度与黑名单。
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY not set - see backend/env.example for how to generate one}
+      # P0-3: CORS 白名单，可选透传；未设置则沿用 backend/.env。
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
       AGENT_ENABLED: "true"
       SANDBOX_ENABLED: "true"

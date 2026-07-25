@@ -12,7 +12,8 @@ from app.models.user import User
 from app.schemas import token as token_schema
 
 reusable_oauth2 = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V1_STR}/auth/login"
+    # P2-7: rstrip('/') 防止 API_V1_STR 意外带尾斜杠时 tokenUrl 出现 '//'
+    tokenUrl=f"{settings.API_V1_STR.rstrip('/')}/auth/login"
 )
 
 async def get_current_user(

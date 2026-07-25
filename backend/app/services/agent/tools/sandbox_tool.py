@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from .base import AgentTool, ToolResult
 from app.core.config import settings
+from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
 
@@ -878,8 +879,10 @@ class SandboxTool(AgentTool):
 
     @staticmethod
     def _command_needs_project_mount(command: str) -> bool:
-        # 根因1修复: 仅 heredoc 写入不需要项目挂载；
-        # 含 /workspace/ 路径引用 = 要读项目文件，仍需挂载（原逻辑误判为不挂载导致找不到文件）
+        # 根因1修复: 优先检查是否含 /workspace/ 路径引用（包括 heredoc 写入的脚本内容），
+        # 再对纯 heredoc 写入（不引用项目文件）返回 False
+        if '/workspace/' in command:
+            return True
         if '<<' in command:
             return False
 
@@ -1370,7 +1373,11 @@ class PhpTestTool(AgentTool):
         if file_path:
             # 从文件读取
             import os
-            full_path = os.path.join(self.project_root, file_path)
+            # P1-3: Path Traversal 防护
+            try:
+                full_path = str(resolve_safe_path(self.project_root, file_path))
+            except UnsafePathError as e:
+                return ToolResult(success=False, error=f"路径不安全: {e}")
             if not os.path.exists(full_path):
                 return ToolResult(
                     success=False,
@@ -1554,7 +1561,11 @@ class CommandInjectionTestTool(AgentTool):
             )
 
         import os
-        full_path = os.path.join(self.project_root, target_file)
+        # P1-3: Path Traversal 防护
+        try:
+            full_path = str(resolve_safe_path(self.project_root, target_file))
+        except UnsafePathError as e:
+            return ToolResult(success=False, error=f"路径不安全: {e}")
 
         if not os.path.exists(full_path):
             return ToolResult(

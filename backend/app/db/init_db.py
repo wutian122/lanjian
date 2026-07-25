@@ -3,12 +3,14 @@
 在应用启动时创建超级管理员账户和演示数据
 
 环境变量配置:
-  SUPERADMIN_USERNAME - 超级管理员用户名 (默认: admin)
-  SUPERADMIN_PASSWORD - 超级管理员密码 (默认: 123456789)
-  SUPERADMIN_NAME     - 超级管理员姓名 (默认: 超级管理员)
-  SUPERADMIN_DEPARTMENT - 超级管理员部门 (默认: 安全管理部)
-  SUPERADMIN_PHONE    - 超级管理员电话 (默认: 13800138000)
-  RESET_ALL_USERS     - 是否重置所有用户数据 (默认: false, 设置true强制删除重建)
+  SUPERADMIN_USERNAME     - 超级管理员用户名 (默认: admin)
+  SUPERADMIN_PASSWORD     - 超级管理员密码 (P0-4: 必填，无默认。必须满足密码策略：
+                            ≥12 位、大小写字母+数字+特殊字符。未设置或弱密码时
+                            init_db 会跳过创建并给出日志提示)
+  SUPERADMIN_NAME         - 超级管理员姓名 (默认: 超级管理员)
+  SUPERADMIN_DEPARTMENT   - 超级管理员部门 (默认: 安全管理部)
+  SUPERADMIN_PHONE        - 超级管理员电话 (默认: 13800138000)
+  RESET_ALL_USERS         - 是否重置所有用户数据 (默认: false, 设置true强制删除重建)
 """
 import os
 import json
@@ -18,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import delete
 
-from app.core.security import get_password_hash
+from app.core.security import get_password_hash, validate_password_policy
 from app.models.user import User, UserRole
 from app.models.project import Project, ProjectMember
 from app.models.audit import AuditTask, AuditIssue
@@ -31,10 +33,22 @@ logger = logging.getLogger(__name__)
 
 # 超级管理员配置
 SUPERADMIN_USERNAME = os.getenv("SUPERADMIN_USERNAME", "admin")
-SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD", "123456789")
+# P0-4: 不再有默认密码。未设置视为 None，create_super_admin 会跳过创建。
+SUPERADMIN_PASSWORD = os.getenv("SUPERADMIN_PASSWORD") or None
 SUPERADMIN_NAME = os.getenv("SUPERADMIN_NAME", "超级管理员")
 SUPERADMIN_DEPARTMENT = os.getenv("SUPERADMIN_DEPARTMENT", "安全管理部")
 SUPERADMIN_PHONE = os.getenv("SUPERADMIN_PHONE", "13800138000")
+
+
+_MISSING_PASSWORD_HINT = (
+    "SUPERADMIN_PASSWORD 未设置。请通过环境变量注入满足密码策略的密码：\n"
+    "  1) 生成随机强密码（示例）：\n"
+    "     python -c \"import secrets, string; a=string.ascii_letters; d=string.digits; "
+    "s='!@#$%^&*'; import random; r=random.SystemRandom(); "
+    "print(''.join(r.choice(a+d+s) for _ in range(20)))\"\n"
+    "  2) 在 backend/.env 或部署环境中设置 SUPERADMIN_PASSWORD=<强密码>\n"
+    "  3) 首次登录后立即在页面上修改密码（is_first_login=True 会触发强制改密）。"
+)
 
 
 async def wipe_all_users(db: AsyncSession) -> None:
@@ -68,11 +82,19 @@ async def wipe_all_users(db: AsyncSession) -> None:
     logger.warning(f"✓ 已删除 {len(user_ids)} 个用户及其关联数据")
 
 
-async def create_super_admin(db: AsyncSession) -> User:
+async def create_super_admin(db: AsyncSession) -> User | None:
     """
-    创建唯一的超级管理员账户
-    - 默认: admin / 123456789
-    - 如果超级管理员已存在则返回
+    创建唯一的超级管理员账户。
+
+    P0-4 变化：
+    - 不再使用硬编码默认密码（原来是 123456789）。
+    - ``SUPERADMIN_PASSWORD`` 未设置 —— 跳过创建，日志给出注入方式。
+    - 密码未通过 :func:`validate_password_policy` —— 同样跳过创建，日志说明未通过的原因。
+    - 超级管理员已存在时**不再覆盖**其密码 —— 覆盖逻辑等于每次重启都把用户改过的密码
+      重置回环境变量的值，是安全反模式。想要重置密码请显式使用 ``RESET_ALL_USERS=true``。
+
+    Returns:
+        创建成功或已存在时返回 User；因缺密码/弱密码跳过时返回 None。
     """
     result = await db.execute(
         select(User).where(User.role == UserRole.SUPER_ADMIN)
@@ -80,14 +102,27 @@ async def create_super_admin(db: AsyncSession) -> User:
     existing = result.scalars().first()
 
     if existing:
-        # 如果超级管理员存在但密码不匹配，更新密码为默认密码
-        from app.core.security import verify_password
-        if not verify_password(SUPERADMIN_PASSWORD, existing.hashed_password):
-            existing.hashed_password = get_password_hash(SUPERADMIN_PASSWORD)
-            logger.info(f"✓ 已更新超级管理员密码: {SUPERADMIN_USERNAME}")
-        else:
-            logger.info(f"超级管理员账户已存在: {SUPERADMIN_USERNAME}")
+        logger.info(f"超级管理员账户已存在: {existing.username}")
         return existing
+
+    # P0-4: 强制注入密码 —— 未设置直接跳过创建
+    if not SUPERADMIN_PASSWORD:
+        logger.warning("=" * 60)
+        logger.warning("⚠️ 超级管理员未创建：%s", _MISSING_PASSWORD_HINT)
+        logger.warning("=" * 60)
+        return None
+
+    # P0-4: 校验密码策略 —— 弱密码直接跳过创建
+    ok, reason = validate_password_policy(SUPERADMIN_PASSWORD)
+    if not ok:
+        logger.warning("=" * 60)
+        logger.warning(
+            "⚠️ 超级管理员未创建：SUPERADMIN_PASSWORD 未通过密码策略校验（%s）。"
+            "请重新生成并设置环境变量后再启动。",
+            reason,
+        )
+        logger.warning("=" * 60)
+        return None
 
     # 创建超级管理员
     super_admin = User(
@@ -105,7 +140,7 @@ async def create_super_admin(db: AsyncSession) -> User:
     )
     db.add(super_admin)
     await db.flush()
-    logger.info(f"✓ 创建超级管理员: {SUPERADMIN_USERNAME}")
+    logger.info(f"✓ 创建超级管理员: {SUPERADMIN_USERNAME}（首次登录将强制修改密码）")
     return super_admin
 
 
