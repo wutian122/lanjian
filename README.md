@@ -106,11 +106,11 @@ docker compose up -d
 **镜像版本控制**：`docker-compose.yml` 中的 `image` 通过 `${IMAGE_TAG:-latest}` 解析，默认拉取 Docker Hub 上的 `wutian449/lanjian-*:latest`。若需锁定到某个具体版本，用环境变量：
 
 ```bash
-IMAGE_TAG=v3.6.0 docker compose pull
-IMAGE_TAG=v3.6.0 docker compose up -d
+IMAGE_TAG=v4.0.0 docker compose pull
+IMAGE_TAG=v4.0.0 docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 文件永久锁版本 —— `echo "IMAGE_TAG=v3.6.0" > .env`。
+可选：在部署机根目录建 `.env` 文件永久锁版本 —— `echo "IMAGE_TAG=v4.0.0" > .env`。
 
 ### 方式 B：本地开发
 
