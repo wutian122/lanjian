@@ -105,16 +105,26 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 通过 `${IMAGE_TAG:-latest}` 解析，默认拉取 Docker Hub 上的 `wutian449/lanjian-*:latest`。若需锁定到某个具体版本，用环境变量：
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 通过 `${IMAGE_TAG:-latest}` 解析。v5.0.0 镜像按 **CPU 架构** 发布独立 tag（`wutian449/lanjian-{backend,frontend,sandbox}`）：
+
+| 架构 | tag | 适用 |
+|------|-----|------|
+| x86_64 | `v5.0.0-amd64` | 常见 Intel/AMD 服务器 |
+| ARM64 | `v5.0.0-arm64` | ARM 服务器 / 麒麟等 |
+
+在部署机根目录建 `.env` 锁定对应架构（推荐）：
 
 ```bash
-IMAGE_TAG=v5.0.0 docker compose pull
-IMAGE_TAG=v5.0.0 docker compose up -d
+# x86_64 主机
+echo "IMAGE_TAG=v5.0.0-amd64" > .env
+# ARM64 主机
+echo "IMAGE_TAG=v5.0.0-arm64" > .env
+
+docker compose pull
+docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 文件永久锁版本 —— `echo "IMAGE_TAG=v5.0.0" > .env`。
-
-> **镜像架构**：`wutian449/lanjian-backend` 与 `wutian449/lanjian-frontend` 均发布 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 会自动匹配宿主机架构。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10）。
+> **为何按架构分 tag**：backend/frontend/sandbox 三镜像在各自架构的服务器上原生构建。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10，避免浮动 tag 重建引入不兼容）。用 `uname -m` 确认本机架构（`x86_64` → amd64，`aarch64` → arm64）。
 
 ### 方式 B：本地开发
 
