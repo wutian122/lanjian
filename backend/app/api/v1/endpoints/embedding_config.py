@@ -49,7 +49,8 @@ class EmbeddingConfigResponse(BaseModel):
     """配置响应"""
     provider: str
     model: str
-    api_key: Optional[str] = None  # 返回 API Key
+    api_key: Optional[str] = None  # 始终返回空，看 has_api_key 判断是否已配置
+    has_api_key: bool = False  # 问题二：密钥脱敏，F12 不可见
     base_url: Optional[str]
     dimensions: int
     batch_size: int
@@ -141,41 +142,65 @@ EMBEDDING_PROVIDERS: List[EmbeddingProvider] = [
 EMBEDDING_CONFIG_KEY = "embedding_config"
 
 
-async def get_embedding_config_from_db(db: AsyncSession, user_id: str) -> EmbeddingConfig:
-    """从数据库获取嵌入配置（异步）"""
-    result = await db.execute(
-        select(UserConfig).where(UserConfig.user_id == user_id)
-    )
-    user_config = result.scalar_one_or_none()
-
-    if user_config and user_config.other_config:
-        try:
-            other_config = json.loads(user_config.other_config) if isinstance(user_config.other_config, str) else user_config.other_config
-            embedding_data = other_config.get(EMBEDDING_CONFIG_KEY)
-
-            if embedding_data:
-                config = EmbeddingConfig(
-                    provider=embedding_data.get("provider", settings.EMBEDDING_PROVIDER),
-                    model=embedding_data.get("model", settings.EMBEDDING_MODEL),
-                    api_key=embedding_data.get("api_key"),
-                    base_url=embedding_data.get("base_url"),
-                    dimensions=embedding_data.get("dimensions"),
-                    batch_size=embedding_data.get("batch_size", 100),
-                )
-                print(f"[EmbeddingConfig] 读取用户 {user_id} 的嵌入配置: provider={config.provider}, model={config.model}")
-                return config
-        except (json.JSONDecodeError, AttributeError) as e:
-            print(f"[EmbeddingConfig] 解析用户 {user_id} 配置失败: {e}")
-
-    # 返回默认配置
-    print(f"[EmbeddingConfig] 用户 {user_id} 无保存配置，返回默认值")
+def _extract_embedding_from_raw(raw_other: dict) -> Optional[EmbeddingConfig]:
+    """从原始 other_config dict 中提取嵌入配置。"""
+    embedding_data = raw_other.get(EMBEDDING_CONFIG_KEY) if raw_other else None
+    if not embedding_data:
+        return None
     return EmbeddingConfig(
+        provider=embedding_data.get("provider", settings.EMBEDDING_PROVIDER),
+        model=embedding_data.get("model", settings.EMBEDDING_MODEL),
+        api_key=embedding_data.get("api_key"),
+        base_url=embedding_data.get("base_url"),
+        dimensions=embedding_data.get("dimensions"),
+        batch_size=embedding_data.get("batch_size", 100),
+    )
+
+
+async def get_embedding_config_from_db(db: AsyncSession, user_id: str) -> EmbeddingConfig:
+    """从数据库获取嵌入配置（问题一：包含系统级配置共享）"""
+    # 1. 环境默认
+    default = EmbeddingConfig(
         provider=settings.EMBEDDING_PROVIDER,
         model=settings.EMBEDDING_MODEL,
         api_key=settings.LLM_API_KEY,
         base_url=settings.LLM_BASE_URL,
         batch_size=100,
     )
+
+    # 2. 系统级层（超管配置中的嵌入配置）
+    from app.api.v1.endpoints.config import get_system_admin_config
+    _, sys_other = await get_system_admin_config(db)
+    sys_embed = _extract_embedding_from_raw(sys_other)
+
+    # 3. 用户个人层
+    result = await db.execute(
+        select(UserConfig).where(UserConfig.user_id == user_id)
+    )
+    user_config = result.scalar_one_or_none()
+    user_embed = None
+    if user_config and user_config.other_config:
+        try:
+            other_config = json.loads(user_config.other_config) if isinstance(user_config.other_config, str) else user_config.other_config
+            user_embed = _extract_embedding_from_raw(other_config)
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[EmbeddingConfig] 解析用户 {user_id} 配置失败: {e}")
+
+    # 合并：环境默认 → 系统级 → 用户个人（后者覆盖前者）
+    merged = default
+    for layer in [sys_embed, user_embed]:
+        if layer:
+            merged = EmbeddingConfig(
+                provider=layer.provider or merged.provider,
+                model=layer.model or merged.model,
+                api_key=layer.api_key or merged.api_key,
+                base_url=layer.base_url or merged.base_url,
+                dimensions=layer.dimensions or merged.dimensions,
+                batch_size=layer.batch_size or merged.batch_size,
+            )
+
+    print(f"[EmbeddingConfig] 用户 {user_id} 的有效嵌入配置: provider={merged.provider}, model={merged.model}")
+    return merged
 
 
 async def save_embedding_config_to_db(db: AsyncSession, user_id: str, config: EmbeddingConfig) -> None:
@@ -201,6 +226,12 @@ async def save_embedding_config_to_db(db: AsyncSession, user_id: str, config: Em
             other_config = json.loads(user_config.other_config) if user_config.other_config else {}
         except (json.JSONDecodeError, TypeError):
             other_config = {}
+
+        # 问题二：空 api_key 不覆盖已存密钥
+        if not embedding_data.get("api_key"):
+            existing_embedding = other_config.get(EMBEDDING_CONFIG_KEY)
+            if existing_embedding:
+                embedding_data["api_key"] = existing_embedding.get("api_key")
 
         other_config[EMBEDDING_CONFIG_KEY] = embedding_data
         user_config.other_config = json.dumps(other_config)
@@ -245,10 +276,14 @@ async def get_current_config(
     # 获取维度：优先使用用户配置的维度，否则使用默认值
     dimensions = config.dimensions if config.dimensions else _get_model_dimensions(config.provider, config.model)
 
+    # 问题二：脱敏——密钥永不下发前端，F12 不可见
+    has_api_key = bool(config.api_key)
+
     return EmbeddingConfigResponse(
         provider=config.provider,
         model=config.model,
-        api_key=config.api_key,
+        api_key="",
+        has_api_key=has_api_key,
         base_url=config.base_url,
         dimensions=dimensions,
         batch_size=config.batch_size,
@@ -286,6 +321,7 @@ async def update_config(
 @router.post("/test", response_model=TestEmbeddingResponse)
 async def test_embedding(
     request: TestEmbeddingRequest,
+    db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """
@@ -297,10 +333,16 @@ async def test_embedding(
     try:
         from app.services.rag.embeddings import EmbeddingService
 
+        # 问题二：前端不再下发明文密钥，从 DB 读取已保存的密钥
+        effective_api_key = request.api_key
+        if not effective_api_key:
+            saved_config = await get_embedding_config_from_db(db, current_user.id)
+            effective_api_key = saved_config.api_key
+
         service = EmbeddingService(
             provider=request.provider,
             model=request.model,
-            api_key=request.api_key,
+            api_key=effective_api_key,
             base_url=request.base_url,
             dimension=request.dimension,
             cache_enabled=False,

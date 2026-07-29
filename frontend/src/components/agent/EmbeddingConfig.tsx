@@ -48,6 +48,7 @@ interface EmbeddingConfig {
   provider: string;
   model: string;
   api_key: string | null;
+  has_api_key: boolean;
   base_url: string | null;
   dimensions: number;
   batch_size: number;
@@ -73,6 +74,7 @@ export default function EmbeddingConfigPanel() {
   const [selectedProvider, setSelectedProvider] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [apiKeySet, setApiKeySet] = useState(false);
   const [baseUrl, setBaseUrl] = useState("");
   const [customDimension, setCustomDimension] = useState<number | null>(null);
   const [batchSize, setBatchSize] = useState(100);
@@ -107,7 +109,8 @@ export default function EmbeddingConfigPanel() {
       if (configRes.data) {
         setSelectedProvider(configRes.data.provider);
         setSelectedModel(configRes.data.model);
-        setApiKey(configRes.data.api_key || "");
+        setApiKey("");
+        setApiKeySet(configRes.data.has_api_key ?? false);
         setBaseUrl(configRes.data.base_url || "");
         setCustomDimension(configRes.data.dimensions || null);
         setBatchSize(configRes.data.batch_size);
@@ -126,7 +129,7 @@ export default function EmbeddingConfigPanel() {
     }
 
     const provider = providers.find((p) => p.id === selectedProvider);
-    if (provider?.requires_api_key && !apiKey) {
+    if (provider?.requires_api_key && !apiKey && !apiKeySet) {
       toast.error(`${provider.name} 需要 API Key`);
       return;
     }
@@ -310,7 +313,7 @@ export default function EmbeddingConfigPanel() {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="输入 API Key"
+              placeholder={apiKeySet ? "•••••••• (已配置，重新输入可修改)" : "输入 API Key"}
               className="h-10"
             />
             <p className="text-xs text-muted-foreground">

@@ -12,7 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import {
-  Settings, Save, RotateCcw, Eye, EyeOff, CheckCircle2, AlertCircle, Shield,
+  Settings, Save, RotateCcw, CheckCircle2, AlertCircle, Shield,
   Info, Zap, Globe, PlayCircle, Brain, Key, Copy, Trash2, Terminal, ServerCrash, Wifi, WifiOff
 } from "lucide-react";
 import { toast } from "sonner";
@@ -53,12 +53,13 @@ interface SystemConfigData {
   githubToken: string; gitlabToken: string; giteaToken: string;
   maxAnalyzeFiles: number; llmConcurrency: number; llmGapMs: number; llmRatePerMinute: number; outputLanguage: string;
   sandboxNetworkEnabled: boolean;
+  // 问题二：密钥脱敏——后端不下发明文，仅用布尔标记"已配置"
+  llmApiKeySet?: boolean;
 }
 
 export function SystemConfig() {
   const [config, setConfig] = useState<SystemConfigData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [showApiKey, setShowApiKey] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
   const [testingLLM, setTestingLLM] = useState(false);
   const [llmTestResult, setLlmTestResult] = useState<{ success: boolean; message: string; debug?: Record<string, unknown> } | null>(null);
@@ -141,6 +142,7 @@ export function SystemConfig() {
         const newConfig = {
           llmProvider: llmConfig.llmProvider || 'openai',
           llmApiKey: llmConfig.llmApiKey || '',
+          llmApiKeySet: llmConfig.llmApiKeySet ?? false,
           llmModel: llmConfig.llmModel || '',
           llmBaseUrl: llmConfig.llmBaseUrl || '',
           llmTimeout: llmConfig.llmTimeout || 150000,
@@ -329,6 +331,7 @@ export function SystemConfig() {
         setConfig({
           llmProvider: llmConfig.llmProvider || config.llmProvider,
           llmApiKey: llmConfig.llmApiKey || '',
+          llmApiKeySet: llmConfig.llmApiKeySet ?? false,
           llmModel: llmConfig.llmModel || '',
           llmBaseUrl: llmConfig.llmBaseUrl || '',
           llmTimeout: llmConfig.llmTimeout || 150000,
@@ -379,7 +382,7 @@ export function SystemConfig() {
 
   const testLLMConnection = async () => {
     if (!config) return;
-    if (!config.llmApiKey && config.llmProvider !== 'ollama') {
+    if (!config.llmApiKey && !config.llmApiKeySet && config.llmProvider !== 'ollama') {
       toast.error('请先配置 API Key');
       return;
     }
@@ -388,7 +391,7 @@ export function SystemConfig() {
     try {
       const result = await api.testLLMConnection({
         provider: config.llmProvider,
-        apiKey: config.llmApiKey,
+        apiKey: config.llmApiKey || undefined,
         model: config.llmModel || undefined,
         baseUrl: config.llmBaseUrl || undefined,
       });
@@ -416,7 +419,7 @@ export function SystemConfig() {
   }
 
   const currentProvider = LLM_PROVIDERS.find(p => p.value === config.llmProvider);
-  const isConfigured = config.llmApiKey !== '' || config.llmProvider === 'ollama';
+  const isConfigured = config.llmApiKeySet === true || config.llmApiKey !== '' || config.llmProvider === 'ollama';
 
   return (
     <div className="space-y-6">
@@ -496,20 +499,12 @@ export function SystemConfig() {
                 <Label className="text-xs font-bold text-muted-foreground uppercase">API Key</Label>
                 <div className="flex gap-2">
                   <Input
-                    type={showApiKey ? 'text' : 'password'}
+                    type="password"
                     value={config.llmApiKey}
                     onChange={(e) => updateConfig('llmApiKey', e.target.value)}
-                    placeholder={config.llmProvider === 'baidu' ? 'API_KEY:SECRET_KEY 格式' : '输入你的 API Key'}
+                    placeholder={config.llmApiKeySet ? '•••••••• (已配置，重新输入可修改)' : '输入你的 API Key'}
                     className="h-12"
                   />
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="h-12 w-12"
-                  >
-                    {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </Button>
                 </div>
               </div>
             )}

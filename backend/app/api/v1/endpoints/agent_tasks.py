@@ -1075,35 +1075,29 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: Optional[str] 
 
 
 async def _get_user_config(db: AsyncSession, user_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """获取用户配置"""
+    """获取用户配置（问题一：包含系统级配置共享）"""
     if not user_id:
         return None
-    
+
     try:
-        from app.api.v1.endpoints.config import (
-            decrypt_config, 
-            SENSITIVE_LLM_FIELDS, SENSITIVE_OTHER_FIELDS
+        from app.api.v1.endpoints.config import resolve_effective_config
+        from app.models.user import User as _User
+
+        # 查询该用户是否为超管（决定是否叠加系统级层）
+        user_row = await db.execute(select(_User).where(_User.id == user_id))
+        user_obj = user_row.scalar_one_or_none()
+        is_superuser = bool(user_obj.is_superuser) if user_obj else False
+
+        merged_llm, merged_other = await resolve_effective_config(
+            db, user_id, is_superuser=is_superuser
         )
-        
-        result = await db.execute(
-            select(UserConfig).where(UserConfig.user_id == user_id)
-        )
-        config = result.scalar_one_or_none()
-        
-        if config and config.llm_config:
-            user_llm_config = json.loads(config.llm_config) if config.llm_config else {}
-            user_other_config = json.loads(config.other_config) if config.other_config else {}
-            
-            user_llm_config = decrypt_config(user_llm_config, SENSITIVE_LLM_FIELDS)
-            user_other_config = decrypt_config(user_other_config, SENSITIVE_OTHER_FIELDS)
-            
-            return {
-                "llmConfig": user_llm_config,
-                "otherConfig": user_other_config,
-            }
+        return {
+            "llmConfig": merged_llm,
+            "otherConfig": merged_other,
+        }
     except Exception as e:
         logger.warning(f"Failed to get user config: {e}")
-    
+
     return None
 
 

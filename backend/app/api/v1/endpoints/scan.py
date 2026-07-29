@@ -300,7 +300,7 @@ async def scan_zip(
     await db.refresh(task)
 
     # 获取用户配置
-    user_config = await get_user_config_dict(db, current_user.id)
+    user_config = await get_user_config_dict(db, current_user)
     
     # 将扫描配置注入到 user_config 中（包括规则集、提示词模板和排除模式）
     if parsed_scan_config:
@@ -363,7 +363,7 @@ async def scan_stored_zip(
     await db.refresh(task)
 
     # 获取用户配置
-    user_config = await get_user_config_dict(db, current_user.id)
+    user_config = await get_user_config_dict(db, current_user)
     
     # 将扫描配置注入到 user_config 中（包括规则集、提示词模板和排除模式）
     if scan_request:
@@ -400,44 +400,16 @@ class InstantAnalysisResponse(BaseModel):
         from_attributes = True
 
 
-async def get_user_config_dict(db: AsyncSession, user_id: str) -> dict:
-    """获取用户配置字典（包含解密敏感字段）"""
-    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
+async def get_user_config_dict(db: AsyncSession, user: User) -> dict:
+    """获取用户配置字典（问题一：包含系统级配置共享 + 解密敏感字段）"""
+    from app.api.v1.endpoints.config import resolve_effective_config
 
-    # 需要解密的敏感字段列表（与 config.py 保持一致）
-    SENSITIVE_LLM_FIELDS = [
-        'llmApiKey', 'geminiApiKey', 'openaiApiKey', 'claudeApiKey',
-        'qwenApiKey', 'deepseekApiKey', 'zhipuApiKey', 'moonshotApiKey',
-        'baiduApiKey', 'minimaxApiKey', 'doubaoApiKey'
-    ]
-    # P2-4: SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
-    
-    def decrypt_config(config: dict, sensitive_fields: list) -> dict:
-        """解密配置中的敏感字段"""
-        decrypted = config.copy()
-        for field in sensitive_fields:
-            if field in decrypted and decrypted[field]:
-                decrypted[field] = decrypt_sensitive_data(decrypted[field])
-        return decrypted
-    
-    result = await db.execute(
-        select(UserConfig).where(UserConfig.user_id == user_id)
+    merged_llm, merged_other = await resolve_effective_config(
+        db, user.id, is_superuser=bool(user.is_superuser)
     )
-    config = result.scalar_one_or_none()
-    if not config:
-        return {}
-    
-    # 解析配置
-    llm_config = json.loads(config.llm_config) if config.llm_config else {}
-    other_config = json.loads(config.other_config) if config.other_config else {}
-    
-    # 解密敏感字段
-    llm_config = decrypt_config(llm_config, SENSITIVE_LLM_FIELDS)
-    other_config = decrypt_config(other_config, SENSITIVE_OTHER_FIELDS)
-    
     return {
-        'llmConfig': llm_config,
-        'otherConfig': other_config,
+        'llmConfig': merged_llm,
+        'otherConfig': merged_other,
     }
 
 
@@ -451,7 +423,7 @@ async def instant_analysis(
     Perform instant code analysis.
     """
     # 获取用户配置
-    user_config = await get_user_config_dict(db, current_user.id)
+    user_config = await get_user_config_dict(db, current_user)
     
     # 创建使用用户配置的LLM服务实例
     llm_service = LLMService(user_config=user_config)
