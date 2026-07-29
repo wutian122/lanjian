@@ -1,6 +1,6 @@
 {
   "name": "lanjian",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "type": "module",
   "pnpm": {
     "onlyBuiltDependencies": [

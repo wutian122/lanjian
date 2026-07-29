@@ -1,6 +1,6 @@
 [project]
 name = "lanjian-backend"
-version = "4.0.0"
+version = "5.0.0"
 description = "lanjian Backend API - AI-Powered Code Security Audit Platform"
 requires-python = ">=3.11"
 readme = "README.md"

@@ -50,6 +50,34 @@ def decrypt_config(config: dict, sensitive_fields: list) -> dict:
     return decrypted
 
 
+def mask_config(config: dict, sensitive_fields: list) -> dict:
+    """脱敏配置中的敏感字段（问题二：密钥 F12 不可见）。
+
+    永不将明文密钥下发到前端：敏感字段一律置空，仅额外提供
+    ``{field}Set`` 布尔标记，供前端展示"已配置/未配置"。前端在
+    用户未重新输入时不得回传该字段（空值不覆盖已存密钥）。
+    """
+    masked = config.copy()
+    for field in sensitive_fields:
+        has_value = bool(masked.get(field))
+        masked[field] = ""
+        masked[f"{field}Set"] = has_value
+    return masked
+
+
+def strip_empty_sensitive(data: dict, sensitive_fields: list) -> dict:
+    """移除请求中值为空的敏感字段，避免空值覆盖已存密钥。
+
+    配合脱敏返回：前端在用户未修改密钥时会回传空串（或省略），
+    此处将空敏感字段剔除，确保 update 时不会把已保存的密钥清空。
+    """
+    cleaned = data.copy()
+    for field in sensitive_fields:
+        if field in cleaned and not cleaned[field]:
+            cleaned.pop(field)
+    return cleaned
+
+
 class LLMConfigSchema(BaseModel):
     """LLM配置Schema"""
     llmProvider: Optional[str] = None
@@ -157,6 +185,65 @@ def get_default_config() -> dict:
     }
 
 
+async def _load_raw_user_config(db: AsyncSession, user_id: str) -> tuple[dict, dict]:
+    """加载并解密指定用户的原始配置（llm, other）。用户无配置时返回空 dict。"""
+    result = await db.execute(
+        select(UserConfig).where(UserConfig.user_id == user_id)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        return {}, {}
+    llm = json.loads(config.llm_config) if config.llm_config else {}
+    other = json.loads(config.other_config) if config.other_config else {}
+    return (
+        decrypt_config(llm, SENSITIVE_LLM_FIELDS),
+        decrypt_config(other, SENSITIVE_OTHER_FIELDS),
+    )
+
+
+async def get_system_admin_config(db: AsyncSession) -> tuple[dict, dict]:
+    """获取"系统级"配置——即超级管理员保存的配置（问题一）。
+
+    作为新用户/未配置用户的继承来源，介于"环境默认"和"用户个人配置"之间。
+    找不到超管或超管无配置时返回空 dict（自动回落到环境默认）。
+    """
+    result = await db.execute(
+        select(User)
+        .where(User.is_superuser == True)  # noqa: E712
+        .order_by(User.created_at.asc())
+    )
+    super_admin = result.scalars().first()
+    if not super_admin:
+        return {}, {}
+    return await _load_raw_user_config(db, super_admin.id)
+
+
+async def resolve_effective_config(
+    db: AsyncSession, user_id: str, is_superuser: bool = False
+) -> tuple[dict, dict]:
+    """解析用户的有效配置（问题一：系统级配置共享）。
+
+    合并顺序（后者覆盖前者）：
+      环境默认 → 系统级（超管保存的配置） → 用户个人配置
+    这样新用户无需重复配置即可继承超管在系统配置里设置的 LLM / 嵌入模型等。
+    超管本人不叠加系统级层（避免自我循环，其个人配置即系统级来源）。
+    """
+    default_config = get_default_config()
+
+    # 系统级层（超管配置）
+    if is_superuser:
+        sys_llm, sys_other = {}, {}
+    else:
+        sys_llm, sys_other = await get_system_admin_config(db)
+
+    # 用户个人层
+    user_llm, user_other = await _load_raw_user_config(db, user_id)
+
+    merged_llm = {**default_config["llmConfig"], **sys_llm, **user_llm}
+    merged_other = {**default_config["otherConfig"], **sys_other, **user_other}
+    return merged_llm, merged_other
+
+
 @router.get("/defaults")
 async def get_default_config_endpoint() -> Any:
     """获取系统默认配置（无需认证）"""
@@ -168,49 +255,33 @@ async def get_my_config(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """获取当前用户的配置（合并用户配置和系统默认配置）"""
+    """获取当前用户的配置（合并系统默认 + 系统级超管配置 + 用户个人配置）"""
     result = await db.execute(
         select(UserConfig).where(UserConfig.user_id == current_user.id)
     )
     config = result.scalar_one_or_none()
-    
-    # 获取系统默认配置
-    default_config = get_default_config()
-    
-    if not config:
-        print(f"[Config] 用户 {current_user.id} 没有保存的配置，返回默认配置")
-        # 返回系统默认配置
-        return UserConfigResponse(
-            id="",
-            user_id=current_user.id,
-            llmConfig=default_config["llmConfig"],
-            otherConfig=default_config["otherConfig"],
-            created_at="",
-        )
-    
-    # 合并用户配置和默认配置（用户配置优先）
-    user_llm_config = json.loads(config.llm_config) if config.llm_config else {}
-    user_other_config = json.loads(config.other_config) if config.other_config else {}
-    
-    # 解密敏感字段
-    user_llm_config = decrypt_config(user_llm_config, SENSITIVE_LLM_FIELDS)
-    user_other_config = decrypt_config(user_other_config, SENSITIVE_OTHER_FIELDS)
-    
-    print(f"[Config] 用户 {current_user.id} 的保存配置:")
-    print(f"  - llmProvider: {user_llm_config.get('llmProvider')}")
-    print(f"  - llmApiKey: {'***' + user_llm_config.get('llmApiKey', '')[-4:] if user_llm_config.get('llmApiKey') else '(空)'}")
-    print(f"  - llmModel: {user_llm_config.get('llmModel')}")
-    
-    merged_llm_config = {**default_config["llmConfig"], **user_llm_config}
-    merged_other_config = {**default_config["otherConfig"], **user_other_config}
-    
+
+    # 问题一：解析有效配置（环境默认 → 系统级超管 → 用户个人）
+    merged_llm_config, merged_other_config = await resolve_effective_config(
+        db, current_user.id, is_superuser=bool(current_user.is_superuser)
+    )
+
+    # 问题二：脱敏——密钥永不下发前端，F12 不可见
+    merged_llm_config = mask_config(merged_llm_config, SENSITIVE_LLM_FIELDS)
+    merged_other_config = mask_config(merged_other_config, SENSITIVE_OTHER_FIELDS)
+
+    print(f"[Config] 用户 {current_user.id} 的有效配置:")
+    print(f"  - llmProvider: {merged_llm_config.get('llmProvider')}")
+    print(f"  - llmApiKeySet: {merged_llm_config.get('llmApiKeySet')}")
+    print(f"  - llmModel: {merged_llm_config.get('llmModel')}")
+
     return UserConfigResponse(
-        id=config.id,
-        user_id=config.user_id,
+        id=config.id if config else "",
+        user_id=current_user.id,
         llmConfig=merged_llm_config,
         otherConfig=merged_other_config,
-        created_at=config.created_at.isoformat() if config.created_at else "",
-        updated_at=config.updated_at.isoformat() if config.updated_at else None,
+        created_at=config.created_at.isoformat() if config and config.created_at else "",
+        updated_at=config.updated_at.isoformat() if config and config.updated_at else None,
     )
 
 
@@ -229,6 +300,10 @@ async def update_my_config(
     # 准备要保存的配置数据（加密敏感字段）
     llm_data = config_in.llmConfig.dict(exclude_none=True) if config_in.llmConfig else {}
     other_data = config_in.otherConfig.dict(exclude_none=True) if config_in.otherConfig else {}
+
+    # 问题二：空敏感字段不覆盖已存密钥（前端未修改密钥时回传空串）
+    llm_data = strip_empty_sensitive(llm_data, SENSITIVE_LLM_FIELDS)
+    other_data = strip_empty_sensitive(other_data, SENSITIVE_OTHER_FIELDS)
 
     # Base URL 验证
     if config_in.llmConfig and config_in.llmConfig.llmBaseUrl is not None:
@@ -281,9 +356,13 @@ async def update_my_config(
     # 解密后返回给前端
     user_llm_config = decrypt_config(user_llm_config, SENSITIVE_LLM_FIELDS)
     user_other_config = decrypt_config(user_other_config, SENSITIVE_OTHER_FIELDS)
-    
+
     merged_llm_config = {**default_config["llmConfig"], **user_llm_config}
     merged_other_config = {**default_config["otherConfig"], **user_other_config}
+
+    # 问题二：脱敏后返回
+    merged_llm_config = mask_config(merged_llm_config, SENSITIVE_LLM_FIELDS)
+    merged_other_config = mask_config(merged_other_config, SENSITIVE_OTHER_FIELDS)
     
     return UserConfigResponse(
         id=config.id,
@@ -316,7 +395,7 @@ async def delete_my_config(
 class LLMTestRequest(BaseModel):
     """LLM测试请求"""
     provider: str
-    apiKey: str
+    apiKey: str = ""
     model: Optional[str] = None
     baseUrl: Optional[str] = None
 
@@ -377,12 +456,26 @@ async def test_llm_connection(
     saved_max_files = saved_other_config.get('maxAnalyzeFiles', settings.MAX_ANALYZE_FILES)
     saved_output_lang = saved_other_config.get('outputLanguage', settings.OUTPUT_LANGUAGE)
 
+    # 问题二：前端不再下发明文密钥，从 DB 读取已保存的密钥
+    provider_key_map = {
+        'gemini': 'geminiApiKey', 'openai': 'openaiApiKey', 'claude': 'claudeApiKey',
+        'qwen': 'qwenApiKey', 'deepseek': 'deepseekApiKey', 'zhipu': 'zhipuApiKey',
+        'moonshot': 'moonshotApiKey', 'baidu': 'baiduApiKey', 'minimax': 'minimaxApiKey',
+        'doubao': 'doubaoApiKey', 'ollama': 'ollamaApiKey',
+    }
+    effective_api_key = request.apiKey
+    if not effective_api_key:
+        # 前端未提供密钥时，从已保存的配置中读取
+        provider_lower = request.provider.lower()
+        saved_key_field = provider_key_map.get(provider_lower, 'llmApiKey')
+        effective_api_key = saved_llm_config.get(saved_key_field) or saved_llm_config.get('llmApiKey', '')
+
     debug_info = {
         "provider": request.provider,
         "model_requested": request.model,
         "base_url_requested": request.baseUrl,
-        "api_key_length": len(request.apiKey) if request.apiKey else 0,
-        "api_key_prefix": request.apiKey[:8] + "..." if request.apiKey and len(request.apiKey) > 8 else "(empty)",
+        "api_key_length": len(effective_api_key) if effective_api_key else 0,
+        "api_key_prefix": effective_api_key[:8] + "..." if effective_api_key and len(effective_api_key) > 8 else "(empty)",
         # 用户保存的配置参数
         "saved_config": {
             "timeout_ms": saved_timeout_ms,
@@ -444,7 +537,7 @@ async def test_llm_connection(
         # 创建配置
         config = LLMConfig(
             provider=provider,
-            api_key=request.apiKey,
+            api_key=effective_api_key,
             model=model,
             base_url=request.baseUrl,
             timeout=test_timeout,
