@@ -1,0 +1,3 @@
+# 单包工作区（修复：pnpm 9 要求 packages 字段；构建白名单由 .npmrc 的 onlyBuiltDependencies 承担）
+packages:
+  - '.'

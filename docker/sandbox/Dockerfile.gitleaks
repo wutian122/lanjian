@@ -1,0 +1,80 @@
+# 在现有沙箱镜像基础上添加离线安全工具 + 浏览器环境
+FROM lanjian/sandbox:latest
+
+USER root
+
+# Gitleaks: 检测代码中的硬编码密钥、Token、私钥
+COPY gitleaks_8.30.1_linux_x64.tar.gz /tmp/gitleaks.tar.gz
+RUN tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin/ && \
+    chmod +x /usr/local/bin/gitleaks && \
+    rm /tmp/gitleaks.tar.gz
+
+# TruffleHog: 检测密钥泄露
+COPY trufflehog_3.82.12_linux_amd64.tar.gz /tmp/trufflehog.tar.gz
+RUN tar -xzf /tmp/trufflehog.tar.gz -C /usr/local/bin/ && \
+    chmod +x /usr/local/bin/trufflehog && \
+    rm /tmp/trufflehog.tar.gz
+
+# OSV-Scanner: 依赖漏洞扫描
+COPY osv-scanner_linux_amd64 /usr/local/bin/osv-scanner
+RUN chmod +x /usr/local/bin/osv-scanner
+
+# Chromium + Playwright 浏览器环境（用于 XSS/CSRF 动态验证）
+# 使用阿里云镜像源安装系统依赖和 Chromium
+RUN sed -i 's|mirrors.aliyun.com|mirrors.aliyun.com|g' /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        chromium \
+        chromium-driver \
+        libnss3 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libcups2 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libasound2 \
+        libx11-xcb1 \
+        libdrm2 \
+        libxkbcommon0 \
+        libglib2.0-0 \
+        libfontconfig1 \
+        libfreetype6 \
+        libjpeg62-turbo \
+        libpng16-16 \
+        libxml2 \
+        libxslt1.1 \
+        libevent-2.1-7 \
+        libgles2 \
+        libvpx6 \
+        libwebpdemux2 \
+        libwebpmux3 \
+        libharfbuzz-icu0 \
+        liblcms2-2 \
+        libopenjp2-7 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Playwright Python 库（离线 wheel）
+COPY playwright-wheels-py311.tar.gz /tmp/playwright-wheels.tar.gz
+RUN mkdir -p /tmp/playwright-wheels && \
+    tar -xzf /tmp/playwright-wheels.tar.gz -C /tmp/playwright-wheels && \
+    pip install --no-index --find-links=/tmp/playwright-wheels playwright && \
+    rm -rf /tmp/playwright-wheels /tmp/playwright-wheels.tar.gz
+
+# 导入 Playwright 浏览器缓存
+COPY playwright-browsers.tar.gz /tmp/playwright-browsers.tar.gz
+RUN mkdir -p /home/sandbox/.cache/ms-playwright && \
+    tar -xzf /tmp/playwright-browsers.tar.gz -C /home/sandbox/.cache/ms-playwright && \
+    chown -R sandbox:sandbox /home/sandbox/.cache/ms-playwright && \
+    rm /tmp/playwright-browsers.tar.gz
+
+# 设置 Playwright 浏览器缓存路径环境变量
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/sandbox/.cache/ms-playwright
+
+# 切回 sandbox 用户
+USER sandbox
+WORKDIR /workspace
