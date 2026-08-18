@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-18
+goal: SSE 实时流在中大项目审计（>60s Semgrep prescan）过程中不被前端 45s 心跳超时误断，且服务端 --reload / 断连
+  500 事件上限 / 慢消费者背压等已知路径均已根治

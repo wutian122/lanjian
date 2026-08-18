@@ -1,0 +1,33 @@
+name: lanjian
+
+# 开发者本地补充配置（`docker compose up` 会自动合并 override.yml）。
+#
+# ⚠️ 本文件只用于开发者环境，生产部署（docker-compose.prod.yml）不应加载此文件。
+# 如需部署生产：显式指定 `docker compose -f docker-compose.prod.yml up -d`，
+# override.yml 不会被合并，backend 走主 compose 的稳定启动命令。
+
+services:
+  # 开发者热更：覆盖 backend command 加 --reload
+  # 代价：文件变更会重启 uvicorn，正在跑的 SSE 连接会断开（可接受，开发用）
+  backend:
+    command: >
+      sh -c ".venv/bin/alembic upgrade head &&
+             .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    profiles:
+      - tools
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - lanjian-network
+
+networks:
+  lanjian-network:
+    name: lanjian-network
+    driver: bridge

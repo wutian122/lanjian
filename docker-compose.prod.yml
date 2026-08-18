@@ -1,0 +1,128 @@
+name: lanjian
+
+# 镜像锁版本：v5.1.0。变更前先 git tag + 更新两台服务器并验证。
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lanjian_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-lanjian}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lanjian-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lanjian-network
+
+  db-migrate:
+    image: wutian449/lanjian-backend:v5.1.0
+    restart: "no"
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_SERVER: db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lanjian_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-lanjian}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-lanjian_change_me}@db:5432/${POSTGRES_DB:-lanjian}
+    command: [".venv/bin/alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - lanjian-network
+
+  backend:
+    image: wutian449/lanjian-backend:v5.1.0
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_SERVER: db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lanjian_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-lanjian}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-lanjian_change_me}@db:5432/${POSTGRES_DB:-lanjian}
+      # P0-1: SECRET_KEY 必须由宿主环境或 backend/.env 提供；未设置时 compose 层直接失败，
+      # 强制阻止使用默认弱值启动。后端 config.py 还会再校验一次长度与黑名单。
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY not set - see backend/env.example for how to generate one}
+      # P0-3: CORS 白名单，可选透传；未设置则沿用 backend/.env。
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      REDIS_URL: redis://redis:6379/0
+      AGENT_ENABLED: "true"
+      SANDBOX_ENABLED: "true"
+      SANDBOX_IMAGE: wutian449/lanjian-sandbox:v5.1.0
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
+    expose:
+      - "8000"
+    volumes:
+      - backend_uploads:/app/uploads
+      - /var/run/docker.sock:/var/run/docker.sock
+      # P0-2 部署修复: 沙箱需要看到 backend 在容器内解压的 ZIP。
+      # 原因：backend 通过 docker.sock 让 daemon 起沙箱容器，daemon 是宿主机进程，
+      # 挂载"源路径"时去宿主机找 /tmp/lanjian/xxx。不加这条，验证全空跑。
+      - /tmp/lanjian:/tmp/lanjian:rw
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    # 生产启动命令：单 worker、无 --reload、显式绑定所有接口。
+    # ⚠️ 严禁在此加 --reload：文件变更会触发 uvicorn 重启，正在运行的 SSE 连接全部断开，
+    # 内存中的 Orchestrator/EventManager 状态丢失（跨进程 Registry 尚未落地时会导致 stale running）。
+    command: [".venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    networks:
+      - lanjian-network
+
+  frontend:
+    image: wutian449/lanjian-frontend:v5.1.0
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+    networks:
+      - lanjian-network
+
+  sandbox:
+    image: wutian449/lanjian-sandbox:v5.1.0
+    restart: "no"
+    command: ["sh", "-c", "echo Sandbox image ready"]
+
+networks:
+  lanjian-network:
+    name: lanjian-network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  backend_uploads:
+  redis_data:
