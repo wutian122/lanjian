@@ -71,7 +71,7 @@ MAX_CHUNKS_PER_FILE = 500  # 单文件 chunk 数量上限，超过截断至 500 
 CHUNK_CONCURRENCY = 4
 
 
-def _cap_chunks(file_path: str, chunks: List[CodeChunk]) -> List[CodeChunk]:
+def _cap_chunks(file_path: str, chunks: list[CodeChunk]) -> list[CodeChunk]:
     """单文件 chunk 数量上限防护：超过 MAX_CHUNKS_PER_FILE 截断至上限并记 warning。
 
     三个分块调用点（_full_index / _incremental_index / index_files）行为一致。
@@ -944,7 +944,7 @@ class CodeIndexer:
         file_path: str,
         directory: str,
         is_update: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """单文件分块 worker（供有界并发批处理调用，wave3 分块并发）。
 
         内部完成：读文件 → 空内容跳过 → hash → 截断 500KB → wait_for 超时保护 →
@@ -1063,7 +1063,7 @@ class CodeIndexer:
                 return_exceptions=True,
             )
 
-            for file_path, result in zip(batch, results):
+            for file_path, result in zip(batch, results, strict=True):
                 progress.current_file = file_path
 
                 if isinstance(result, BaseException):
@@ -1219,7 +1219,7 @@ class CodeIndexer:
                 return_exceptions=True,
             )
 
-            for relative_path, result in zip(batch, results):
+            for relative_path, result in zip(batch, results, strict=True):
                 progress.current_file = relative_path
                 is_update = relative_path in files_to_update
 
@@ -1557,7 +1557,7 @@ class CodeIndexer:
                         continue
                     # 文件足够大才读内容检查单行长度，小文件直接放行
                     if file_size > MAX_SINGLE_LINE_LENGTH:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        with open(file_path, encoding="utf-8", errors="ignore") as f:
                             if any(len(line) > MAX_SINGLE_LINE_LENGTH for line in f):
                                 logger.debug(f"跳过疑似构建产物（单行超长）: {file_path}")
                                 continue
