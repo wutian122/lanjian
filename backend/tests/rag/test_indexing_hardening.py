@@ -683,3 +683,47 @@ async def test_smart_index_directory_propagates_embedding_unavailable_no_write(t
         async for _p in indexer.smart_index_directory(str(root), [], None):
             pass
     assert await indexer.vector_store.get_count() == 0
+
+
+# ===========================================================================
+# Task 5 (B5): 进度消息分阶段标识（分块 vs 嵌入）
+# 覆盖 specs/rag-indexing-hardening/spec.md MODIFIED-R5：
+# - 分块阶段进度消息明确标识"分块"，嵌入阶段使用独立的"嵌入"标识，两阶段可区分。
+# - 文档契约型断言：模板常量同时是 SSE 消息的实际来源（agent_tasks.py 内 emit 使用），
+#   因此直接断言模板内容即锁定了用户可见消息的阶段标识。
+# ===========================================================================
+
+
+def _progress_templates():
+    """延迟导入 agent_tasks 常量，避免拖慢本模块收集阶段（模块导入较重）。"""
+    from app.api.v1.endpoints.agent_tasks import (
+        CHUNK_PROGRESS_MSG_TEMPLATE,
+        EMBED_PROGRESS_MSG_TEMPLATE,
+    )
+
+    return CHUNK_PROGRESS_MSG_TEMPLATE, EMBED_PROGRESS_MSG_TEMPLATE
+
+
+def test_chunk_progress_template_marks_chunk_phase():
+    """文档契约：分块模板含"分块"与"文件"标识，且与嵌入模板内容不同。"""
+    chunk_tpl, embed_tpl = _progress_templates()
+    assert "分块" in chunk_tpl
+    assert "文件" in chunk_tpl
+    assert chunk_tpl != embed_tpl
+
+
+def test_embed_progress_template_marks_embed_phase():
+    """文档契约：嵌入模板含"嵌入"标识，且不含"分块"（两阶段标识互斥）。"""
+    chunk_tpl, embed_tpl = _progress_templates()
+    assert "嵌入" in embed_tpl
+    assert "分块" not in embed_tpl
+
+
+def test_progress_templates_render_phase_labels():
+    """文档契约：模板 .format 渲染后，样本消息含对应阶段标识（用户实际看到的文案）。"""
+    chunk_tpl, embed_tpl = _progress_templates()
+    chunk_msg = chunk_tpl.format(processed=5, total=10, pct=50.0)
+    embed_msg = embed_tpl.format(processed=5, total=10, pct=50.0)
+    assert "分块" in chunk_msg
+    assert "嵌入" in embed_msg
+    assert "分块" not in embed_msg

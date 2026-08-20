@@ -52,6 +52,11 @@ from app.services.llm.service import LLMService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# 🔥 B5: 索引进度消息模板（分块阶段 vs 嵌入阶段分别标识，供用户区分当前所处阶段）
+# 分块阶段进度：明确标识"分块"；嵌入阶段使用独立的"嵌入"标识。
+CHUNK_PROGRESS_MSG_TEMPLATE = "📝 分块进度: {processed}/{total} 文件 ({pct:.0f}%)"
+EMBED_PROGRESS_MSG_TEMPLATE = "🔢 嵌入进度: {processed}/{total} ({pct:.0f}%)"
+
 # 运行中的任务（兼容旧接口）
 _running_tasks: dict[str, Any] = {}
 
@@ -1261,7 +1266,9 @@ async def _initialize_tools(
             if processed - last_embedding_progress[0] >= 10 or processed == total:
                 last_embedding_progress[0] = processed
                 percentage = (processed / total * 100) if total > 0 else 0
-                msg = f"🔢 嵌入进度: {processed}/{total} ({percentage:.0f}%)"
+                msg = EMBED_PROGRESS_MSG_TEMPLATE.format(
+                    processed=processed, total=total, pct=percentage
+                )
                 logger.info(msg)
                 # 使用 asyncio.create_task 调度异步 emit
                 try:
@@ -1300,8 +1307,11 @@ async def _initialize_tools(
                         if progress.processed_files - last_progress_update >= 10 or progress.processed_files == progress.total_files:
                             if progress.total_files > 0:
                                 await emit(
-                                    f"📝 索引进度: {progress.processed_files}/{progress.total_files} 文件 "
-                                    f"({progress.progress_percentage:.0f}%)"
+                                    CHUNK_PROGRESS_MSG_TEMPLATE.format(
+                                        processed=progress.processed_files,
+                                        total=progress.total_files,
+                                        pct=progress.progress_percentage,
+                                    )
                                 )
                                 # Mark progress as complete when 100%
                                 if progress.processed_files >= progress.total_files:
