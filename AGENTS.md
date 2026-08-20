@@ -1,6 +1,6 @@
 # AGENTS.md - 蓝鉴 (lanjian)
 
-AI 驱动的本地化代码安全审计平台：项目导入 -> 规则审计 -> Multi-Agent AI 分析 -> Docker 沙箱验证 -> 报告导出。
+AI 驱动的本地化代码安全审计平台：项目导入 -> RAG 索引 + 静态扫描（Semgrep/Bandit/Gitleaks 等 7 种外部工具 + 内置 OWASP 正则模式库）-> Multi-Agent AI 分析 -> Docker 沙箱 PoC 验证 -> 报告导出。
 前后端分离：后端 Python 3.11+（FastAPI + uv + Alembic + PostgreSQL 15 + Redis 7），前端 React 18（Vite + TypeScript + Tailwind + pnpm），Docker Compose 部署。
 
 ## 目录结构
@@ -8,12 +8,13 @@ AI 驱动的本地化代码安全审计平台：项目导入 -> 规则审计 -> 
 - `backend/` - FastAPI 后端，入口 `app.main:app`（详见 `backend/AGENTS.md`）
 - `backend/app/services/agent/` - Multi-Agent 审计引擎（详见其目录下 AGENTS.md）
 - `frontend/` - React 前端（详见 `frontend/AGENTS.md`）
-- `e2e/` - Playwright E2E 测试
-- `docker/sandbox/` - 沙箱镜像构建（Dockerfile + seccomp）
-- `openspec/` - OpenSpec 规格驱动（`specs/` 规格 + `changes/` 活动变更 + `changes/archive/` 归档）
-- `docs/` - 架构文档 + 安全加固交付报告
-- `rules/` - ast-grep 静态规则
-- compose 三件套：`docker-compose.yml`（默认）/ `docker-compose.override.yml`（开发热更）/ `docker-compose.prod.yml`（生产）
+- `e2e/` - Playwright E2E（仅 1 个 spec、无 playwright.config，基建实际废弃）
+- `docker/sandbox/` - 沙箱镜像构建（多语言 Dockerfile + seccomp；国内镜像源，`ARG TARGETARCH` 多架构）
+- `openspec/` - OpenSpec 规格驱动（`specs/` 4 个规格域：audit-engine/llm-adapter/rag/sse-realtime-stream）；2026-08 有 4 个活动变更在途（fix-deployment-drift-2026-08 进行中 5/11，其余 3 个未动工），动手前先对齐
+- `docs/` - 代码级流程分析（agent-execution-flow / audit-data-flow）+ 安全加固交付报告
+- `rules/` - ast-grep 规则（仅 SelectItem.yml，前端 TSX lint 用；后端审计不使用 ast-grep）
+- compose 四件套：`docker-compose.yml`（默认）/ `docker-compose.override.yml`（开发热更）/ `docker-compose.prod.yml`（生产，含独立 db-migrate 服务）/ `docker-compose.b-amd64.yml`（服务器 B 现场 override）
+- `.codegraph/` - 已建 CodeGraph 索引，定位代码优先 `codegraph explore` 再用 rg
 
 ## 常用命令
 
@@ -21,7 +22,8 @@ AI 驱动的本地化代码安全审计平台：项目导入 -> 规则审计 -> 
 
 ```bash
 uv sync                                    # 安装依赖
-uv run alembic upgrade head                # 数据库迁移
+uv run alembic upgrade head                # 数据库迁移（共 24 个，head=023_drop_dead）
+uv run alembic revision --autogenerate -m "描述"  # 生成迁移
 uv run uvicorn app.main:app --reload       # 开发服务 (:8000)
 uv run pytest                              # 测试
 uv run pytest tests/agent/test_xxx.py -v   # 单个测试
@@ -63,11 +65,13 @@ docker compose logs -f backend                  # 日志
 | 蓝鉴 backend | `:8000` 直接对外暴露 | `:8000` 直接对外暴露 |
 | docker build | 需代理 `10.129.1.238:10808`（**未配通**），代码靠现场 override compose | 直连正常，可本地 build |
 | 其它业务 | 宿主机 nginx `:8080`（`/etc/nginx/conf.d/drone-platform.conf` 反代，2026-08-03 启用） | 宿主机 xrdp + Xvnc + xray（运维远程/代理用） |
-| 蓝鉴 compose | `docker-compose.b-amd64.yml`（落仓，独立精简版，含 `db seccomp:unconfined`） | `docker-compose.yml`（3875B 仓库默认原文） |
-| IMAGE_TAG | 显式锁 `v5.1.0` | 镜像层已 v5.1.0，由 `docker-compose.yml` 显式锁 |
+| 蓝鉴 compose | `docker-compose.b-amd64.yml`（落仓精简版，含 `db seccomp:unconfined`；实测为生效 compose） | `docker-compose.yml`（仓库默认；实测为生效 compose） |
+| IMAGE_TAG | compose 显式锁 `v5.1.0`（`.env` 未设此变量） | compose 显式锁 `v5.1.0`（`.env` 残留惰性 `IMAGE_TAG=v5.0.0`，compose 已硬编码 tag 不受影响） |
 
 - 两台均跑 5 容器：`db`（postgres:15-alpine）、`redis`（redis:7-alpine）、`backend`、`frontend`、沙箱（`restart: no` 保持 Exited，仅作 docker.sock 动态起 PoC 容器的基底）。
 - 镜像来自 Docker Hub 组织 `wutian449`（lanjian-backend / lanjian-frontend / lanjian-sandbox），`v5.1.0` 为多架构（amd64 + arm64）；生产已锁 `v5.1.0`，禁止 `:latest` 浮动。
+- **2026-08-19 只读实测**：两台 5 容器全部 `v5.1.0`、db/redis healthy、sandbox 按设计 Exited(0)；生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）；A 机另有 buildx buildkit 常驻容器（本地构建用）。
+- ⚠️ **v5.1.0 镜像是重打 tag，不是重新构建**：三个镜像的层创建于 2026-06/07（v5.0.0 时代），v5.1.0 为纯版本号升级；两台前端容器显示的 5.1.0 是 2026-08-18 容器重建后**就地 sed 修补 dist**（index/icons/utils 三个 JS bundle）的产物--**recreate 容器后版本号显示会回退 5.0.0**。改代码必须重新 build + push 镜像再更新两台，只 bump 版本号无效。
 - 部署凭证（SUPERADMIN/POSTGRES 密码、SECRET_KEY）见 `docs/security-hardening-2026-07-DELIVERY.md` §6，登录凭证已录入 remote-shell 加密凭证库（credctl）。
 - **远程操作唯一入口是 remote-shell 技能**，默认只读，危险操作须老板确认。
 
@@ -89,12 +93,22 @@ docker compose logs -f backend                  # 日志
 ## 关键约束与坑
 
 - **生产严禁 `--reload`**：uvicorn 热重启会掐断所有 SSE 连接、丢失内存中 Orchestrator/EventManager 状态，任务进入 stale running。热更只写在 `docker-compose.override.yml`。
-- **沙箱 bind mount**：`/tmp/lanjian:/tmp/lanjian:rw` 必须保留。backend 经 docker.sock 起沙箱，daemon 是宿主机进程，看不到容器内解压的 ZIP 就会导致沙箱验证空跑。注意：仓库内 `docker-compose.prod.yml` 的 backend **未包含**此挂载（交付修复只写进了默认 `docker-compose.yml`），改用 prod.yml 部署前必须补上。
-- **4 个强制环境变量**（缺失拒绝启动）：`SECRET_KEY`（≥32 位）、`CORS_ALLOWED_ORIGINS`、`SUPERADMIN_PASSWORD`（≥12 位复杂度）、`POSTGRES_PASSWORD`（黑名单校验）。模板见 `backend/env.example`。
-- 后端单 worker（`--workers 1`），SSE/任务状态在进程内存中；跨进程 Registry 未落地。
+- **沙箱 bind mount**：`/tmp/lanjian:/tmp/lanjian:rw` 必须保留。backend 经 docker.sock 起沙箱，daemon 是宿主机进程，看不到容器内解压的 ZIP 就会导致沙箱验证空跑。三个部署 compose（默认/prod/b-amd64）现已全部包含此挂载（2026-08-19 核实，prod.yml 曾缺失的坑已修复）。
+- **环境变量分级**（README 称"4 个强制"，实际以代码为准）：真正拒绝启动的只有 `SECRET_KEY`（≥32 位 + 弱值黑名单）和 `POSTGRES_PASSWORD`（≥12 位 + 弱值黑名单）；`CORS_ALLOWED_ORIGINS` 未配置仅降级警告（origins=[]）；`SUPERADMIN_PASSWORD` 缺失或不达标时**跳过超管创建**而非拒绝启动。compose 层对 SECRET_KEY 用 `:?` 直接失败。模板见 `backend/env.example`。
+- 后端单 worker（`--workers 1`）的根源：`agent_tasks.py` 模块级内存 dict（`_running_orchestrators`/`_running_event_managers` 等）持有编排器与 SSE 队列；OrchestratorRegistry 已把存活心跳 Redis 化（`lanjian:orch:{task_id}`），但编排本体仍在进程内存，多 worker 仍不可用。
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
 - RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离，资源访问统一走 `assert_can_access_project`。
-- 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`。
+- 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`（容器 read_only + cap_drop ALL + 默认 network none + 60s 超时；SANDBOX_IMAGE 代码默认 `:latest`，生产靠 compose 锁 v5.1.0 覆盖）。
+- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 5.1.0；动依赖先 `uv lock` 再全量测试。
+- **SSE 只服务 Agent 审计页**：前端 useResilientStream 用 fetch+ReadableStream（非 EventSource，需 Bearer header），心跳 45s/长操作 180s、Last-Event-ID + after_sequence 续传、最多重连 5 次；普通审计任务是 setInterval 轮询（2s->60s 分级），无 SSE。
+- **前端版本号在构建期硬编码进 JS bundle**（package.json version 经 vite 注入），运行时不可配；升版本必须重构建前端镜像。
+
+## 代码速览（2026-08-19 全量深读核验）
+
+- 后端：13 个 API 端点模块（`agent_tasks.py` 最大，4650 行）；16 张表 / 9 个 model 文件；24 个 alembic 迁移（head=`023_drop_dead`）；74 个测试文件约 490 个用例（asyncio_mode=auto）。
+- 审计引擎：OrchestratorAgent（ReAct 循环 + Semgrep 预扫描）调度 Recon/Analysis/Verification 三子 Agent；27 种 SSE 事件；D1-D10 十维度覆盖率门禁；LLM 调用经熔断器 + 令牌桶限流（均已接线）。
+- 静态检测三套：沙箱内外部工具 7 种（Semgrep/Bandit/Gitleaks/TruffleHog/npm audit/Safety/OSV-Scanner）+ 内置 OWASP 正则模式库 + DB 中的 AuditRuleSet（LLM 提示词规则）。
+- 前端：16 个页面 / 13 条业务路由（无角色分流，权限全靠后端 API）；React Context + useReducer（无 zustand）；无单测框架（仅 3 个静态断言脚本）；三层 lint = tsgo + Biome（单规则）+ ast-grep。
 
 ## 编码规范
 
@@ -105,9 +119,10 @@ docker compose logs -f backend                  # 日志
 
 ## 改动前先读
 
-- 动后端 → `backend/AGENTS.md`
-- 动前端 → `frontend/AGENTS.md`
-- 动审计引擎 → `backend/app/services/agent/AGENTS.md`
-- 动 RAG → `backend/app/services/rag/AGENTS.md`
+- 动后端 → `backend/AGENTS.md`（⚠️ 已知过时：行数/迁移数/模型与测试清单/"不依赖 Semgrep"等条目与代码相反，以代码为准）
+- 动前端 → `frontend/AGENTS.md`（⚠️ 已知过时：组件清单/角色路由/zod 表单/apiInterceptor 等描述，以代码为准）
+- 动审计引擎 → `backend/app/services/agent/AGENTS.md`（⚠️ 部分超时常量与事件类型数过时）
+- 动 RAG → `backend/app/services/rag/AGENTS.md`（与代码一致性良好）
 - 动审计引擎规格 → `openspec/specs/audit-engine/spec.md`
-- 安全加固背景 → `docs/security-hardening-2026-07-DELIVERY.md`
+- 安全加固背景 → `docs/security-hardening-2026-07-DELIVERY.md`（§6 部署凭证、§7 留待老板事项）
+- 代码级流程 -> `docs/agent-execution-flow.md` + `docs/audit-data-flow.md`（2026-06-22 产出；熔断/限流现已接线、SSE 事件已 27 种，行号有漂移）
