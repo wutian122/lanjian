@@ -196,6 +196,11 @@ export default function CreateAgentTaskDialog({
 
     setCreating(true);
     try {
+      // B1: 若用户现场选择了新 ZIP，先上传再建任务（后端 Agent 任务只读已持久化的 ZIP，
+      // 不先上传会静默审计旧 ZIP 或无 ZIP 时后台失败）
+      if (isZipProject(selectedProject) && zipFile) {
+        await api.uploadProjectZip(selectedProject.id, zipFile);
+      }
       const agentTask = await createAgentTask({
         project_id: selectedProject.id,
         name: `Agent审计-${selectedProject.name}`,

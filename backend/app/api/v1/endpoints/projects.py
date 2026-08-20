@@ -1,33 +1,49 @@
-from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import FileResponse
+import json
+import os
+import shutil
+import uuid
+import zipfile
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel
-from datetime import datetime, timezone
-import shutil
-import os
-import uuid
-import json
 
 from app.api import deps
 from app.core.rbac import (
-    has_permission, get_subordinate_user_ids, build_project_filter,
-    UserRole, Permission, assert_can_access_project,
+    Permission,
+    UserRole,
+    assert_can_access_project,
+    build_project_filter,
+    get_subordinate_user_ids,
+    has_permission,
 )
-from app.db.session import get_db, AsyncSessionLocal
+from app.db.session import AsyncSessionLocal, get_db
+from app.models.agent_task import AgentFinding, AgentTask, AgentTaskStatus
+from app.models.audit import AuditIssue, AuditTask
 from app.models.project import Project
 from app.models.user import User
-from app.models.audit import AuditTask, AuditIssue
-from app.models.agent_task import AgentTask, AgentTaskStatus, AgentFinding
 from app.models.user_config import UserConfig
-import zipfile
-from app.services.scanner import scan_repo_task, get_github_files, get_gitlab_files, get_github_branches, get_gitlab_branches, get_gitea_branches, should_exclude, is_text_file
+from app.services.scanner import (
+    get_gitea_branches,
+    get_github_branches,
+    get_github_files,
+    get_gitlab_branches,
+    get_gitlab_files,
+    is_text_file,
+    scan_repo_task,
+    should_exclude,
+)
 from app.services.zip_storage import (
-    save_project_zip, load_project_zip, get_project_zip_meta,
-    delete_project_zip, has_project_zip
+    delete_project_zip,
+    get_project_zip_meta,
+    has_project_zip,
+    load_project_zip,
+    save_project_zip,
 )
 
 router = APIRouter()
@@ -35,28 +51,28 @@ router = APIRouter()
 # Schemas
 class ProjectCreate(BaseModel):
     name: str
-    source_type: Optional[str] = "repository"  # 'repository' 或 'zip'
-    repository_url: Optional[str] = None
-    repository_type: Optional[str] = "other"  # github, gitlab, other
-    description: Optional[str] = None
-    default_branch: Optional[str] = "main"
-    programming_languages: Optional[List[str]] = None
+    source_type: str | None = "repository"  # 'repository' 或 'zip'
+    repository_url: str | None = None
+    repository_type: str | None = "other"  # github, gitlab, other
+    description: str | None = None
+    default_branch: str | None = "main"
+    programming_languages: list[str] | None = None
 
 class ProjectUpdate(BaseModel):
-    name: Optional[str] = None
-    source_type: Optional[str] = None
-    repository_url: Optional[str] = None
-    repository_type: Optional[str] = None
-    description: Optional[str] = None
-    default_branch: Optional[str] = None
-    programming_languages: Optional[List[str]] = None
+    name: str | None = None
+    source_type: str | None = None
+    repository_url: str | None = None
+    repository_type: str | None = None
+    description: str | None = None
+    default_branch: str | None = None
+    programming_languages: list[str] | None = None
 
 class OwnerSchema(BaseModel):
     id: str
-    email: Optional[str] = None
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-    role: Optional[str] = None
+    email: str | None = None
+    full_name: str | None = None
+    avatar_url: str | None = None
+    role: str | None = None
 
     class Config:
         from_attributes = True
@@ -64,17 +80,17 @@ class OwnerSchema(BaseModel):
 class ProjectResponse(BaseModel):
     id: str
     name: str
-    description: Optional[str] = None
-    source_type: Optional[str] = "repository"  # 'repository' 或 'zip'
-    repository_url: Optional[str] = None
-    repository_type: Optional[str] = None  # github, gitlab, other
-    default_branch: Optional[str] = None
-    programming_languages: Optional[str] = None
+    description: str | None = None
+    source_type: str | None = "repository"  # 'repository' 或 'zip'
+    repository_url: str | None = None
+    repository_type: str | None = None  # github, gitlab, other
+    default_branch: str | None = None
+    programming_languages: str | None = None
     owner_id: str
     is_active: bool
     created_at: datetime
-    updated_at: Optional[datetime] = None
-    owner: Optional[OwnerSchema] = None
+    updated_at: datetime | None = None
+    owner: OwnerSchema | None = None
 
     class Config:
         from_attributes = True
@@ -156,7 +172,7 @@ async def create_project(
     await db.refresh(project)
     return project
 
-@router.get("/", response_model=List[ProjectResponse])
+@router.get("/", response_model=list[ProjectResponse])
 async def read_projects(
     db: AsyncSession = Depends(get_db),
     skip: int = 0,
@@ -184,7 +200,7 @@ async def read_projects(
     result = await db.execute(query)
     return result.scalars().all()
 
-@router.get("/deleted", response_model=List[ProjectResponse])
+@router.get("/deleted", response_model=list[ProjectResponse])
 async def read_deleted_projects(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
@@ -324,7 +340,7 @@ async def update_project(
     for field, value in update_data.items():
         setattr(project, field, value)
 
-    project.updated_at = datetime.now(timezone.utc)
+    project.updated_at = datetime.now(UTC)
     await db.commit()
     await db.refresh(project)
     return project
@@ -344,7 +360,7 @@ async def delete_project(
     assert_can_access_project(current_user, project)
 
     project.is_active = False
-    project.updated_at = datetime.now(timezone.utc)
+    project.updated_at = datetime.now(UTC)
     await db.commit()
     return {"message": "项目已删除"}
 
@@ -363,7 +379,7 @@ async def restore_project(
     assert_can_access_project(current_user, project)
 
     project.is_active = True
-    project.updated_at = datetime.now(timezone.utc)
+    project.updated_at = datetime.now(UTC)
     await db.commit()
     return {"message": "项目已恢复"}
 
@@ -397,8 +413,8 @@ async def permanently_delete_project(
 @router.get("/{id}/files")
 async def get_project_files(
     id: str,
-    branch: Optional[str] = None,
-    exclude_patterns: Optional[str] = None,
+    branch: str | None = None,
+    exclude_patterns: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
@@ -447,8 +463,8 @@ async def get_project_files(
             return []
 
         # Get tokens from user config
-        from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
         from app.core.config import settings
+        from app.core.encryption import SENSITIVE_OTHER_FIELDS, decrypt_sensitive_data
         from app.services.git_ssh_service import GitSSHOperations
 
         # P2-4: 使用 SENSITIVE_OTHER_FIELDS 单一真相源（含 giteaToken/sshPrivateKey）
@@ -518,17 +534,19 @@ async def get_project_files(
     return files
 
 class ScanRequest(BaseModel):
-    file_paths: Optional[List[str]] = None
+    file_paths: list[str] | None = None
     full_scan: bool = True
-    exclude_patterns: Optional[List[str]] = None
-    branch_name: Optional[str] = None
+    exclude_patterns: list[str] | None = None
+    branch_name: str | None = None
+    rule_set_id: str | None = None
+    prompt_template_id: str | None = None
 
 
 @router.post("/{id}/scan")
 async def scan_project(
     id: str,
     background_tasks: BackgroundTasks,
-    scan_request: Optional[ScanRequest] = None,
+    scan_request: ScanRequest | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
@@ -556,7 +574,7 @@ async def scan_project(
     await db.refresh(task)
 
     # 获取用户配置（包含解密敏感字段）
-    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
+    from app.core.encryption import SENSITIVE_OTHER_FIELDS, decrypt_sensitive_data
 
     # 需要解密的敏感字段列表
     SENSITIVE_LLM_FIELDS = [
@@ -591,8 +609,13 @@ async def scan_project(
         }
 
     # 将扫描配置注入到 user_config 中，以便 scan_repo_task 使用
-    if scan_request and scan_request.file_paths:
-        user_config['scan_config'] = {'file_paths': scan_request.file_paths}
+    # B2: 除 file_paths 外，还要透传用户选择的规则集与提示词模板（此前被丢弃，仓库扫描静默退回默认）
+    if scan_request:
+        user_config['scan_config'] = {
+            'file_paths': scan_request.file_paths,
+            'rule_set_id': scan_request.rule_set_id,
+            'prompt_template_id': scan_request.prompt_template_id,
+        }
 
     # Trigger Background Task
     background_tasks.add_task(scan_repo_task, task.id, AsyncSessionLocal, user_config)
@@ -604,9 +627,9 @@ async def scan_project(
 
 class ZipFileMetaResponse(BaseModel):
     has_file: bool
-    original_filename: Optional[str] = None
-    file_size: Optional[int] = None
-    uploaded_at: Optional[str] = None
+    original_filename: str | None = None
+    file_size: int | None = None
+    uploaded_at: str | None = None
 
 
 @router.get("/{id}/zip", response_model=ZipFileMetaResponse)
@@ -733,7 +756,7 @@ async def get_project_branches(
 
     # 获取用户配置的 Token
     from app.core.config import settings
-    from app.core.encryption import decrypt_sensitive_data, SENSITIVE_OTHER_FIELDS
+    from app.core.encryption import SENSITIVE_OTHER_FIELDS, decrypt_sensitive_data
 
     config = await db.execute(
         select(UserConfig).where(UserConfig.user_id == current_user.id)

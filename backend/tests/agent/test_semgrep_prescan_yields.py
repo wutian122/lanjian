@@ -8,6 +8,7 @@ import asyncio
 import ast
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,7 +22,8 @@ def _make_minimal_agent():
     agent._runtime_context = {"project_root": "."}
     agent.event_emitter = MagicMock()
     agent.event_emitter.emit = AsyncMock()
-    # emit_event 继承自 BaseAgent，需要 event_emitter 不为 None
+    # emit_event 继承自 BaseAgent，需要 event_emitter 与 config.name（self.name 属性）
+    agent.config = SimpleNamespace(name="Orchestrator")
     return agent
 
 

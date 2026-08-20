@@ -49,8 +49,8 @@ class TestTokenBudgetGate:
         assert agent._check_token_budget_exceeded(budget=-1) is False
 
     def test_token_budget_default_reads_from_config(self):
-        """P1: 不传 budget 时从 get_agent_config() 读取（默认值已上调到 10M）"""
+        """P1: 不传 budget 时从 get_agent_config() 读取（默认值 60M，见 README「Token 预算」）"""
         from app.services.agent.config import get_agent_config
         cfg = get_agent_config()
-        # 默认预算必须是 10,000,000（修复后值），不是旧的 100,000
-        assert cfg.token_budget == 10_000_000
+        # 默认预算 60,000,000（README 声明），非旧的 100K/10M
+        assert cfg.token_budget == 60_000_000

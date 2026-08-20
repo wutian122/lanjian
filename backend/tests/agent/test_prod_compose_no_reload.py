@@ -14,7 +14,8 @@ import pytest
 import yaml
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# 测试文件位于 backend/tests/agent/ 下：parents[3] 才是仓库根（parents[2] 是 backend/）
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_compose(name: str) -> dict:

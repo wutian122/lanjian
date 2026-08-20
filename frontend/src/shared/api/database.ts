@@ -177,7 +177,10 @@ export const api = {
       file_paths: task.scan_config?.file_paths,
       full_scan: !task.scan_config?.file_paths || task.scan_config.file_paths.length === 0,
       exclude_patterns: task.exclude_patterns || [],
-      branch_name: task.branch_name || "main"
+      branch_name: task.branch_name || "main",
+      // B2: 透传规则集与提示词模板（此前中间层丢弃这两个字段，界面策略对仓库扫描不生效）
+      rule_set_id: task.scan_config?.rule_set_id,
+      prompt_template_id: task.scan_config?.prompt_template_id,
     };
     const res = await apiClient.post(`/projects/${task.project_id}/scan`, scanRequest);
     // Fetch the created task

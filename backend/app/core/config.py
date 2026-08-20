@@ -175,6 +175,9 @@ class Settings(BaseSettings):
     SANDBOX_TIMEOUT: int = 60  # 娌欑鍛戒护瓒呮椂锛堢锛?
     SANDBOX_NETWORK_MODE: str = "none"  # 娌欑缃戠粶妯″紡 (none, bridge)
     SANDBOX_NETWORK_ENABLED: bool = False  # 沙箱是否允许联网（默认关闭）
+
+    # C2: LLM 连通性测试允许放行的内网代理主机（逗号分隔），其余回环/内网地址一律拒绝（防 SSRF）
+    LLM_TEST_ALLOWED_HOSTS: str = ""
     
     # RAG 閰嶇疆
     RAG_CHUNK_SIZE: int = 1500  # 浠ｇ爜鍧楀ぇ灏忥紙Token锛?

@@ -4,16 +4,16 @@ import random
 import string
 import time
 import uuid as uuid_lib
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
-from pydantic import BaseModel, EmailStr, field_validator
 
 from app.api import deps
 from app.core import security
@@ -23,7 +23,7 @@ from app.core.redis import get_redis
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.token import Token
-from app.schemas.user import User as UserSchema, UserCreate
+from app.schemas.user import User as UserSchema
 
 router = APIRouter()
 
@@ -77,7 +77,7 @@ class RegisterRequest(BaseModel):
     full_name: str
     department: str
     phone: str
-    email: Optional[str] = None
+    email: str | None = None
 
     @field_validator("confirm_password")
     @classmethod
@@ -147,8 +147,8 @@ async def get_captcha():
 async def login(
     db: AsyncSession = Depends(get_db),
     form_data: OAuth2PasswordRequestForm = Depends(),
-    captcha_code: Optional[str] = Query(None),
-    captcha_id: Optional[str] = Query(None),
+    captcha_code: str | None = Query(None),
+    captcha_id: str | None = Query(None),
 ) -> Any:
     """
     OAuth2 compatible token login with security enhancements.
@@ -167,8 +167,8 @@ async def login(
     user = result.scalars().first()
 
     # 检查账户锁定
-    if user and user.locked_until and user.locked_until > datetime.now(timezone.utc):
-        remaining = int((user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60)
+    if user and user.locked_until and user.locked_until > datetime.now(UTC):
+        remaining = int((user.locked_until - datetime.now(UTC)).total_seconds() / 60)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"账户已锁定，请 {remaining} 分钟后重试"
@@ -179,7 +179,7 @@ async def login(
         if user:
             user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
             if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
-                user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+                user.locked_until = datetime.now(UTC) + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
             await db.commit()
         raise HTTPException(status_code=400, detail="用户名或密码错误")
 
@@ -215,7 +215,7 @@ async def refresh_token(
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """使用刷新令牌获取新的访问令牌"""
-    from jose import jwt, JWTError
+    from jose import JWTError, jwt
 
     try:
         payload = jwt.decode(
@@ -226,6 +226,18 @@ async def refresh_token(
         user_id = payload.get("sub")
     except JWTError:
         raise HTTPException(status_code=401, detail="无效的刷新令牌")
+
+    # A2: 登出黑名单校验——已登出的 refresh 令牌不得再换发新令牌（Redis 不可用时 fail-open）
+    jti = payload.get("jti")
+    if jti:
+        try:
+            redis = await get_redis()
+            if await redis.get("logout:blacklist:" + str(jti)):
+                raise HTTPException(status_code=401, detail="刷新令牌已失效")
+        except HTTPException:
+            raise
+        except Exception:
+            logger.warning("[refresh] 黑名单检查跳过（Redis 不可用）")
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
@@ -293,7 +305,7 @@ async def register(
         role=UserRole.SUPER_ADMIN if is_first_user else UserRole.USER,
         is_first_login=True,
         password_history=[security.get_password_hash(user_in.password)],
-        last_password_change=datetime.now(timezone.utc),
+        last_password_change=datetime.now(UTC),
     )
     db.add(db_user)
     await db.commit()
@@ -326,7 +338,7 @@ async def change_password(
     # 更新密码
     current_user.hashed_password = security.get_password_hash(request.new_password)
     current_user.is_first_login = False
-    current_user.last_password_change = datetime.now(timezone.utc)
+    current_user.last_password_change = datetime.now(UTC)
 
     # 更新密码历史（保留最近 5 次）
     history = (current_user.password_history or [])[-4:]  # 保留旧 4 条
@@ -341,46 +353,56 @@ async def change_password(
 
 class LogoutRequest(BaseModel):
     refresh_token: str
+    access_token: str | None = None
 
 
 @router.post("/logout")
 async def logout(
     request: LogoutRequest,
-    current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """退出登录，将 refresh_token 加入黑名单"""
+    """退出登录，将 access 与 refresh 令牌的 jti 一并加入黑名单（登出立即全失效）。
+
+    不要求登录态：access 令牌过期后用户也应能登出并拉黑 refresh。仅按请求携带的
+    令牌拉黑，幂等且无信息泄露。
+    """
     # P3-2: 旧代码用 except Exception: pass 静默吞掉所有错误 —— JWT 篡改、Redis 掉线、
     # SECRET_KEY 不匹配都被无声跳过，登出根本没生效，客户端拿到"已退出登录"却仍能用旧 token。
     # 现在按异常类型分级处理：
     #   - JWT 解码失败：token 篡改/过期 → 依然当"已退出"响应（无需报错，token 不能用即目的达成）
     #   - Redis 掉线：黑名单写不进 → 抛 503，让前端知道要重试
-    from jose import JWTError
-    try:
-        import jwt
-        payload = jwt.decode(
-            request.refresh_token,
-            settings.SECRET_KEY,
-            algorithms=[settings.ALGORITHM],
-            options={"verify_exp": False},
-        )
-    except (JWTError, Exception) as e:
-        # JWT 层面失败不影响登出语义，仅记 debug 日志
-        logger.debug(f"[logout] refresh_token 解码失败（已忽略）: {e}")
-        return {"message": "已退出登录"}
+    from jose import JWTError, jwt
 
-    jti = payload.get("jti")
-    exp = payload.get("exp")
-    if not (jti and exp):
+    entries: dict = {}  # jti -> exp
+    for token in (request.refresh_token, request.access_token):
+        if not token:
+            continue
+        try:
+            payload = jwt.decode(
+                token,
+                settings.SECRET_KEY,
+                algorithms=[settings.ALGORITHM],
+                options={"verify_exp": False},
+            )
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            if jti and exp:
+                entries[jti] = exp
+        except (JWTError, Exception) as e:
+            # 单个令牌解码失败不影响登出语义，仅记 debug 日志
+            logger.debug(f"[logout] token 解码失败（已忽略）: {e}")
+
+    if not entries:
         # 老版本 token 没有 jti，无法拉黑；直接放行
         return {"message": "已退出登录"}
 
     now = int(time.time())
-    ttl = max(1, exp - now)
+    ttl = max(1, max(entries.values()) - now)
     try:
         redis = await get_redis()
-        await redis.setex(f"logout:blacklist:{jti}", ttl, "1")
+        for jti in entries:
+            await redis.setex("logout:blacklist:" + str(jti), ttl, "1")
     except Exception as e:
-        # Redis 层面失败必须让客户端知道，否则前端以为登出成功但 refresh 仍可用
+        # Redis 层面失败必须让客户端知道，否则前端以为登出成功但 token 仍可用
         logger.exception(f"[logout] Redis 写黑名单失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -22,6 +22,7 @@ import {
   resumeAgentTask,
   reAuditAgentTask,
   recoverAgentTask,
+  reverifyFinding,
   deleteAgentTask,
   getAgentTree,
   getAgentEvents,
@@ -536,7 +537,7 @@ function AgentAuditPageContent() {
     includeToolCalls: true,
     // 🔥 使用 state 变量，确保在历史事件加载后能获取最新值
     afterSequence: afterSequence,
-    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string }; sequence?: number }) => {
+    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string; init_step?: string; init_status?: string }; sequence?: number }) => {
       // 🔥 FIX F1: SSE 事件到达时同步更新 lastEventSequenceRef，防止 loadHistoricalEvents 重复拉取
       if (event.sequence && event.sequence > lastEventSequenceRef.current) {
         lastEventSequenceRef.current = event.sequence;
@@ -1142,7 +1143,7 @@ function AgentAuditPageContent() {
     return response.reply;
   }, [dispatch, taskId]);
 
-  const handleContinueAudit = useCallback(() => {
+  const handleContinueAudit = useCallback(async () => {
     dispatch({
       type: 'ADD_LOG',
       payload: {
@@ -1151,9 +1152,29 @@ function AgentAuditPageContent() {
         content: '用户从 AI 协同栏请求继续推进当前审计任务。',
       },
     });
-  }, [dispatch]);
+    // B4: 按任务状态路由到真实恢复能力（此前只写日志）
+    if (!taskId) return;
+    try {
+      if (isPaused) {
+        await resumeAgentTask(taskId);
+        toast.success('任务已继续执行');
+      } else if (canRecover) {
+        await recoverAgentTask(taskId);
+        toast.success('已请求恢复失活任务');
+      } else if (canReAudit) {
+        await reAuditAgentTask(taskId);
+        toast.success('已发起补充审计（重跑未验证发现）');
+      } else {
+        toast.info('当前任务状态无需继续操作');
+      }
+      await loadTask();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '操作失败';
+      toast.error(msg);
+    }
+  }, [dispatch, taskId, isPaused, canRecover, canReAudit, loadTask]);
 
-  const handleRerunPoc = useCallback((findingId: string) => {
+  const handleRerunPoc = useCallback(async (findingId: string) => {
     dispatch({
       type: 'ADD_LOG',
       payload: {
@@ -1162,7 +1183,17 @@ function AgentAuditPageContent() {
         content: `用户请求重新验证 finding: ${findingId}`,
       },
     });
-  }, [dispatch]);
+    // B4: 真实调用后端重跑 PoC 端点（此前只写日志）
+    if (!taskId) return;
+    try {
+      const result = await reverifyFinding(taskId, findingId);
+      toast.success(result.message || 'PoC 重跑完成');
+      await loadFindings();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'PoC 重跑失败';
+      toast.error(msg);
+    }
+  }, [dispatch, taskId, loadFindings]);
 
   // ============ Render ============
 

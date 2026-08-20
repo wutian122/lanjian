@@ -14,7 +14,7 @@ backend/
 │   │   └── v1/
 │   │       ├── api.py                # 路由聚合器（13 个端点模块）
 │   │       └── endpoints/
-│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期，3623 行）
+│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期，4650 行）
 │   │           ├── auth.py           # 登录、注册、验证码、改密、登出
 │   │           ├── users.py          # 用户 CRUD + 状态切换 + 级联删除
 │   │           ├── projects.py       # 项目管理 + ZIP + 分支 + 文件树（811 行）
@@ -22,7 +22,7 @@ backend/
 │   │           ├── tasks.py          # 传统审计任务
 │   │           ├── scan.py           # 即时代码扫描（仓库/ZIP/即时分析）
 │   │           ├── config.py         # LLM 运行时配置（加密存储）
-│   │           ├── database.py       # 数据库连接测试
+│   │           ├── database.py       # 数据库管理（export/import/clear/stats/health）
 │   │           ├── prompts.py        # 提示词模板管理（中英文双语）
 │   │           ├── rules.py          # 审计规则集（导入导出）
 │   │           ├── embedding_config.py # Embedding 模型配置
@@ -37,17 +37,15 @@ backend/
 │   │   ├── session.py                # AsyncSessionLocal 工厂 + get_db 依赖注入
 │   │   ├── base.py                   # SQLAlchemy 声明式基类（自动推导表名）
 │   │   └── init_db.py                # 首次启动种子数据（超管 + 演示数据 + 模板初始化）
-│   ├── models/                       # 11 个 ORM 模型
+│   ├── models/                       # 9 个 ORM 模型（16 张表）
 │   │   ├── user.py                   # 用户（UUID 主键、RBAC 角色、多租户、密码历史、账户锁定）
 │   │   ├── project.py                # 项目（repository/zip 两种类型）+ 项目成员
-│   │   ├── agent_task.py             # Agent 任务（11 种状态）+ 事件（18 种类型）+ 发现（7 种状态）+ 检查点 + 树节点
+│   │   ├── agent_task.py             # Agent 任务（11 种状态）+ 事件（27 种类型）+ 发现（7 种状态）+ 检查点 + 树节点
 │   │   ├── audit.py                  # 传统审计任务 + 审计问题（5 级严重度）
 │   │   ├── audit_rule.py             # 审计规则集 + 规则（支持导入导出）
 │   │   ├── audit_log.py              # 操作审计日志
 │   │   ├── prompt_template.py        # 提示词模板（中英文、系统/用户/分析三种类型）
 │   │   ├── user_config.py            # 用户 LLM 配置（JSON 存储）
-│   │   ├── security_control.py       # 安全控件（v3.1 Fusion）
-│   │   ├── coverage.py               # 覆盖率追踪
 │   │   └── analysis.py               # 即时分析记录
 │   ├── schemas/                      # Pydantic Schema（4 个模块）
 │   │   ├── token.py                  # 登录响应 + JWT 载荷
@@ -73,8 +71,6 @@ backend/
 │   │   │   ├── indexer.py            # 代码索引器（增量/全量/智能更新，索引版本控制）
 │   │   │   ├── retriever.py          # 代码检索器（语义/混合/函数上下文/相似代码检索）
 │   │   │   └── splitter.py           # 代码拆分器（tree-sitter AST，16+ 语言，安全模式识别）
-│   │   ├── controls/                 # 安全控件配置（YAML 驱动）
-│   │   │   └── config_loader.py      # 从 YAML 加载安全控件矩阵 + 语言适配器
 │   │   ├── scanner.py                # 传统 SAST 扫描器（GitHub/GitLab/Gitea 仓库）
 │   │   ├── report_generator.py       # WeasyPrint PDF 报告生成（A4 企业级审计报告）
 │   │   ├── init_templates.py         # 提示词模板和审计规则初始化（4 个模板 + 5 个规则集）
@@ -82,10 +78,10 @@ backend/
 │   │   └── git_ssh_service.py        # Git SSH 密钥管理（Ed25519/RSA）
 │   └── utils/
 │       └── repo_utils.py             # Git 仓库操作
-├── alembic/                          # 数据库迁移（19 个迁移文件）
-│   └── versions/                     # 001_initial → 017_add_verification_coverage
-├── tests/                            # 测试（23 个测试文件）
-│   ├── agent/                        # Agent 专项测试（13 个：验证/沙箱/覆盖率/严格发现等）
+├── alembic/                          # 数据库迁移（24 个迁移文件）
+│   └── versions/                     # 001_initial → 023_drop_dead（含一次 merge heads 4c280754c680）
+├── tests/                            # 测试（74 个测试文件，约 491 个用例）
+│   ├── agent/                        # Agent 专项测试（58 个：验证/沙箱/覆盖率/严格发现等）
 │   └── test_*.py                     # 认证/RBAC/攻击链/覆盖率/跨轮次/文件选择测试
 ├── uploads/                          # 上传文件存储
 ├── pyproject.toml                    # 依赖 + lint + 测试配置
@@ -118,7 +114,7 @@ backend/
 ## 审计数据流
 
 ```
-前端 POST /api/v1/agent-tasks/execute
+前端 POST /api/v1/agent-tasks/
     │
     ▼agent_tasks.py: _execute_agent_task(task_id)
     ├── 1. 获取项目、用户配置
@@ -146,10 +142,14 @@ backend/
 |------|------|------|
 | MVP | 001 | users, projects, audit_tasks, audit_issues |
 | 可定制化 | 004 | prompt_templates, audit_rule_sets, audit_rules |
-| Agent 引擎 | 006-009 | agent_tasks, agent_findings, checkpoints, 安全控制 |
-| 多租户 | 011 | tenants 表 + 所有核心表添加 tenant_id |
+| Agent 引擎 | 006-009 | agent_tasks, agent_findings, checkpoints（早期安全控件表，后废弃） |
+| 多租户 | 011 | tenants 表 + 所有核心表添加 tenant_id（后废弃，018 已删除） |
 | RBAC | 013-015 | 权限字段、用户名、部门 |
 | 验证流程 | 016-017 | verification_status, verification_coverage |
+| 清理 | 018 | cleanup_dead_schema：删除 tenants 表及 tenant_id 列、projects 死列 |
+| 清理 | 023 | drop_dead：删除 security_controls/sensitive_operations/operation_required_controls/language_adapters/coverage_tracks 五张死表 |
+
+> 注：迁移链含一次 merge heads（`4c280754c680`），当前 head=`023_drop_dead`。
 
 ## 编码规范
 
@@ -169,7 +169,7 @@ backend/
 - 禁止硬编码密钥密码
 - 沙箱工具禁止网络访问
 - 所有 LLM 调用必须经过 `circuit_breaker`
-- 不依赖外部静态分析工具（如 Semgrep）作为核心，用 LLM 自主审计
+- 外部静态分析工具为审计核心必用：Orchestrator 含 Semgrep 预扫描，沙箱内 7 种外部工具（Semgrep/Bandit/Gitleaks/TruffleHog/npm audit/Safety/OSV-Scanner）；静态检测三套 = 外部工具 + 内置 OWASP 正则模式库 + DB 中 AuditRuleSet（LLM 提示词规则，非 ast-grep）
 - 敏感信息必须通过 Fernet 加密存储
 
 ## 常用命令

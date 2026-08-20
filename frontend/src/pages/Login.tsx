@@ -78,7 +78,7 @@ export default function Login() {
         localStorage.removeItem("remembered_username");
       }
 
-      await login(response.data.access_token, rememberMe);
+      await login(response.data.access_token, response.data.refresh_token, rememberMe);
       toast.success("登录成功");
     } catch (error: any) {
       const detail = error.response?.data?.detail;

@@ -12,8 +12,8 @@ agent/
 │   ├── recon.py           # 侦察 Agent（项目结构、技术栈、入口点、高风险区域）
 │   ├── analysis.py        # 分析 Agent（外部工具扫描 + LLM 智能深度审计）
 │   └── verification.py    # 验证 Agent（PoC 生成、Docker 沙箱执行、自修正）
-├── core/                  # Agent 运行时基础设施（18 个文件）
-│   ├── circuit_breaker.py # 熔断器（CLOSED→OPEN→HALF_OPEN，连续失败 5 次触发）
+├── core/                  # Agent 运行时基础设施（19 个文件）
+│   ├── circuit_breaker.py # 熔断器（CLOSED→OPEN→HALF_OPEN，连续失败 10 次触发）
 │   ├── rate_limiter.py    # 令牌桶限流
 │   ├── retry.py           # 指数退避重试
 │   ├── fallback.py        # Agent 失败降级策略
@@ -25,6 +25,7 @@ agent/
 │   ├── validation.py      # 输出校验
 │   ├── message.py         # Agent 间消息协议（MessageType、MessagePriority）
 │   ├── graph_controller.py # LangGraph 工作流编排
+│   ├── orchestrator_registry.py # OrchestratorRegistry（Redis 存活心跳 `lanjian:orch:{task_id}`，5s 刷新/60s TTL，Redis 不可用降级进程内）
 │   ├── coverage.py        # CoverageMatrix（D1-D10 覆盖率矩阵）
 │   ├── cross_round.py     # CrossRoundContext（多轮审计上下文传递）
 │   ├── attack_chain.py    # 攻击链分析
@@ -54,7 +55,7 @@ agent/
 │   ├── rag_knowledge.py   # RAG 知识检索
 │   ├── tools.py           # 知识查询工具
 │   ├── frameworks/        # 框架安全知识（FastAPI、Django、Flask、Express、React、Supabase）
-│   └── vulnerabilities/   # 漏洞类型知识（12 种）
+│   └── vulnerabilities/   # 漏洞类型知识（13 个文件）
 │       ├── injection.py       # SQL/NoSQL/命令/代码注入
 │       ├── xss.py             # 反射型/存储型/DOM XSS
 │       ├── auth.py            # 认证绕过/IDOR/访问控制
@@ -66,7 +67,8 @@ agent/
 │       ├── xxe.py             # XXE
 │       ├── race_condition.py  # 竞态条件
 │       ├── business_logic.py  # 业务逻辑/速率限制
-│       └── open_redirect.py   # 开放重定向
+│       ├── open_redirect.py   # 开放重定向
+│       └── ssti.py            # 服务端模板注入（SSTI）
 ├── prompts/               # 系统提示词模板
 │   ├── system_prompts.py  # 多 Agent 规则、核心安全原则、工具使用指南
 │   └── __init__.py
@@ -89,10 +91,10 @@ agent/
 
 | Agent | 角色 | 输入 | 输出 | 最大轮次 | 超时 |
 |-------|------|------|------|---------|------|
-| **Orchestrator** | 编排决策 | 审计任务 + 项目上下文 | 子 Agent 调度指令 | 25 | 1800s |
-| **Recon** | 信息收集 | 项目仓库 | 技术栈、入口点、攻击面、推荐工具 | 15 | 1200s |
-| **Analysis** | 漏洞发现 | 代码 + 攻击面 | 漏洞列表（含置信度） | 45 | 1200s |
-| **Verification** | PoC 验证 | 漏洞报告 | PoC 脚本 + 验证结果 | 20 | 1200s |
+| **Orchestrator** | 编排决策 | 审计任务 + 项目上下文 | 子 Agent 调度指令 | 25 | 7200s |
+| **Recon** | 信息收集 | 项目仓库 | 技术栈、入口点、攻击面、推荐工具 | 15 | 1800s |
+| **Analysis** | 漏洞发现 | 代码 + 攻击面 | 漏洞列表（含置信度） | 45 | 1800s |
+| **Verification** | PoC 验证 | 漏洞报告 | PoC 脚本 + 验证结果 | 20 | 1800s |
 
 ## 审计流程（ReAct 编排）
 
@@ -180,12 +182,16 @@ Agent 执行 → AgentEventEmitter.emit(event_data)
       → stream_events(task_id) → AsyncGenerator → SSE 推送到前端
 ```
 
-事件类型（18 种）：
-- `phase_start/phase_complete` — 阶段开始/完成
-- `thinking/llm_thought/llm_decision/llm_action` — LLM 思考和决策
-- `tool_call/tool_result` — 工具调用和结果
-- `finding_new/finding_verified` — 漏洞发现和验证
-- `task_complete/task_error/task_cancel` — 任务完成/错误/取消
+事件类型（27 种）：
+- `task_*`（4 种）— task_start/task_complete/task_error/task_cancel
+- `phase_*`（2 种）— phase_start/phase_complete
+- `thinking`/`planning`/`decision`（3 种）— LLM 思考、规划、决策
+- `tool_*`（3 种）— tool_call/tool_result/tool_error
+- `rag_*`（2 种）— rag_query/rag_result
+- `finding_*`（4 种）— finding_new/finding_update/finding_verified/finding_false_positive
+- `sandbox_*`（4 种）— sandbox_start/sandbox_exec/sandbox_result/sandbox_error
+- `progress`（1 种）— 进度更新
+- `info`/`warning`/`error`/`debug`（4 种）— 日志级别
 - `heartbeat` — 心跳保活（15s）
 
 推送策略：初始排空 → 快速消费（最多 1000 个）→ 实时推送 → 积压检测（>100 时批量消费）
@@ -218,7 +224,7 @@ Agent 执行 → AgentEventEmitter.emit(event_data)
 
 ## 依赖
 
-- **LangChain + LangGraph**: Agent 工作流编排和 LLM 抽象
+- **无 LangChain/LangGraph 依赖**: 代码零 import（仅注释提及；langgraph 仅存在于过期 uv.lock）
 - **LiteLLM**: 多 LLM 提供商统一接口
 - **Docker SDK**: 沙箱容器管理
 - **Redis**: Agent 状态持久化和任务队列
@@ -232,12 +238,14 @@ Agent 执行 → AgentEventEmitter.emit(event_data)
 | `recon_max_iterations` | 15 | Recon 最大迭代 |
 | `analysis_max_iterations` | 45 | Analysis 最大迭代 |
 | `verification_max_iterations` | 20 | Verification 最大迭代 |
-| `orchestrator_timeout_seconds` | 1800 | Orchestrator 超时（30 分钟） |
-| `sub_agent_timeout_seconds` | 600 | 子 Agent 超时（10 分钟） |
+| `orchestrator_timeout_seconds` | 7200 | Orchestrator 超时（2 小时） |
+| `sub_agent_timeout_seconds` | 1800 | 子 Agent 超时（30 分钟） |
 | `tool_timeout_seconds` | 60 | 工具调用默认超时 |
 | `llm_max_retries` | 3 | LLM 调用最大重试 |
-| `circuit_breaker.failure_threshold` | 5 | 熔断器失败阈值 |
-| `circuit_breaker.recovery_timeout` | 30s | 熔断器恢复超时 |
+| `circuit_breaker.failure_threshold` | 10 | 熔断器失败阈值 |
+| `circuit_breaker.recovery_timeout` | 60s | 熔断器恢复超时 |
+| `circuit_breaker.half_open_max_calls` | 3 | 半开状态最大调用数 |
+| `per_finding_budget` | 8 | 单发现弹性验证预算（迭代次数） |
 
 ## 反模式
 

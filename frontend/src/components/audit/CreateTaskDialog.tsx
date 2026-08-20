@@ -256,6 +256,8 @@ export default function CreateTaskDialog({
             zipFile: zipState.zipFile,
             excludePatterns,
             createdBy: "local-user",
+            // B3: 新上传 ZIP 分支补传已选文件范围（此前漏传导致 UI 部分选择、后端全量扫描）
+            filePaths: selectedFiles,
             ruleSetId: selectedRuleSetId || undefined,
             promptTemplateId: selectedPromptTemplateId || undefined,
           });
@@ -423,6 +425,7 @@ export default function CreateTaskDialog({
                         await api.uploadProjectZip(selectedProject.id, zipState.zipFile);
                         toast.success("文件上传成功");
                         zipState.switchToStored();
+                        setSelectedFiles(undefined); // B3: 新文件上传后清空旧的文件范围，避免全量/旧范围误扫
                         loadProjects();
                       } catch (error) {
                         const msg = error instanceof Error ? error.message : "上传失败";

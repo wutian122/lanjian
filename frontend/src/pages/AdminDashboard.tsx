@@ -52,7 +52,9 @@ export default function AdminDashboard() {
     full_name: "", department: "", phone: "", role: "user",
   });
 
-  const isSuperAdmin = user?.role === "super_admin" || user?.is_superuser;
+  const isSuperAdmin = user?.role === "super_admin";
+  // C3: 后端 RBAC 允许 admin 管理下辖用户（parent_admin_id 数据范围），前端同步放开用户管理入口
+  const canManageUsers = isSuperAdmin || user?.role === "admin";
 
   const loadUsers = async () => {
     try {
@@ -68,7 +70,7 @@ export default function AdminDashboard() {
   };
 
   useEffect(() => {
-    if (isSuperAdmin) loadUsers();
+    if (canManageUsers) loadUsers();
   }, []);
 
   const handleToggleStatus = async (userId: string) => {
@@ -179,11 +181,11 @@ export default function AdminDashboard() {
         </TabsContent>
 
         <TabsContent value="users" className="space-y-6">
-          {!isSuperAdmin ? (
+          {!canManageUsers ? (
             <div className="rounded-xl border border-border bg-card shadow-card p-8 text-center">
               <Shield className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
               <h2 className="text-lg font-semibold text-foreground mb-2">权限不足</h2>
-              <p className="text-muted-foreground text-sm">仅超级管理员可访问用户管理功能</p>
+              <p className="text-muted-foreground text-sm">仅管理员及以上角色可访问用户管理功能</p>
             </div>
           ) : (
             <div className="rounded-xl border border-border bg-card shadow-card p-6">

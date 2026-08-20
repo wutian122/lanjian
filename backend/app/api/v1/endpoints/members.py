@@ -1,10 +1,11 @@
-from typing import Any, List, Optional
+from datetime import datetime
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel
-from datetime import datetime
 
 from app.api import deps
 from app.core.rbac import assert_can_access_project
@@ -18,10 +19,10 @@ router = APIRouter()
 # Schemas
 class UserSchema(BaseModel):
     id: str
-    email: Optional[str] = None
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-    role: Optional[str] = None
+    email: str | None = None
+    full_name: str | None = None
+    avatar_url: str | None = None
+    role: str | None = None
 
     class Config:
         from_attributes = True
@@ -32,10 +33,10 @@ class ProjectMemberSchema(BaseModel):
     project_id: str
     user_id: str
     role: str
-    permissions: Optional[str] = None
+    permissions: str | None = None
     joined_at: datetime
     created_at: datetime
-    user: Optional[UserSchema] = None
+    user: UserSchema | None = None
 
     class Config:
         from_attributes = True
@@ -47,11 +48,11 @@ class AddMemberRequest(BaseModel):
 
 
 class UpdateMemberRequest(BaseModel):
-    role: Optional[str] = None
-    permissions: Optional[str] = None
+    role: str | None = None
+    permissions: str | None = None
 
 
-@router.get("/{project_id}/members", response_model=List[ProjectMemberSchema])
+@router.get("/{project_id}/members", response_model=list[ProjectMemberSchema])
 async def get_project_members(
     project_id: str,
     db: AsyncSession = Depends(get_db),
@@ -64,7 +65,9 @@ async def get_project_members(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    
+    # P2: 对象级访问控制——非项目成员不得读取成员列表（404 不泄露资源存在性）
+    assert_can_access_project(current_user, project)
+
     result = await db.execute(
         select(ProjectMember)
         .options(selectinload(ProjectMember.user))
@@ -88,15 +91,15 @@ async def add_project_member(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    
+
     # Check if user is project owner or admin
     assert_can_access_project(current_user, project)
-    
+
     # Check if user exists
     user = await db.get(User, member_in.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-    
+
     # Check if already a member
     existing = await db.execute(
         select(ProjectMember)
@@ -107,7 +110,7 @@ async def add_project_member(
     )
     if existing.scalars().first():
         raise HTTPException(status_code=400, detail="用户已是项目成员")
-    
+
     # Create member
     member = ProjectMember(
         project_id=project_id,
@@ -118,7 +121,7 @@ async def add_project_member(
     db.add(member)
     await db.commit()
     await db.refresh(member)
-    
+
     # Reload with user relationship
     result = await db.execute(
         select(ProjectMember)
@@ -143,10 +146,10 @@ async def update_project_member(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    
+
     # Check permissions
     assert_can_access_project(current_user, project)
-    
+
     # Get member
     result = await db.execute(
         select(ProjectMember)
@@ -155,16 +158,16 @@ async def update_project_member(
     member = result.scalars().first()
     if not member:
         raise HTTPException(status_code=404, detail="成员不存在")
-    
+
     # Update fields
     if member_update.role:
         member.role = member_update.role
     if member_update.permissions:
         member.permissions = member_update.permissions
-    
+
     await db.commit()
     await db.refresh(member)
-    
+
     # Reload with user relationship
     result = await db.execute(
         select(ProjectMember)
@@ -188,10 +191,10 @@ async def remove_project_member(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    
+
     # Check permissions
     assert_can_access_project(current_user, project)
-    
+
     # Get member
     result = await db.execute(
         select(ProjectMember)
@@ -200,10 +203,10 @@ async def remove_project_member(
     member = result.scalars().first()
     if not member:
         raise HTTPException(status_code=404, detail="成员不存在")
-    
+
     await db.delete(member)
     await db.commit()
-    
+
     return {"message": "成员已移除"}
 
 

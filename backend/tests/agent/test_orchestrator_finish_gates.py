@@ -34,29 +34,51 @@ def test_has_valid_sandbox_evidence_false_when_no_evidence():
     assert agent._has_valid_sandbox_evidence() is False
 
 
-def test_has_valid_sandbox_evidence_true_when_confirmed():
-    agent = _make_agent()
-    agent._all_findings = [
-        {"title": "SQL注入", "verification_status": "confirmed"}
-    ]
-    assert agent._has_valid_sandbox_evidence() is True
-
-
-def test_has_valid_sandbox_evidence_true_when_sandbox_success():
+def test_has_valid_sandbox_evidence_true_when_confirmed_with_evidence():
+    """confirmed 且带成功沙箱证据 → 有效（Bug C 收紧后的语义）。"""
     agent = _make_agent()
     agent._all_findings = [
         {
-            "title": "RCE",
+            "title": "SQL注入",
+            "verification_status": "confirmed",
             "sandbox_attempts": [{"success": True, "exit_code": 0}],
         }
     ]
     assert agent._has_valid_sandbox_evidence() is True
 
 
-def test_has_valid_sandbox_evidence_true_when_is_verified():
+def test_has_valid_sandbox_evidence_true_when_sandbox_success():
+    """confirmed + 沙箱成功（success=True, exit_code=0）→ 有效。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "title": "RCE",
+            "verification_status": "confirmed",
+            "sandbox_attempts": [{"success": True, "exit_code": 0}],
+        }
+    ]
+    assert agent._has_valid_sandbox_evidence() is True
+
+
+def test_has_valid_sandbox_evidence_true_when_static_confirmed():
+    """static_confirmed（代码推理，B3 严标准）→ 有效。"""
+    agent = _make_agent()
+    agent._all_findings = [{"title": "XSS", "verification_status": "static_confirmed"}]
+    assert agent._has_valid_sandbox_evidence() is True
+
+
+def test_has_valid_sandbox_evidence_false_when_confirmed_without_evidence():
+    """Bug C fix：confirmed 但无沙箱证据 → 无效（不再仅凭状态放行）。"""
+    agent = _make_agent()
+    agent._all_findings = [{"title": "SQL注入", "verification_status": "confirmed"}]
+    assert agent._has_valid_sandbox_evidence() is False
+
+
+def test_has_valid_sandbox_evidence_false_when_only_is_verified():
+    """Bug C fix：is_verified=True 不再单独放行（必须有沙箱证据或 static_confirmed）。"""
     agent = _make_agent()
     agent._all_findings = [{"title": "XSS", "is_verified": True}]
-    assert agent._has_valid_sandbox_evidence() is True
+    assert agent._has_valid_sandbox_evidence() is False
 
 
 def test_has_valid_sandbox_evidence_false_when_sandbox_failed():
