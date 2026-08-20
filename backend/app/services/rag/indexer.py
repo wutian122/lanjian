@@ -61,6 +61,25 @@ BUILD_ARTIFACT_DIR_SEGMENTS = {
 MAX_SINGLE_LINE_LENGTH = 2000  # 单行超过该字符数视为 minified
 MAX_SOURCE_FILE_SIZE = 2 * 1024 * 1024  # 文件超过 2MB 视为构建产物
 
+# 单文件分块防护：对单个文件的 tree-sitter 分块设置时间上限与每文件 chunk 数量上限，
+# 超限时跳过该文件或截断并记录 warning，不中断整体索引
+FILE_CHUNK_TIMEOUT = 20  # 单文件分块超时（秒），超时跳过该文件并记 warning
+MAX_CHUNKS_PER_FILE = 500  # 单文件 chunk 数量上限，超过截断至 500 并记 warning
+
+
+def _cap_chunks(file_path: str, chunks: List[CodeChunk]) -> List[CodeChunk]:
+    """单文件 chunk 数量上限防护：超过 MAX_CHUNKS_PER_FILE 截断至上限并记 warning。
+
+    三个分块调用点（_full_index / _incremental_index / index_files）行为一致。
+    """
+    if len(chunks) > MAX_CHUNKS_PER_FILE:
+        logger.warning(
+            f"文件 {file_path} 分块数量 {len(chunks)} 超过上限 {MAX_CHUNKS_PER_FILE}，"
+            f"截断至 {MAX_CHUNKS_PER_FILE}"
+        )
+        return chunks[:MAX_CHUNKS_PER_FILE]
+    return chunks
+
 
 class IndexUpdateMode(Enum):
     """索引更新模式"""
@@ -965,7 +984,20 @@ class CodeIndexer:
                     content = content[:500000]
 
                 # 异步分块，避免 Tree-sitter 解析阻塞事件循环
-                chunks = await self.splitter.split_file_async(content, relative_path)
+                # 单文件分块设时间上限：超时跳过该文件但仍计入已处理数（保证进度推进）
+                # 注意：asyncio.wait_for 超时不会杀死后台线程，线程仍会跑完——这是设计允许的
+                try:
+                    chunks = await asyncio.wait_for(
+                        self.splitter.split_file_async(content, relative_path),
+                        timeout=FILE_CHUNK_TIMEOUT,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"文件 {relative_path} 分块超时（>{FILE_CHUNK_TIMEOUT}s），跳过该文件"
+                    )
+                    progress.processed_files += 1
+                    continue
+                chunks = _cap_chunks(relative_path, chunks)
 
                 # 为每个 chunk 添加 file_hash
                 for chunk in chunks:
@@ -1119,7 +1151,20 @@ class CodeIndexer:
                     content = content[:500000]
 
                 # 异步分块，避免 Tree-sitter 解析阻塞事件循环
-                chunks = await self.splitter.split_file_async(content, relative_path)
+                # 单文件分块设时间上限：超时跳过该文件但仍计入已处理数（保证进度推进）
+                # 注意：asyncio.wait_for 超时不会杀死后台线程，线程仍会跑完——这是设计允许的
+                try:
+                    chunks = await asyncio.wait_for(
+                        self.splitter.split_file_async(content, relative_path),
+                        timeout=FILE_CHUNK_TIMEOUT,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"文件 {relative_path} 分块超时（>{FILE_CHUNK_TIMEOUT}s），跳过该文件"
+                    )
+                    progress.processed_files += 1
+                    continue
+                chunks = _cap_chunks(relative_path, chunks)
 
                 # 为每个 chunk 添加 file_hash
                 for chunk in chunks:
@@ -1268,6 +1313,8 @@ class CodeIndexer:
 
                 # 分块
                 chunks = self.splitter.split_file(content, file_path)
+                # 单文件 chunk 数量上限：超过截断至 500 并记 warning（与异步主路径行为一致）
+                chunks = _cap_chunks(file_path, chunks)
 
                 # 为每个 chunk 添加 file_hash
                 for chunk in chunks:
