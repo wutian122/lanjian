@@ -256,6 +256,8 @@ export default function CreateTaskDialog({
             zipFile: zipState.zipFile,
             excludePatterns,
             createdBy: "local-user",
+            // B3: 新上传 ZIP 分支补传已选文件范围（此前漏传导致 UI 部分选择、后端全量扫描）
+            filePaths: selectedFiles,
             ruleSetId: selectedRuleSetId || undefined,
             promptTemplateId: selectedPromptTemplateId || undefined,
           });
@@ -764,7 +766,11 @@ function ZipUploadCard({
             <input
               type="radio"
               checked={!zipState.useStoredZip}
-              onChange={() => zipState.switchToUpload()}
+              onChange={() => {
+                zipState.switchToUpload();
+                // B3: 切到"上传新文件"后清空旧的已选文件范围，避免 UI 残留误导 + 新文件被旧范围过滤
+                setSelectedFiles(undefined);
+              }}
               className="w-4 h-4 accent-emerald-500"
             />
             <span className="text-emerald-700 dark:text-emerald-300">上传新文件</span>

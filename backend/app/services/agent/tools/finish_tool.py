@@ -159,20 +159,21 @@ class FinishScanTool(AgentTool):
                 error="此工具只能由根Agent使用。子Agent请使用 agent_finish 工具。"
             )
         
-        # 检查是否为注册的根Agent
-        root_id = agent_registry.get_root_agent_id()
-        if root_id and root_id != self.agent_id:
+        # C1: 并发下全局 root 只记录首个任务（单根模型），不能再用它判定根 Agent；
+        # 无父节点 + 是某任务的绑定根（或全局根，兼容旧流程）才视为根。
+        global_root = agent_registry.get_root_agent_id()
+        if global_root and global_root != self.agent_id and not agent_registry.is_bound_root(self.agent_id):
             return ToolResult(
                 success=False,
-                error=f"当前Agent不是根Agent。根Agent ID: {root_id}"
+                error=f"当前Agent不是根Agent。根Agent ID: {global_root}"
             )
-        
+
         return None
     
     def _check_active_agents(self) -> Optional[ToolResult]:
         """检查是否有活跃的子Agent"""
         try:
-            tree = agent_registry.get_agent_tree()
+            tree = agent_registry.get_agent_tree_subtree(self.agent_id)
             
             running_agents = []
             waiting_agents = []
@@ -245,7 +246,7 @@ class FinishScanTool(AgentTool):
         all_findings = []
         
         try:
-            tree = agent_registry.get_agent_tree()
+            tree = agent_registry.get_agent_tree_subtree(self.agent_id)
             
             for agent_id, node in tree["nodes"].items():
                 result = node.get("result")

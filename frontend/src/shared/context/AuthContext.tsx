@@ -15,7 +15,7 @@ interface AuthContextType {
   user: User | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  login: (token: string, rememberMe?: boolean) => Promise<void>;
+  login: (accessToken: string, refreshToken: string, rememberMe?: boolean) => Promise<void>;
   logout: () => void;
 }
 
@@ -46,16 +46,18 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     checkAuth();
   }, []);
 
-  const login = async (token: string, rememberMe: boolean = false) => {
+  const login = async (accessToken: string, refreshToken: string, rememberMe: boolean = false) => {
     // Clear any existing tokens first
     localStorage.removeItem('access_token');
     sessionStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+    sessionStorage.removeItem('refresh_token');
 
-    // Store token based on rememberMe preference
-    if (rememberMe) {
-      localStorage.setItem('access_token', token);
-    } else {
-      sessionStorage.setItem('access_token', token);
+    // Store tokens based on rememberMe preference
+    const storage = rememberMe ? localStorage : sessionStorage;
+    storage.setItem('access_token', accessToken);
+    if (refreshToken) {
+      storage.setItem('refresh_token', refreshToken);
     }
 
     try {
@@ -68,8 +70,26 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const logout = () => {
+    const token = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
+    const refresh = localStorage.getItem('refresh_token') || sessionStorage.getItem('refresh_token');
+    // A2: 通知后端将令牌加入黑名单（keepalive 保证页面跳转后请求仍送达）。
+    // 登出端点不需要登录态，access 过期后也能正常拉黑 refresh。
+    if (token || refresh) {
+      try {
+        fetch('/api/v1/auth/logout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refresh, access_token: token }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch (e) {
+        console.error('Logout API call failed', e);
+      }
+    }
     localStorage.removeItem('access_token');
     sessionStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+    sessionStorage.removeItem('refresh_token');
     setUser(null);
     setIsAuthenticated(false);
   };

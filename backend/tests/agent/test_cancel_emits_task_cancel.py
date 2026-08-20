@@ -43,25 +43,21 @@ class TestCancelPathEmitsTaskCancel:
         )
 
     def test_execute_agent_task_cancelled_error_branch_emits(self):
-        """_execute_agent_task 的 CancelledError 分支应含 emit_task_cancelled 调用"""
+        """_execute_agent_task 的主任务 CancelledError 分支应含 emit_task_cancelled 调用"""
         content = SRC.read_text(encoding="utf-8")
         body = _extract_function_body(content, "_execute_agent_task")
 
-        # 找到 `except asyncio.CancelledError:` 之后的 50 行
+        # 函数内存在多个 `except asyncio.CancelledError`（嵌套的早心跳辅助函数也有），
+        # 需定位"某个"在后续窗口内调用 emit_task_cancelled 的分支（真实主循环分支在 1044 行附近）。
         lines = body.splitlines()
-        idx = None
+        found = False
         for i, line in enumerate(lines):
             if "except asyncio.CancelledError" in line:
-                idx = i
-                break
-        assert idx is not None, "_execute_agent_task 应有 except asyncio.CancelledError 分支"
-
-        # 检查其后 40 行内含 emit_task_cancelled
-        window = "\n".join(lines[idx:idx + 40])
-        assert "emit_task_cancelled" in window, (
-            f"_execute_agent_task 的 CancelledError 分支应调用 emit_task_cancelled；"
-            f"当前该分支内容:\n{window}"
-        )
+                window = "\n".join(lines[i:i + 40])
+                if "emit_task_cancelled" in window:
+                    found = True
+                    break
+        assert found, "_execute_agent_task 的 CancelledError 分支应调用 emit_task_cancelled"
 
 
 class TestEmitTaskCancelledMethodExists:

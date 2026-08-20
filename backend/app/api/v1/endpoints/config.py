@@ -2,23 +2,24 @@
 用户配置API端点
 """
 
-from typing import Any, Optional
+import json
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from pydantic import BaseModel, Field
-import json
 
 from app.api import deps
-from app.db.session import get_db
-from app.models.user_config import UserConfig
-from app.models.user import User
 from app.core.config import settings
 from app.core.encryption import (
-    encrypt_sensitive_data,
-    decrypt_sensitive_data,
     SENSITIVE_OTHER_FIELDS,
+    decrypt_sensitive_data,
+    encrypt_sensitive_data,
 )
+from app.db.session import get_db
+from app.models.user import User
+from app.models.user_config import UserConfig
 
 router = APIRouter()
 
@@ -78,54 +79,107 @@ def strip_empty_sensitive(data: dict, sensitive_fields: list) -> dict:
     return cleaned
 
 
+def _validate_llm_base_url(url: str) -> str:
+    """C2: 校验 LLM Base URL，防止已认证 SSRF。
+
+    仅允许 http/https；拒绝回环/内网/保留地址（含域名解析后校验，防 DNS rebinding）；
+    逗号分隔的 LLM_TEST_ALLOWED_HOSTS 放行合法内网代理。校验失败抛 400。
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Base URL 必须是 http/https 协议")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise HTTPException(status_code=400, detail="Base URL 缺少主机名")
+
+    allowed = [
+        h.strip().lower()
+        for h in getattr(settings, "LLM_TEST_ALLOWED_HOSTS", "").split(",")
+        if h.strip()
+    ]
+    if host in allowed:
+        return url
+
+    if host in ("localhost", "db", "redis", "backend", "frontend", "sandbox", "host.docker.internal"):
+        raise HTTPException(status_code=400, detail="禁止访问内部服务地址")
+
+    def _is_banned(ip: "ipaddress._BaseAddress") -> bool:
+        return (
+            ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast
+        )
+
+    try:
+        ip = ipaddress.ip_address(host)
+        if _is_banned(ip):
+            raise HTTPException(status_code=400, detail="禁止访问内网/回环/保留地址")
+        return url
+    except ValueError:
+        pass  # 非 IP 字面量，走域名解析校验
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise HTTPException(status_code=400, detail="域名无法解析")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if _is_banned(ip):
+            raise HTTPException(status_code=400, detail="域名解析到内网/回环地址")
+    return url
+
+
 class LLMConfigSchema(BaseModel):
     """LLM配置Schema"""
-    llmProvider: Optional[str] = None
-    llmApiKey: Optional[str] = None
-    llmModel: Optional[str] = None
+    llmProvider: str | None = None
+    llmApiKey: str | None = None
+    llmModel: str | None = None
     llmBaseUrl: str = Field(None, description="API Base URL（必填）")
-    llmTimeout: Optional[int] = None
-    llmTemperature: Optional[float] = None
-    llmMaxTokens: Optional[int] = None
-    llmCustomHeaders: Optional[str] = None
+    llmTimeout: int | None = None
+    llmTemperature: float | None = None
+    llmMaxTokens: int | None = None
+    llmCustomHeaders: str | None = None
 
     # Agent超时配置
-    llmFirstTokenTimeout: Optional[int] = None  # 首Token超时（秒）
-    llmStreamTimeout: Optional[int] = None  # 流式超时（秒）
-    agentTimeout: Optional[int] = None  # Agent总超时（秒）
-    subAgentTimeout: Optional[int] = None  # 子Agent超时（秒）
-    toolTimeout: Optional[int] = None  # 工具执行超时（秒）
+    llmFirstTokenTimeout: int | None = None  # 首Token超时（秒）
+    llmStreamTimeout: int | None = None  # 流式超时（秒）
+    agentTimeout: int | None = None  # Agent总超时（秒）
+    subAgentTimeout: int | None = None  # 子Agent超时（秒）
+    toolTimeout: int | None = None  # 工具执行超时（秒）
 
     # 平台专用配置
-    geminiApiKey: Optional[str] = None
-    openaiApiKey: Optional[str] = None
-    claudeApiKey: Optional[str] = None
-    qwenApiKey: Optional[str] = None
-    deepseekApiKey: Optional[str] = None
-    zhipuApiKey: Optional[str] = None
-    moonshotApiKey: Optional[str] = None
-    baiduApiKey: Optional[str] = None
-    minimaxApiKey: Optional[str] = None
-    doubaoApiKey: Optional[str] = None
-    ollamaBaseUrl: Optional[str] = None
+    geminiApiKey: str | None = None
+    openaiApiKey: str | None = None
+    claudeApiKey: str | None = None
+    qwenApiKey: str | None = None
+    deepseekApiKey: str | None = None
+    zhipuApiKey: str | None = None
+    moonshotApiKey: str | None = None
+    baiduApiKey: str | None = None
+    minimaxApiKey: str | None = None
+    doubaoApiKey: str | None = None
+    ollamaBaseUrl: str | None = None
 
 
 class OtherConfigSchema(BaseModel):
     """其他配置Schema"""
-    githubToken: Optional[str] = None
-    gitlabToken: Optional[str] = None
-    maxAnalyzeFiles: Optional[int] = None
-    llmConcurrency: Optional[int] = None
-    llmGapMs: Optional[int] = None
-    llmRatePerMinute: Optional[int] = None
-    outputLanguage: Optional[str] = None
-    sandboxNetworkEnabled: Optional[bool] = None
+    githubToken: str | None = None
+    gitlabToken: str | None = None
+    maxAnalyzeFiles: int | None = None
+    llmConcurrency: int | None = None
+    llmGapMs: int | None = None
+    llmRatePerMinute: int | None = None
+    outputLanguage: str | None = None
+    sandboxNetworkEnabled: bool | None = None
 
 
 class UserConfigRequest(BaseModel):
     """用户配置请求"""
-    llmConfig: Optional[LLMConfigSchema] = None
-    otherConfig: Optional[OtherConfigSchema] = None
+    llmConfig: LLMConfigSchema | None = None
+    otherConfig: OtherConfigSchema | None = None
 
 
 class UserConfigResponse(BaseModel):
@@ -135,7 +189,7 @@ class UserConfigResponse(BaseModel):
     llmConfig: dict
     otherConfig: dict
     created_at: str
-    updated_at: Optional[str] = None
+    updated_at: str | None = None
 
     class Config:
         from_attributes = True
@@ -245,9 +299,14 @@ async def resolve_effective_config(
 
 
 @router.get("/defaults")
-async def get_default_config_endpoint() -> Any:
-    """获取系统默认配置（无需认证）"""
-    return get_default_config()
+async def get_default_config_endpoint(
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """获取系统默认配置（需认证；敏感字段一律脱敏，绝不下发明文密钥）"""
+    defaults = get_default_config()
+    defaults["llmConfig"] = mask_config(defaults["llmConfig"], SENSITIVE_LLM_FIELDS)
+    defaults["otherConfig"] = mask_config(defaults["otherConfig"], SENSITIVE_OTHER_FIELDS)
+    return defaults
 
 
 @router.get("/me", response_model=UserConfigResponse)
@@ -296,7 +355,7 @@ async def update_my_config(
         select(UserConfig).where(UserConfig.user_id == current_user.id)
     )
     config = result.scalar_one_or_none()
-    
+
     # 准备要保存的配置数据（加密敏感字段）
     llm_data = config_in.llmConfig.dict(exclude_none=True) if config_in.llmConfig else {}
     other_data = config_in.otherConfig.dict(exclude_none=True) if config_in.otherConfig else {}
@@ -305,15 +364,14 @@ async def update_my_config(
     llm_data = strip_empty_sensitive(llm_data, SENSITIVE_LLM_FIELDS)
     other_data = strip_empty_sensitive(other_data, SENSITIVE_OTHER_FIELDS)
 
-    # Base URL 验证
+    # Base URL 验证（C2: 防 SSRF——http/https + 拒绝回环/内网；合法内网代理走 LLM_TEST_ALLOWED_HOSTS）
     if config_in.llmConfig and config_in.llmConfig.llmBaseUrl is not None:
-        if not config_in.llmConfig.llmBaseUrl.startswith(("http://", "https://")):
-            raise HTTPException(422, "API Base URL 必须是一个有效的 HTTP(S) 地址")
-    
+        _validate_llm_base_url(config_in.llmConfig.llmBaseUrl)
+
     # 加密敏感字段
     llm_data_encrypted = encrypt_config(llm_data, SENSITIVE_LLM_FIELDS)
     other_data_encrypted = encrypt_config(other_data, SENSITIVE_OTHER_FIELDS)
-    
+
     if not config:
         # 创建新配置
         config = UserConfig(
@@ -330,14 +388,14 @@ async def update_my_config(
             existing_llm = decrypt_config(existing_llm, SENSITIVE_LLM_FIELDS)
             existing_llm.update(llm_data)  # 使用未加密的新数据合并
             config.llm_config = json.dumps(encrypt_config(existing_llm, SENSITIVE_LLM_FIELDS))
-        
+
         if config_in.otherConfig:
             existing_other = json.loads(config.other_config) if config.other_config else {}
             # 先解密现有数据，再合并新数据，最后加密
             existing_other = decrypt_config(existing_other, SENSITIVE_OTHER_FIELDS)
             existing_other.update(other_data)  # 使用未加密的新数据合并
             config.other_config = json.dumps(encrypt_config(existing_other, SENSITIVE_OTHER_FIELDS))
-    
+
     await db.commit()
     await db.refresh(config)
 
@@ -352,7 +410,7 @@ async def update_my_config(
     default_config = get_default_config()
     user_llm_config = json.loads(config.llm_config) if config.llm_config else {}
     user_other_config = json.loads(config.other_config) if config.other_config else {}
-    
+
     # 解密后返回给前端
     user_llm_config = decrypt_config(user_llm_config, SENSITIVE_LLM_FIELDS)
     user_other_config = decrypt_config(user_other_config, SENSITIVE_OTHER_FIELDS)
@@ -363,7 +421,7 @@ async def update_my_config(
     # 问题二：脱敏后返回
     merged_llm_config = mask_config(merged_llm_config, SENSITIVE_LLM_FIELDS)
     merged_other_config = mask_config(merged_other_config, SENSITIVE_OTHER_FIELDS)
-    
+
     return UserConfigResponse(
         id=config.id,
         user_id=config.user_id,
@@ -384,11 +442,11 @@ async def delete_my_config(
         select(UserConfig).where(UserConfig.user_id == current_user.id)
     )
     config = result.scalar_one_or_none()
-    
+
     if config:
         await db.delete(config)
         await db.commit()
-    
+
     return {"message": "配置已删除"}
 
 
@@ -396,18 +454,18 @@ class LLMTestRequest(BaseModel):
     """LLM测试请求"""
     provider: str
     apiKey: str = ""
-    model: Optional[str] = None
-    baseUrl: Optional[str] = None
+    model: str | None = None
+    baseUrl: str | None = None
 
 
 class LLMTestResponse(BaseModel):
     """LLM测试响应"""
     success: bool
     message: str
-    model: Optional[str] = None
-    response: Optional[str] = None
+    model: str | None = None
+    response: str | None = None
     # 调试信息
-    debug: Optional[dict] = None
+    debug: dict | None = None
 
 
 @router.post("/test-llm", response_model=LLMTestResponse)
@@ -417,11 +475,24 @@ async def test_llm_connection(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """测试LLM连接是否正常"""
-    from app.services.llm.factory import LLMFactory, NATIVE_ONLY_PROVIDERS
-    from app.services.llm.adapters import LiteLLMAdapter, BaiduAdapter, MinimaxAdapter, DoubaoAdapter
-    from app.services.llm.types import LLMConfig, LLMProvider, LLMRequest, LLMMessage, DEFAULT_MODELS, DEFAULT_BASE_URLS
-    import traceback
     import time
+    import traceback
+
+    from app.services.llm.adapters import (
+        BaiduAdapter,
+        DoubaoAdapter,
+        LiteLLMAdapter,
+        MinimaxAdapter,
+    )
+    from app.services.llm.factory import NATIVE_ONLY_PROVIDERS
+    from app.services.llm.types import (
+        DEFAULT_BASE_URLS,
+        DEFAULT_MODELS,
+        LLMConfig,
+        LLMMessage,
+        LLMProvider,
+        LLMRequest,
+    )
 
     start_time = time.time()
 
@@ -516,7 +587,12 @@ async def test_llm_connection(
 
         # 获取默认模型
         model = request.model or DEFAULT_MODELS.get(provider)
-        base_url = request.baseUrl or DEFAULT_BASE_URLS.get(provider, "")
+        # C2: 用户提供的 baseUrl 必须通过 SSRF 校验（默认 baseUrl 是可信常量）
+        base_url = (
+            _validate_llm_base_url(request.baseUrl)
+            if request.baseUrl
+            else DEFAULT_BASE_URLS.get(provider, "")
+        )
 
         # 测试时使用用户保存的所有配置参数
         test_timeout = int(saved_timeout_ms / 1000) if saved_timeout_ms else settings.LLM_TIMEOUT
@@ -539,7 +615,7 @@ async def test_llm_connection(
             provider=provider,
             api_key=effective_api_key,
             model=model,
-            base_url=request.baseUrl,
+            base_url=base_url,
             timeout=test_timeout,
             temperature=test_temperature,
             max_tokens=test_max_tokens,
@@ -568,7 +644,7 @@ async def test_llm_connection(
             max_tokens=test_max_tokens,
         )
 
-        print(f"[LLM Test] 发送测试请求...")
+        print("[LLM Test] 发送测试请求...")
         response = await adapter.complete(test_request)
 
         elapsed_time = time.time() - start_time
@@ -610,7 +686,7 @@ async def test_llm_connection(
         debug_info["elapsed_time_ms"] = round(elapsed_time * 1000, 2)
         debug_info["error_type"] = error_type
         debug_info["error_message"] = error_msg
-        debug_info["traceback"] = traceback.format_exc()
+        # C2: traceback 全文只进服务端日志（下方已有 print），不再回传客户端
 
         # 提取 LLMError 中的 api_response
         if hasattr(e, 'api_response') and e.api_response:
@@ -678,7 +754,7 @@ async def test_sandbox_network(
     if current_user.role not in ("super_admin", "admin"):
         raise HTTPException(403, "仅管理员可执行此操作")
 
-    from app.services.agent.tools.sandbox_tool import SandboxManager, SandboxConfig
+    from app.services.agent.tools.sandbox_tool import SandboxConfig, SandboxManager
 
     config = SandboxConfig(network_mode="bridge")
     manager = SandboxManager(config=config)
@@ -744,7 +820,7 @@ async def sandbox_exec_command(
             f"不允许执行此命令。允许的命令前缀: {', '.join(allowed_prefixes)}"
         )
 
-    from app.services.agent.tools.sandbox_tool import SandboxManager, SandboxConfig
+    from app.services.agent.tools.sandbox_tool import SandboxConfig, SandboxManager
 
     config = SandboxConfig(network_mode="bridge")
     manager = SandboxManager(config=config)
@@ -806,8 +882,8 @@ async def get_sandbox_packages(
 async def get_llm_providers() -> Any:
     """获取支持的LLM提供商列表"""
     from app.services.llm.factory import LLMFactory
-    from app.services.llm.types import LLMProvider, DEFAULT_BASE_URLS
-    
+    from app.services.llm.types import DEFAULT_BASE_URLS
+
     providers = []
     for provider in LLMFactory.get_supported_providers():
         providers.append({
@@ -817,6 +893,6 @@ async def get_llm_providers() -> Any:
             "models": LLMFactory.get_available_models(provider),
             "defaultBaseUrl": DEFAULT_BASE_URLS.get(provider, ""),
         })
-    
+
     return {"providers": providers}
 

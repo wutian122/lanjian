@@ -123,7 +123,7 @@ async def test_resume_agent_task_uses_last_checkpoint_and_restarts_runner(monkey
 
     fake_asyncio_task = MagicMock()
 
-    def fake_create_task(coro):
+    def fake_create_task(coro, **kwargs):
         scheduled["coroutine"] = coro
         frame_locals = coro.cr_frame.f_locals if coro.cr_frame else {}
         scheduled["task_id"] = frame_locals.get("task_id")
@@ -170,7 +170,7 @@ async def test_resume_agent_task_falls_back_to_latest_checkpoint(monkeypatch):
 
     fake_asyncio_task = MagicMock()
 
-    def fake_create_task(coro):
+    def fake_create_task(coro, **kwargs):
         scheduled["coroutine"] = coro
         frame_locals = coro.cr_frame.f_locals if coro.cr_frame else {}
         scheduled["task_id"] = frame_locals.get("task_id")
@@ -215,7 +215,7 @@ async def test_resume_agent_task_without_checkpoint_starts_fresh(monkeypatch):
 
     fake_asyncio_task = MagicMock()
 
-    def fake_create_task(coro):
+    def fake_create_task(coro, **kwargs):
         frame_locals = coro.cr_frame.f_locals if coro.cr_frame else {}
         scheduled["task_id"] = frame_locals.get("task_id")
         scheduled["resume_checkpoint_id"] = frame_locals.get("resume_checkpoint_id")

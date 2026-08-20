@@ -93,7 +93,7 @@ docker compose logs -f backend                  # 日志
 - **4 个强制环境变量**（缺失拒绝启动）：`SECRET_KEY`（≥32 位）、`CORS_ALLOWED_ORIGINS`、`SUPERADMIN_PASSWORD`（≥12 位复杂度）、`POSTGRES_PASSWORD`（黑名单校验）。模板见 `backend/env.example`。
 - 后端单 worker（`--workers 1`），SSE/任务状态在进程内存中；跨进程 Registry 未落地。
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
-- RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离，资源访问统一走 `assert_can_access_project`。
+- RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离；项目资源访问统一走 `assert_can_access_project`（2026-08 安全加固已补上 members.py 遗漏的断言；前端用户管理已对 admin 开放，与后端下辖管理 RBAC 对齐）。
 - 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`。
 
 ## 编码规范

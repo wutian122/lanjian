@@ -1,0 +1,46 @@
+# .spec-superflow.yaml — lightweight state machine
+# Derived data. Always rebuildable from artifacts. Lost/corrupt → fall back to content-level detection.
+
+# === Core state ===
+state: approved-for-build
+workflow: full
+revision: null
+
+# === Hashes (fast staleness detection) ===
+artifacts_hash: sha256:61144124850b24966860b7a65f5a91e3bd78ad3abaf978b40da3655e3280cc54
+contract_hash: sha256:95ad159f9a81424f555a696ffc8d0a9d780e38e5007214fa8d0bef2e89d27f30
+
+# === Execution progress ===
+execution_mode: null
+execution_plan_hash: null
+execution_plan_revision: null
+batches_completed: 0
+test_result: pass
+spec_merged: true
+spec_publication_receipt: eyJ2ZXJzaW9uIjoxLCJzb3VyY2VfaGFzaCI6InNoYTI1NjowMjAyMTVhNjQ3MDUxYzQwNmQyNDE5MjhiN2ZkNjg0OTBiNWU2ZThiZjZlZmQwZTkzNTQ1NWU4MjU3ZjZjNzAyIiwiYmFzZWxpbmVfYmVmb3JlX2hhc2giOiJzaGEyNTY6NjRiMzE0Yjg2MTgzMjlmYjcyN2ZiZjk3ZWIxZGI4ZTZiMzg0YTU0OGNkM2YxYTVjZjFhNTE1YjMyYWI1MzZhZSIsImJhc2VsaW5lX2FmdGVyX2hhc2giOiJzaGEyNTY6MzU2ZjkxNWRmOTFkYzRmYjU3ODIwZGVmZTMwMWQ3MjgyZGNmZjgzNzc0OTQwYTQ2N2EyYTljNWI2Y2U1N2ViMyIsImNhcGFiaWxpdGllcyI6WyJzZWN1cml0eS1oYXJkZW5pbmciXX0
+
+# === Metadata ===
+change_name: security-hardening-2026-08
+last_transition: 2026-08-19T07:57:42.706Z
+last_transition_from: bridging
+last_transition_to: approved-for-build
+
+# === Decision points ===
+dp_0_decisions: workflow_path=full; recommended=full; followed_recommendation=true
+dp_0_result: null
+dp_0_confirmed: null
+dp_0_timestamp: null
+dp_1_result: null
+dp_1_timestamp: null
+dp_2_result: null
+dp_2_timestamp: null
+dp_3_result: approved: 老板确认全部按推荐 + 方案A + 完成剩余事项；执行契约见 execution-contract.md
+dp_3_timestamp: null
+dp_4_result: null
+dp_4_timestamp: null
+dp_5_result: null
+dp_5_timestamp: null
+dp_6_result: null
+dp_6_timestamp: null
+dp_7_result: null
+dp_7_timestamp: null

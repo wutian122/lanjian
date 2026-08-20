@@ -42,6 +42,16 @@ class FakeSandboxManager:
             "error": None,
         }
 
+    async def execute_python(self, code, timeout=None):
+        self.calls.append(("execute_python", code, timeout))
+        return {
+            "success": True,
+            "stdout": "ok",
+            "stderr": "",
+            "exit_code": 0,
+            "error": None,
+        }
+
     async def execute_tool_command(self, command, host_workdir, timeout=None, network_mode="none"):
         self.calls.append(("execute_tool_command", command, host_workdir, timeout, network_mode))
         return {
@@ -62,7 +72,8 @@ async def test_sandbox_exec_does_not_mount_project_for_inline_interpreter_comman
 
     assert isinstance(result, ToolResult)
     assert result.success is True
-    assert manager.calls == [("execute_command", "python3 -c 'print(1)'", 5, "none")]
+    # 当前实现：inline python3 -c 走 execute_python（base64 通道），不挂载项目目录
+    assert manager.calls == [("execute_python", "print(1)", 5)]
 
 
 @pytest.mark.asyncio

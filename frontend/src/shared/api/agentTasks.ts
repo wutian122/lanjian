@@ -556,6 +556,14 @@ export async function reAuditAgentTask(taskId: string): Promise<{ message: strin
   return response.data;
 }
 
+export async function reverifyFinding(
+  taskId: string,
+  findingId: string,
+): Promise<{ message: string; finding_id: string; success: boolean; verification_status: string; exit_code?: number | null }> {
+  const response = await apiClient.post(`/agent-tasks/${taskId}/findings/${findingId}/reverify`);
+  return response.data;
+}
+
 export async function recoverAgentTask(taskId: string): Promise<{ message: string; task_id: string }> {
   const response = await apiClient.post(`/agent-tasks/${taskId}/recover`);
   return response.data;
