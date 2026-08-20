@@ -1,8 +1,9 @@
 """
 Task 1 (B1): 构建产物目录与 minified 文件排除
 Task 2 (B2): 单文件分块超时与 chunk 数量上限防护
+Task 3 (B3): 分块循环有界并发（CHUNK_CONCURRENCY=4）
 
-覆盖 specs/rag-indexing-hardening/spec.md ADDED-R1 / ADDED-R2：
+覆盖 specs/rag-indexing-hardening/spec.md ADDED-R1 / ADDED-R2 / ADDED-R3：
 - 按路径段排除前端构建产物目录（static/next/assets、static/console-ui/assets、public 等）
 - 单行超长 / 文件超大 → 判定为 minified 产物跳过
 - 合法大文件（多行正常源码）不误伤
@@ -13,10 +14,17 @@ Task 2 (B2): 单文件分块超时与 chunk 数量上限防护
 - 每文件 chunk 数量上限（MAX_CHUNKS_PER_FILE=500），超过截断至 500 并记 warning
 - 三处调用点（_full_index / _incremental_index / index_files）行为一致
 - 正常文件不超时、不截断，行为与改动前一致
+- 分块循环有界并发（CHUNK_CONCURRENCY=4）：多文件并行分块，整体耗时明显小于串行
+- 单个慢文件不阻塞整批：超时被跳过，其余文件正常入库
+- 进度计数单调递增，且与串行语义一致
+- 单文件分块异常不中断整批，错误被记录
+- 增量路径（files_to_add / files_to_update，含 is_update 先删后加）同样受益
 """
 import asyncio
+import hashlib
 import logging
 import os
+import time
 
 import pytest
 
@@ -34,6 +42,7 @@ EXPECTED_MAX_SINGLE_LINE_LENGTH = 2000
 EXPECTED_MAX_SOURCE_FILE_SIZE = 2 * 1024 * 1024
 EXPECTED_FILE_CHUNK_TIMEOUT = 20
 EXPECTED_MAX_CHUNKS_PER_FILE = 500
+EXPECTED_CHUNK_CONCURRENCY = 4
 
 
 @pytest.fixture
@@ -176,11 +185,14 @@ class FakeEmbedding:
 
 
 class FakeSplitter:
-    """可控假分块器：可指定返回 chunk 数，或对指定文件挂起（模拟超时）"""
+    """可控假分块器：可指定返回 chunk 数、对指定文件挂起（模拟超时）、
+    对指定文件抛异常，或对每个文件固定 sleep（模拟真实分块耗时，用于并发验证）"""
 
-    def __init__(self, chunk_count=0, hang_paths=None):
+    def __init__(self, chunk_count=0, hang_paths=None, sleep_per_file=0.0, raise_paths=None):
         self.chunk_count = chunk_count
         self.hang_paths = hang_paths or set()
+        self.sleep_per_file = sleep_per_file
+        self.raise_paths = raise_paths or set()
         self.calls = 0
 
     def _make_chunks(self, content, file_path):
@@ -200,9 +212,15 @@ class FakeSplitter:
         return self._make_chunks(content, file_path)
 
     async def split_file_async(self, content, file_path, language=None):
+        if any(h in file_path for h in self.raise_paths):
+            # 模拟分块阶段抛异常
+            raise RuntimeError(f"boom-{file_path}")
         if any(h in file_path for h in self.hang_paths):
             # 挂起超过被 monkeypatch 的超时值（0.1s），模拟 Tree-sitter 卡死
             await asyncio.sleep(2)
+        if self.sleep_per_file:
+            # 模拟真实分块耗时（不挂起，超时阈值内正常完成）
+            await asyncio.sleep(self.sleep_per_file)
         return self._make_chunks(content, file_path)
 
 
@@ -362,3 +380,170 @@ async def test_normal_path_no_timeout_no_cap(monkeypatch, caplog, tmp_path):
     assert await indexer.vector_store.get_count() == 3
     assert "分块超时" not in caplog.text
     assert "截断" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (B3): 分块循环有界并发（CHUNK_CONCURRENCY=4）
+# ---------------------------------------------------------------------------
+
+
+async def _drive_full_seen(indexer, root, progress=None):
+    """驱动 _full_index 并记录每次 yield 的 processed_files，用于单调性断言"""
+    progress = progress or IndexingProgress()
+    seen = []
+    async for p in indexer._full_index(str(root), [], None, progress, None):
+        seen.append(p.processed_files)
+    return progress, seen
+
+
+async def _seed_store(indexer, entries):
+    """向 InMemoryVectorStore 预置旧索引状态：[(relative_path, file_hash, chunk_count), ...]"""
+    emb = [0.0] * FakeEmbedding.dimension
+    ids, embs, docs, metas = [], [], [], []
+    for rel_path, file_hash, n in entries:
+        for i in range(n):
+            ids.append(f"seed-{rel_path}-{i}")
+            embs.append(emb)
+            docs.append(f"seed {i}")
+            metas.append({"file_path": rel_path, "file_hash": file_hash})
+    await indexer.vector_store.add_documents(ids, embs, docs, metas)
+
+
+def test_chunk_concurrency_constant_defined():
+    """模块常量契约：分块有界并发数"""
+    assert indexer_module.CHUNK_CONCURRENCY == EXPECTED_CHUNK_CONCURRENCY
+
+
+async def test_full_index_batched_concurrency_speeds_up(monkeypatch, tmp_path):
+    """真实并发验证：4 个文件各 sleep 0.3s，串行约需 1.2s，有界并发下总耗时明显小于 1.0s"""
+    monkeypatch.setattr(indexer_module, "FILE_CHUNK_TIMEOUT", 10)  # 放宽超时，仅测并发
+    root = tmp_path / "project"
+    for i in range(4):
+        _write(root / "src" / f"f{i}.py", f"def f{i}():\n    return {i}\n")
+
+    splitter = FakeSplitter(chunk_count=2, sleep_per_file=0.3)
+    indexer = _make_guarded_indexer(splitter)
+
+    start = time.monotonic()
+    progress, _ = await _drive_full_seen(indexer, root)
+    elapsed = time.monotonic() - start
+
+    # 并发为 4：一轮 gather 内 4 个文件并行分块（理论 ~0.3s），串行则需 ~1.2s
+    assert elapsed < 1.0, f"elapsed={elapsed:.2f}s 应明显小于串行 ~1.2s（并发未生效则退回串行）"
+    assert progress.processed_files == 4
+    assert progress.added_files == 4
+    assert progress.total_chunks == 8
+    assert await indexer.vector_store.get_count() == 8
+
+
+async def test_full_index_slow_file_bounded_by_timeout(monkeypatch, caplog, tmp_path):
+    """慢文件不堵死整批：一个文件挂起超过 FILE_CHUNK_TIMEOUT，其余文件仍正常入库"""
+    monkeypatch.setattr(indexer_module, "FILE_CHUNK_TIMEOUT", 0.1)
+    root = tmp_path / "project"
+    _write(root / "src" / "hang.py", "def hang():\n    pass\n")
+    _write(root / "src" / "ok1.py", "def ok1():\n    return 1\n")
+    _write(root / "src" / "ok2.py", "def ok2():\n    return 2\n")
+
+    splitter = FakeSplitter(chunk_count=2, hang_paths={"hang.py"})
+    indexer = _make_guarded_indexer(splitter)
+    progress = IndexingProgress()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.rag.indexer"):
+        await _drive_full(indexer, root, progress)
+
+    # 慢文件超时被跳过但仍计入已处理，快文件 chunk 全部入库
+    assert progress.processed_files == 3
+    assert progress.added_files == 2
+    assert progress.total_chunks == 4
+    assert await indexer.vector_store.get_count() == 4
+    assert "分块超时" in caplog.text
+    assert "hang.py" in caplog.text
+
+
+async def test_full_index_progress_monotonic_and_consistent(monkeypatch, tmp_path):
+    """进度单调 + 与串行语义一致：混合空/慢/正常文件，processed_files 单调不减，总数与串行一致"""
+    monkeypatch.setattr(indexer_module, "FILE_CHUNK_TIMEOUT", 0.1)
+    root = tmp_path / "project"
+    _write(root / "src" / "empty.py", "   \n  \n")  # 空内容 → 跳过
+    _write(root / "src" / "hang.py", "def hang():\n    pass\n")  # 超时 → 跳过但计入已处理
+    _write(root / "src" / "ok1.py", "def ok1():\n    return 1\n")
+    _write(root / "src" / "ok2.py", "def ok2():\n    return 2\n")
+
+    splitter = FakeSplitter(chunk_count=2, hang_paths={"hang.py"})
+    indexer = _make_guarded_indexer(splitter)
+
+    progress, seen = await _drive_full_seen(indexer, root)
+
+    # processed_files 单调不减
+    assert seen == sorted(seen), f"processed_files 应单调不减，实际 {seen}"
+    # 与串行语义一致：4 文件全部计入已处理，1 空跳过，1 超时跳过，2 正常
+    assert progress.processed_files == 4
+    assert progress.skipped_files == 1
+    assert progress.added_files == 2
+    assert progress.total_chunks == 4
+    assert await indexer.vector_store.get_count() == 4
+
+
+async def test_full_index_error_isolation(monkeypatch, caplog, tmp_path):
+    """错误隔离：一个文件分块抛异常，整批不中断，其余文件正常入库，errors 记录"""
+    root = tmp_path / "project"
+    _write(root / "src" / "bad.py", "def bad():\n    pass\n")
+    _write(root / "src" / "ok1.py", "def ok1():\n    return 1\n")
+    _write(root / "src" / "ok2.py", "def ok2():\n    return 2\n")
+
+    splitter = FakeSplitter(chunk_count=2, raise_paths={"bad.py"})
+    indexer = _make_guarded_indexer(splitter)
+    progress = IndexingProgress()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.rag.indexer"):
+        await _drive_full(indexer, root, progress)
+
+    assert progress.processed_files == 3
+    assert progress.added_files == 2
+    assert progress.total_chunks == 4
+    assert await indexer.vector_store.get_count() == 4
+    assert len(progress.errors) == 1
+    assert "bad.py" in progress.errors[0]
+
+
+async def test_incremental_index_concurrency_add_and_update(monkeypatch, tmp_path):
+    """增量路径有界并发：新增 + 更新（is_update 先删后加）混合，全部正常入库、进度单调"""
+    root = tmp_path / "project"
+    _write(root / "src" / "upd.py", "def upd():\n    return 1\n")  # 更新（hash 已变）
+    _write(root / "src" / "new.py", "def new():\n    return 2\n")  # 新增
+    _write(root / "src" / "stable.py", "def stable():\n    return 3\n")  # 未变，不处理
+    # 与 _collect_files/_incremental_index 内部 os.path.relpath 的本地分隔符保持一致
+    upd_rel = os.path.relpath(root / "src" / "upd.py", root)
+    new_rel = os.path.relpath(root / "src" / "new.py", root)
+    stable_rel = os.path.relpath(root / "src" / "stable.py", root)
+
+    splitter = FakeSplitter(chunk_count=2)
+    indexer = _make_guarded_indexer(splitter)
+    # 预置旧索引：upd.py 旧 hash 与当前内容不一致 → 触发更新；stable.py 旧 hash 一致 → 不处理
+    current_upd = hashlib.md5("def upd():\n    return 1\n".encode()).hexdigest()
+    current_stable = hashlib.md5("def stable():\n    return 3\n".encode()).hexdigest()
+    await _seed_store(
+        indexer,
+        [
+            (upd_rel, "old-hash-differs", 2),
+            (stable_rel, current_stable, 2),
+        ],
+    )
+
+    progress = IndexingProgress()
+    seen = []
+    async for p in indexer._incremental_index(str(root), [], None, progress, None):
+        seen.append(p.processed_files)
+
+    # 增量差异：新增 1 + 更新 1（stable 不变不处理）
+    assert progress.total_files == 2
+    assert progress.processed_files == 2
+    assert progress.added_files == 1  # new.py
+    assert progress.updated_files == 1  # upd.py
+    assert progress.deleted_files == 0
+    assert seen == sorted(seen), f"processed_files 应单调不减，实际 {seen}"
+    # upd.py 旧块被删（delete-then-add），最终仅剩：new.py 2 + upd.py 2 + stable.py 2 = 6
+    assert await indexer.vector_store.get_count() == 6
+    hashes = await indexer.vector_store.get_file_hashes()
+    assert hashes[upd_rel] != "old-hash-differs"
+    assert hashes[new_rel] == hashlib.md5("def new():\n    return 2\n".encode()).hexdigest()

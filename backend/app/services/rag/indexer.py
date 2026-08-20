@@ -66,6 +66,10 @@ MAX_SOURCE_FILE_SIZE = 2 * 1024 * 1024  # 文件超过 2MB 视为构建产物
 FILE_CHUNK_TIMEOUT = 20  # 单文件分块超时（秒），超时跳过该文件并记 warning
 MAX_CHUNKS_PER_FILE = 500  # 单文件 chunk 数量上限，超过截断至 500 并记 warning
 
+# 分块有界并发：同一时刻最多并发分块的文件数。按批 gather（每批 ≤ CHUNK_CONCURRENCY 个文件）
+# 并依原始顺序收口结果，使普通文件不被单个慢文件阻塞，进度计数仍单调递增
+CHUNK_CONCURRENCY = 4
+
 
 def _cap_chunks(file_path: str, chunks: List[CodeChunk]) -> List[CodeChunk]:
     """单文件 chunk 数量上限防护：超过 MAX_CHUNKS_PER_FILE 截断至上限并记 warning。
@@ -935,6 +939,98 @@ class CodeIndexer:
             async for p in self._incremental_index(directory, exclude_patterns, include_patterns, progress, progress_callback, embedding_progress_callback, cancel_check):
                 yield p
 
+    async def _chunk_single_file(
+        self,
+        file_path: str,
+        directory: str,
+        is_update: bool = False,
+    ) -> Dict[str, Any]:
+        """单文件分块 worker（供有界并发批处理调用，wave3 分块并发）。
+
+        内部完成：读文件 → 空内容跳过 → hash → 截断 500KB → wait_for 超时保护 →
+        _cap_chunks → 返回结构化结果。超时与异常均以结构化结果返回而不抛出，
+        保证单文件失败不中断整批。is_update 时在同一 worker 内先删后加（顺序不变）。
+
+        返回结构：file_path / relative_path / chunks / skipped（空内容跳过）/
+        timed_out（分块超时）/ file_hash / error（异常信息，None 表示成功）。
+        """
+        relative_path = file_path  # os.path.relpath 失败的兜底
+        try:
+            relative_path = os.path.relpath(file_path, directory)
+
+            # 异步读取文件，避免阻塞事件循环
+            content = await asyncio.to_thread(self._read_file_sync, file_path)
+
+            if not content.strip():
+                return {
+                    "file_path": file_path,
+                    "relative_path": relative_path,
+                    "chunks": [],
+                    "skipped": True,
+                    "timed_out": False,
+                    "file_hash": None,
+                    "error": None,
+                }
+
+            # 如果是更新，先删除旧的（同一文件先删后加的顺序不变）
+            if is_update:
+                await self.vector_store.delete_by_file_path(relative_path)
+
+            # 计算文件 hash
+            file_hash = hashlib.md5(content.encode()).hexdigest()
+
+            # 限制文件大小
+            if len(content) > 500000:
+                content = content[:500000]
+
+            # 异步分块，避免 Tree-sitter 解析阻塞事件循环
+            # 单文件分块设时间上限：超时跳过该文件但仍计入已处理数（保证进度推进）
+            # 注意：asyncio.wait_for 超时不会杀死后台线程，线程仍会跑完——这是设计允许的
+            try:
+                chunks = await asyncio.wait_for(
+                    self.splitter.split_file_async(content, relative_path),
+                    timeout=FILE_CHUNK_TIMEOUT,
+                )
+            except TimeoutError:
+                logger.warning(
+                    f"文件 {relative_path} 分块超时（>{FILE_CHUNK_TIMEOUT}s），跳过该文件"
+                )
+                return {
+                    "file_path": file_path,
+                    "relative_path": relative_path,
+                    "chunks": [],
+                    "skipped": False,
+                    "timed_out": True,
+                    "file_hash": None,
+                    "error": None,
+                }
+            chunks = _cap_chunks(relative_path, chunks)
+
+            # 为每个 chunk 添加 file_hash
+            for chunk in chunks:
+                chunk.metadata["file_hash"] = file_hash
+
+            return {
+                "file_path": file_path,
+                "relative_path": relative_path,
+                "chunks": chunks,
+                "skipped": False,
+                "timed_out": False,
+                "file_hash": file_hash,
+                "error": None,
+            }
+        except Exception as e:
+            logger.warning(f"处理文件失败 {file_path}: {e}")
+            return {
+                "file_path": file_path,
+                "relative_path": relative_path,
+                "chunks": [],
+                "skipped": False,
+                "timed_out": False,
+                "file_hash": None,
+                "error": str(e),
+            }
+
     async def _full_index(
         self,
         directory: str,
@@ -958,52 +1054,42 @@ class CodeIndexer:
         all_chunks: List[CodeChunk] = []
         file_hashes: Dict[str, str] = {}
 
-        # 分块处理文件
-        for file_path in files:
-            progress.current_file = file_path
+        # 分块处理文件（wave3 有界并发：每批 ≤ CHUNK_CONCURRENCY 个文件并发分块，
+        # 依原始文件顺序收口结果，保证 processed_files 单调递增、进度语义与串行一致）
+        for i in range(0, len(files), CHUNK_CONCURRENCY):
+            batch = files[i : i + CHUNK_CONCURRENCY]
+            results = await asyncio.gather(
+                *(self._chunk_single_file(file_path, directory) for file_path in batch),
+                return_exceptions=True,
+            )
 
-            try:
-                relative_path = os.path.relpath(file_path, directory)
+            for file_path, result in zip(batch, results):
+                progress.current_file = file_path
 
-                # 异步读取文件，避免阻塞事件循环
-                content = await asyncio.to_thread(
-                    self._read_file_sync, file_path
-                )
+                if isinstance(result, BaseException):
+                    # gather 兜底（worker 内部已捕获异常，正常不会走到这里）
+                    logger.warning(f"处理文件失败 {file_path}: {result}")
+                    progress.errors.append(f"{file_path}: {result}")
+                    progress.processed_files += 1
+                    continue
 
-                if not content.strip():
+                if result["error"]:
+                    progress.errors.append(f"{file_path}: {result['error']}")
+                    progress.processed_files += 1
+                    continue
+
+                if result["skipped"]:
                     progress.processed_files += 1
                     progress.skipped_files += 1
                     continue
 
-                # 计算文件 hash
-                file_hash = hashlib.md5(content.encode()).hexdigest()
-                file_hashes[relative_path] = file_hash
-
-                # 限制文件大小
-                if len(content) > 500000:
-                    content = content[:500000]
-
-                # 异步分块，避免 Tree-sitter 解析阻塞事件循环
-                # 单文件分块设时间上限：超时跳过该文件但仍计入已处理数（保证进度推进）
-                # 注意：asyncio.wait_for 超时不会杀死后台线程，线程仍会跑完——这是设计允许的
-                try:
-                    chunks = await asyncio.wait_for(
-                        self.splitter.split_file_async(content, relative_path),
-                        timeout=FILE_CHUNK_TIMEOUT,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        f"文件 {relative_path} 分块超时（>{FILE_CHUNK_TIMEOUT}s），跳过该文件"
-                    )
+                if result["timed_out"]:
+                    # 超时：跳过该文件但计入已处理数，不污染 all_chunks
                     progress.processed_files += 1
                     continue
-                chunks = _cap_chunks(relative_path, chunks)
 
-                # 为每个 chunk 添加 file_hash
-                for chunk in chunks:
-                    chunk.metadata["file_hash"] = file_hash
-
-                all_chunks.extend(chunks)
+                all_chunks.extend(result["chunks"])
+                file_hashes[result["relative_path"]] = result["file_hash"]
 
                 progress.processed_files += 1
                 progress.added_files += 1
@@ -1012,11 +1098,6 @@ class CodeIndexer:
                 if progress_callback:
                     progress_callback(progress)
                 yield progress
-
-            except Exception as e:
-                logger.warning(f"处理文件失败 {file_path}: {e}")
-                progress.errors.append(f"{file_path}: {str(e)}")
-                progress.processed_files += 1
 
         logger.info(f"📝 创建了 {len(all_chunks)} 个代码块")
 
@@ -1117,76 +1198,66 @@ class CodeIndexer:
                 progress_callback(progress)
             yield progress
 
-        # 处理新增和更新的文件
-        files_to_process = files_to_add | files_to_update
+        # 处理新增和更新的文件（wave3 有界并发：与全量一致按批并发分块、依序收口；
+        # is_update 的 delete_by_file_path 在各自 worker 内完成，同一文件先删后加顺序不变；
+        # files_to_delete 循环保持串行）
+        files_to_process = sorted(files_to_add | files_to_update)
         all_chunks: List[CodeChunk] = []
         file_hashes: Dict[str, str] = dict(indexed_file_hashes)
 
-        for relative_path in files_to_process:
-            file_path = current_file_map[relative_path]
-            progress.current_file = relative_path
-            is_update = relative_path in files_to_update
+        for i in range(0, len(files_to_process), CHUNK_CONCURRENCY):
+            batch = files_to_process[i : i + CHUNK_CONCURRENCY]
+            results = await asyncio.gather(
+                *(
+                    self._chunk_single_file(
+                        current_file_map[relative_path],
+                        directory,
+                        is_update=relative_path in files_to_update,
+                    )
+                    for relative_path in batch
+                ),
+                return_exceptions=True,
+            )
 
-            try:
-                # 异步读取文件，避免阻塞事件循环
-                content = await asyncio.to_thread(
-                    self._read_file_sync, file_path
-                )
+            for relative_path, result in zip(batch, results):
+                progress.current_file = relative_path
+                is_update = relative_path in files_to_update
 
-                if not content.strip():
+                if isinstance(result, BaseException):
+                    # gather 兜底（worker 内部已捕获异常，正常不会走到这里）
+                    logger.warning(f"处理文件失败 {relative_path}: {result}")
+                    progress.errors.append(f"{relative_path}: {result}")
+                    progress.processed_files += 1
+                    continue
+
+                if result["error"]:
+                    progress.errors.append(f"{relative_path}: {result['error']}")
+                    progress.processed_files += 1
+                    continue
+
+                if result["skipped"]:
                     progress.processed_files += 1
                     progress.skipped_files += 1
                     continue
 
-                # 如果是更新，先删除旧的
-                if is_update:
-                    await self.vector_store.delete_by_file_path(relative_path)
-
-                # 计算文件 hash
-                file_hash = hashlib.md5(content.encode()).hexdigest()
-                file_hashes[relative_path] = file_hash
-
-                # 限制文件大小
-                if len(content) > 500000:
-                    content = content[:500000]
-
-                # 异步分块，避免 Tree-sitter 解析阻塞事件循环
-                # 单文件分块设时间上限：超时跳过该文件但仍计入已处理数（保证进度推进）
-                # 注意：asyncio.wait_for 超时不会杀死后台线程，线程仍会跑完——这是设计允许的
-                try:
-                    chunks = await asyncio.wait_for(
-                        self.splitter.split_file_async(content, relative_path),
-                        timeout=FILE_CHUNK_TIMEOUT,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        f"文件 {relative_path} 分块超时（>{FILE_CHUNK_TIMEOUT}s），跳过该文件"
-                    )
+                if result["timed_out"]:
+                    # 超时：跳过该文件但计入已处理数，不污染 all_chunks
                     progress.processed_files += 1
                     continue
-                chunks = _cap_chunks(relative_path, chunks)
 
-                # 为每个 chunk 添加 file_hash
-                for chunk in chunks:
-                    chunk.metadata["file_hash"] = file_hash
-
-                all_chunks.extend(chunks)
+                all_chunks.extend(result["chunks"])
+                file_hashes[relative_path] = result["file_hash"]
 
                 progress.processed_files += 1
                 if is_update:
                     progress.updated_files += 1
                 else:
                     progress.added_files += 1
-                progress.total_chunks += len(chunks)
+                progress.total_chunks += len(result["chunks"])
 
                 if progress_callback:
                     progress_callback(progress)
                 yield progress
-
-            except Exception as e:
-                logger.warning(f"处理文件失败 {file_path}: {e}")
-                progress.errors.append(f"{file_path}: {str(e)}")
-                progress.processed_files += 1
 
         # 批量嵌入和索引新的代码块
         if all_chunks:
