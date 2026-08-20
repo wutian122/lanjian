@@ -29,6 +29,11 @@ import time
 import pytest
 
 from app.services.rag import indexer as indexer_module
+from app.services.rag.embeddings import (
+    EmbeddingResult,
+    EmbeddingService as EmbeddingServiceImpl,
+    EmbeddingUnavailableError,
+)
 from app.services.rag.indexer import (
     CodeIndexer,
     EmbeddingService,
@@ -547,3 +552,134 @@ async def test_incremental_index_concurrency_add_and_update(monkeypatch, tmp_pat
     hashes = await indexer.vector_store.get_file_hashes()
     assert hashes[upd_rel] != "old-hash-differs"
     assert hashes[new_rel] == hashlib.md5("def new():\n    return 2\n".encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (B4): 嵌入失败快速失败，杜绝零向量静默入库
+# ---------------------------------------------------------------------------
+
+
+class _AlwaysFailProvider:
+    """永远失败的嵌入提供商：embed_texts 稳定抛异常（模拟嵌入端点持续 400）"""
+
+    dimension = 8
+
+    async def embed_text(self, text):
+        raise RuntimeError("embedding endpoint 400 always")
+
+    async def embed_texts(self, texts):
+        raise RuntimeError("embedding endpoint 400 always")
+
+
+class _TransientFailProvider:
+    """瞬时抖动提供商：首次调用抛异常，之后成功（模拟 429 抖动后恢复）"""
+
+    dimension = 8
+
+    def __init__(self):
+        self.calls = 0
+
+    async def embed_text(self, text):
+        results = await self.embed_texts([text])
+        return results[0]
+
+    async def embed_texts(self, texts):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient 429 boom")
+        return [
+            EmbeddingResult(embedding=[0.5] * self.dimension, tokens_used=0, model="fake")
+            for _ in texts
+        ]
+
+
+def _make_embedding_service(provider):
+    """构造带指定 provider 的 EmbeddingService（无缓存、无限流控速）"""
+    svc = EmbeddingServiceImpl(cache_enabled=False)
+    svc._provider = provider
+    svc._rate_limit = 0
+    return svc
+
+
+async def _no_sleep(_):
+    """把 embed_batch 的重试退避 sleep 加速为 no-op，避免测试等待 2+4+8 秒"""
+    return None
+
+
+async def test_embed_batch_raises_embedding_unavailable_no_zero_vectors(monkeypatch):
+    """嵌入批次重试耗尽 → 抛 EmbeddingUnavailableError，绝不返回零向量"""
+    monkeypatch.setattr("app.services.rag.embeddings.asyncio.sleep", _no_sleep)
+
+    svc = _make_embedding_service(_AlwaysFailProvider())
+    with pytest.raises(EmbeddingUnavailableError) as exc_info:
+        await svc.embed_batch(["hello world", "def f():\n    pass"])
+    # 异常信息应携带批次序号、重试次数与最后一次失败原因
+    msg = str(exc_info.value)
+    assert "嵌入批次" in msg
+    assert "重试" in msg
+    assert "400" in msg
+
+
+async def test_embed_batch_transient_retry_succeeds(monkeypatch):
+    """瞬时抖动：首次失败、重试成功 → 正常返回向量，不抛异常"""
+    monkeypatch.setattr("app.services.rag.embeddings.asyncio.sleep", _no_sleep)
+
+    provider = _TransientFailProvider()
+    svc = _make_embedding_service(provider)
+
+    result = await svc.embed_batch(["a", "b"])
+    assert provider.calls == 2  # 首次失败 + 一次重试成功
+    assert len(result) == 2
+    assert all(len(v) == 8 and v[0] == 0.5 for v in result)
+
+
+class _FailingFakeEmbedding:
+    """wave4: 嵌入不可用的假嵌入服务（embed_batch 直接抛 EmbeddingUnavailableError）"""
+
+    provider = "fake"
+    model = "fake-model"
+    dimension = 8
+    base_url = None
+    cache_enabled = False
+
+    async def embed_batch(
+        self,
+        texts,
+        batch_size=200,
+        progress_callback=None,
+        cancel_check=None,
+        **kwargs,
+    ):
+        raise EmbeddingUnavailableError("嵌入端点 400，RAG 不可用")
+
+
+def _make_failing_embedding_indexer(splitter=None):
+    return CodeIndexer(
+        collection_name="test-embed-fail",
+        embedding_service=_FailingFakeEmbedding(),
+        vector_store=InMemoryVectorStore(collection_name="test-embed-fail"),
+        splitter=splitter or FakeSplitter(chunk_count=2),
+    )
+
+
+async def test_full_index_propagates_embedding_unavailable_no_write(tmp_path):
+    """_full_index：嵌入不可用 → 异常向上传播，vector_store 计数保持 0（无零向量写入）"""
+    root = tmp_path / "project"
+    _write(root / "src" / "a.py", "def a():\n    return 1\n")
+
+    indexer = _make_failing_embedding_indexer()
+    with pytest.raises(EmbeddingUnavailableError):
+        await _drive_full(indexer, root)
+    assert await indexer.vector_store.get_count() == 0
+
+
+async def test_smart_index_directory_propagates_embedding_unavailable_no_write(tmp_path):
+    """smart_index_directory（agent_tasks 入口）：嵌入不可用 → 异常向上传播、无写入"""
+    root = tmp_path / "project"
+    _write(root / "src" / "a.py", "def a():\n    return 1\n")
+
+    indexer = _make_failing_embedding_indexer()
+    with pytest.raises(EmbeddingUnavailableError):
+        async for _p in indexer.smart_index_directory(str(root), [], None):
+            pass
+    assert await indexer.vector_store.get_count() == 0
