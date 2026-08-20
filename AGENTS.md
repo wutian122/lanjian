@@ -99,7 +99,7 @@ docker compose logs -f backend                  # 日志
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
 - RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离；项目资源访问统一走 `assert_can_access_project`（2026-08 安全加固已补上 members.py 遗漏的断言；前端用户管理已对 admin 开放，与后端下辖管理 RBAC 对齐）。
 - 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`（容器 read_only + cap_drop ALL + 默认 network none + 60s 超时；SANDBOX_IMAGE 代码默认 `:latest`，生产靠 compose 锁 v5.1.0 覆盖）。
-- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 5.2.0；动依赖先 `uv lock` 再全量测试。
+- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 5.3.0；动依赖先 `uv lock` 再全量测试。
 - **SSE 只服务 Agent 审计页**：前端 useResilientStream 用 fetch+ReadableStream（非 EventSource，需 Bearer header），心跳 45s/长操作 180s、Last-Event-ID + after_sequence 续传、最多重连 5 次；普通审计任务是 setInterval 轮询（2s->60s 分级），无 SSE。
 - **前端版本号在构建期硬编码进 JS bundle**（package.json version 经 vite 注入），运行时不可配；升版本必须重构建前端镜像。
 
