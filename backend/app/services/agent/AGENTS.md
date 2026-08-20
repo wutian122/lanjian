@@ -91,7 +91,7 @@ agent/
 
 | Agent | 角色 | 输入 | 输出 | 最大轮次 | 超时 |
 |-------|------|------|------|---------|------|
-| **Orchestrator** | 编排决策 | 审计任务 + 项目上下文 | 子 Agent 调度指令 | 25 | 7200s |
+| **Orchestrator** | 编排决策 | 审计任务 + 项目上下文 | 子 Agent 调度指令 | 20 | 7200s |
 | **Recon** | 信息收集 | 项目仓库 | 技术栈、入口点、攻击面、推荐工具 | 15 | 1800s |
 | **Analysis** | 漏洞发现 | 代码 + 攻击面 | 漏洞列表（含置信度） | 45 | 1800s |
 | **Verification** | PoC 验证 | 漏洞报告 | PoC 脚本 + 验证结果 | 20 | 1800s |
@@ -234,7 +234,7 @@ Agent 执行 → AgentEventEmitter.emit(event_data)
 
 | 常量 | 默认值 | 说明 |
 |------|--------|------|
-| `orchestrator_max_iterations` | 25 | Orchestrator 最大迭代 |
+| `orchestrator_max_iterations` | 25 | 配置默认值；实际构造时 orchestrator.py:220 硬编码 `max_iterations=20`，运行时以 20 为准 |
 | `recon_max_iterations` | 15 | Recon 最大迭代 |
 | `analysis_max_iterations` | 45 | Analysis 最大迭代 |
 | `verification_max_iterations` | 20 | Verification 最大迭代 |

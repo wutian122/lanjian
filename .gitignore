@@ -17,6 +17,7 @@ Thumbs.db
 .superpowers/
 .pnpm-store/
 docs/superpowers/
+.mimosa/
 
 # Python
 __pycache__/

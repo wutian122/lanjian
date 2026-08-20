@@ -67,7 +67,7 @@ orchestrator.emit_finding(...)       → emitter.emit_finding()
 orchestrator.emit_phase_start(...)   → emitter.emit_phase_start()
 ```
 
-18 种事件类型：phase_start/complete、thinking、llm_thought/decision/action、tool_call/result、finding_new/verified、task_complete/error/cancel、heartbeat。
+SSE 事件类型共 **27 种**（2026-08-20 复核：权威清单为 `backend/app/models/agent_task.py` 的 `AgentEventType` 枚举——task_* 4、phase_* 2、thinking/planning/decision 3、tool_* 3、rag_* 2、finding_* 4、sandbox_* 4、progress 1、日志 4；`heartbeat` 由 SSE 流单独发送，不在枚举内）。下方列表为其中常用子集：phase_start/complete、thinking、llm_thought/decision/action、tool_call/result、finding_new/verified、task_complete/error/cancel、heartbeat。
 
 ### 3.2 EventManager.add_event（event_manager.py:269）
 
