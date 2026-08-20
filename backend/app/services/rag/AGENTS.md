@@ -23,7 +23,7 @@ rag/
 CodeIndexer.smart_index_directory(mode=SMART)
     │  检测是否需要重建（provider/model/dimension/version 变更 → 自动全量）
     ├── [FULL] _full_index
-    │     ├── _collect_files（EXCLUDE_DIRS 精确匹配 + 构建产物目录段剪枝（static/assets/console-ui 等）+ minified 启发式（单行>2000/文件>2MB）+ 28 种文本扩展名白名单）
+    │     ├── _collect_files（EXCLUDE_DIRS 精确匹配 + 构建产物目录段剪枝（static/assets/console-ui 等）+ minified 启发式（单行>2000/文件>2MB）+ 29 种文本扩展名白名单）
     │     ├── 每文件 → CodeSplitter.split_file_async（有界并发 4 分块；单文件 20s 超时跳过 / chunk 超 500 截断）
     │     │     ├── tree-sitter AST 解析（21 语言）
     │     │     ├── 正则回退（6 语言模式）

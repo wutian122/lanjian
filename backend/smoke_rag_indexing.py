@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.services.rag.embeddings import EmbeddingUnavailableError
 from app.services.rag.indexer import CodeIndexer, InMemoryVectorStore
-from app.services.rag.splitter import CodeSplitter
+from app.services.rag.splitter import ChunkType, CodeChunk
 
 
 class UnavailableEmbedding:
@@ -24,8 +24,6 @@ class FakeSplitter:
     真实分块在此不可行；排除逻辑已用真实 _collect_files 单独验证）。"""
 
     async def split_file_async(self, content, file_path, language=None):
-        from app.services.rag.splitter import CodeChunk, ChunkType
-
         return [CodeChunk(
             id=f"smoke-{file_path}",
             content=content[:2000],
