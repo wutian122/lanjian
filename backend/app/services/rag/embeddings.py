@@ -20,6 +20,15 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class EmbeddingUnavailableError(RuntimeError):
+    """嵌入服务不可用异常（wave4 / B4）。
+
+    当嵌入批次在多次重试后仍失败时抛出，表示 RAG 嵌入服务当前不可用。
+    上层（如 agent_tasks）捕获后应跳过向量检索、继续基础审计，
+    system MUST NOT 为失败的批次静默写入零向量。
+    """
+
+
 @dataclass
 class EmbeddingResult:
     """嵌入结果"""
@@ -893,7 +902,11 @@ class EmbeddingService:
                             except Exception as retry_e:
                                 logger.warning(f"Batch {processed_batches + 1} retry {retry_attempt + 1} failed: {retry_e}")
                                 if retry_attempt == batch_retry_max - 1:
-                                    logger.error(f"Batch {processed_batches + 1} failed after {batch_retry_max} retries, will use zero vectors")
+                                    # wave4 / B4: 重试耗尽 → 快速失败，绝不静默回退零向量
+                                    raise EmbeddingUnavailableError(
+                                        f"嵌入批次 {processed_batches + 1}/{total_batches} "
+                                        f"重试 {batch_retry_max} 次后仍失败，RAG 不可用: {retry_e}"
+                                    ) from retry_e
 
                 processed_batches += 1
 
@@ -905,16 +918,10 @@ class EmbeddingService:
                     except Exception as e:
                         logger.warning(f"Progress callback error: {e}")
 
-        # 统计失败批次
-        failed_count = sum(1 for e in embeddings if e is None)
-        if failed_count > 0:
-            logger.warning(
-                f"⚠️ {failed_count}/{len(embeddings)} embeddings failed, "
-                f"replacing with empty vectors"
-            )
-
-        # 确保没有 None（失败的用空向量填充，但已有警告日志）
-        return [e if e is not None else [0.0] * self.dimension for e in embeddings]
+        # wave4 / B4: 失败的批次已在重试耗尽时抛 EmbeddingUnavailableError（快速失败）。
+        # 走到这里的嵌入项要么是空文本/缓存命中的合法零向量，要么已成功嵌入，
+        # 绝不允许把失败批次静默填充为零向量入库。
+        return embeddings
     
     def clear_cache(self):
         """清空缓存"""

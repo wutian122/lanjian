@@ -29,8 +29,9 @@ RUN apt-get update && \
         libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 uv（用 docker.io/astral/uv 替代 ghcr.io，走国内 registry-mirror 避免 ghcr 直连慢）
-COPY --from=docker.io/astral/uv:latest /uv /usr/local/bin/uv
+# 安装 uv（pip 安装，走阿里云 PyPI；避免依赖第三方镜像源拉取 docker.io/astral/uv，
+# 国内服务器网络下该 org 镜像经 daocloud/1ms 等镜像源代理不稳定）
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ uv
 
 # 配置 uv 使用阿里云 PyPI 镜像（国内服务器访问官方 pypi.org 极慢）
 ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/

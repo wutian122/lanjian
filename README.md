@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v5.2.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v5.3.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -106,16 +106,16 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v5.2.0`（生产已禁用 `:latest` 浮动 tag）。`v5.2.0` 为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v5.3.0`（生产已禁用 `:latest` 浮动 tag）。`v5.3.0` 为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
 ```bash
-IMAGE_TAG=v5.2.0 docker compose pull
-IMAGE_TAG=v5.2.0 docker compose up -d
+IMAGE_TAG=v5.3.0 docker compose pull
+IMAGE_TAG=v5.3.0 docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v5.2.0" > .env`。
+可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v5.3.0" > .env`。
 
 > **镜像说明**：backend / frontend / sandbox 三镜像均发布多架构清单（manifest list）。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10，避免浮动 tag 重建引入不兼容）。
 

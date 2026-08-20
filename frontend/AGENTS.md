@@ -136,15 +136,16 @@ frontend/
 │   │   │   └── taskControl.ts    # 任务取消/重启控制
 │   │   ├── types/                # 共享类型定义
 │   │   └── utils/                # 工具函数
-│   │       ├── apiInterceptor.ts # 遗留代码（Axios 拦截器，性能监控 + 慢请求告警；未接线、无调用方）
 │   │       ├── errorHandler.ts   # 统一错误处理（分类 + toast + 日志）
 │   │       ├── fetchWrapper.ts   # 原生 fetch 包装
+│   │       ├── index.ts          # 工具模块导出
 │   │       ├── logger.ts         # 日志系统（5 级、4 类别、localStorage 持久化）
+│   │       ├── paths.ts          # 路径常量
 │   │       ├── performanceMonitor.ts # 性能监控
 │   │       ├── projectUtils.ts   # 项目类型判断
 │   │       ├── uiText.ts         # UI 文案映射
-│   │       ├── zipStorage.ts     # ZIP 文件存储
-│   │       └── utils.ts          # 通用工具（cn className 合并）
+│   │       ├── utils.ts          # 通用工具（cn className 合并）
+│   │       └── zipStorage.ts     # ZIP 文件存储
 │   ├── assets/                   # 静态资源
 │   └── global.d.ts               # 全局类型声明
 ├── public/                       # 公共静态资源
@@ -262,7 +263,6 @@ ProtectedRoute
 fetchWrapper.ts → 拦截原生 fetch，失败时记录日志
 serverClient.ts → Axios 401 自动登出（自建 Axios 实例，内置请求/响应拦截器）
 errorHandler.ts → 统一错误分类 + toast 通知
-apiInterceptor.ts → 未接线、无调用方（serverClient.ts 自建实例，不走 apiInterceptor）
 ```
 
 ## 编码规范

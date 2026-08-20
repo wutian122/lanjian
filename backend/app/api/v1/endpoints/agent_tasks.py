@@ -52,6 +52,11 @@ from app.services.llm.service import LLMService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# 🔥 B5: 索引进度消息模板（分块阶段 vs 嵌入阶段分别标识，供用户区分当前所处阶段）
+# 分块阶段进度：明确标识"分块"；嵌入阶段使用独立的"嵌入"标识。
+CHUNK_PROGRESS_MSG_TEMPLATE = "📝 分块进度: {processed}/{total} 文件 ({pct:.0f}%)"
+EMBED_PROGRESS_MSG_TEMPLATE = "🔢 嵌入进度: {processed}/{total} ({pct:.0f}%)"
+
 # 运行中的任务（兼容旧接口）
 _running_tasks: dict[str, Any] = {}
 
@@ -1164,6 +1169,7 @@ async def _initialize_tools(
 
     # 🔥 RAG 相关导入
     from app.services.rag import CodeIndexer, CodeRetriever, EmbeddingService, IndexUpdateMode
+    from app.services.rag.embeddings import EmbeddingUnavailableError
 
     # 辅助函数：发送事件
     async def emit(message: str, level: str = "info"):
@@ -1251,6 +1257,7 @@ async def _initialize_tools(
         last_embedding_progress = [0]  # 使用列表以便在闭包中修改
         embedding_total = [0]  # 记录总数
         indexing_timed_out = False  # 🔥 标记索引是否超时
+        rag_unavailable = False  # 🔥 wave4/B4: 标记嵌入服务是否不可用
 
         # 🔥 嵌入进度回调函数（同步，但会调度异步任务）
         def on_embedding_progress(processed: int, total: int):
@@ -1259,7 +1266,9 @@ async def _initialize_tools(
             if processed - last_embedding_progress[0] >= 10 or processed == total:
                 last_embedding_progress[0] = processed
                 percentage = (processed / total * 100) if total > 0 else 0
-                msg = f"🔢 嵌入进度: {processed}/{total} ({percentage:.0f}%)"
+                msg = EMBED_PROGRESS_MSG_TEMPLATE.format(
+                    processed=processed, total=total, pct=percentage
+                )
                 logger.info(msg)
                 # 使用 asyncio.create_task 调度异步 emit
                 try:
@@ -1277,7 +1286,7 @@ async def _initialize_tools(
         RAG_INDEX_TIMEOUT = 1800  # 30 分钟
 
         async def run_indexing_with_timeout():
-            nonlocal index_progress, indexing_timed_out, last_progress_update
+            nonlocal index_progress, indexing_timed_out, last_progress_update, rag_unavailable
             try:
                 async with asyncio.timeout(RAG_INDEX_TIMEOUT):
                     async for progress in indexer.smart_index_directory(
@@ -1298,8 +1307,11 @@ async def _initialize_tools(
                         if progress.processed_files - last_progress_update >= 10 or progress.processed_files == progress.total_files:
                             if progress.total_files > 0:
                                 await emit(
-                                    f"📝 索引进度: {progress.processed_files}/{progress.total_files} 文件 "
-                                    f"({progress.progress_percentage:.0f}%)"
+                                    CHUNK_PROGRESS_MSG_TEMPLATE.format(
+                                        processed=progress.processed_files,
+                                        total=progress.total_files,
+                                        pct=progress.progress_percentage,
+                                    )
                                 )
                                 # Mark progress as complete when 100%
                                 if progress.processed_files >= progress.total_files:
@@ -1314,12 +1326,26 @@ async def _initialize_tools(
                 indexing_timed_out = True
                 logger.warning(f"⚠️ RAG 索引超时（{RAG_INDEX_TIMEOUT}秒），跳过 RAG 继续审计")
                 await emit("⚠️ RAG 索引超时，跳过向量检索继续审计（不影响基础审计）")
+            except EmbeddingUnavailableError as rag_err:
+                # wave4/B4: 嵌入批次重试耗尽 → RAG 嵌入服务不可用。
+                # 语义不同于索引超时：分块已完成，仅嵌入阶段失败，
+                # 跳过向量检索、继续基础审计，绝不写入零向量。
+                rag_unavailable = True
+                logger.error(f"⚠️ 嵌入服务不可用，跳过向量检索继续基础审计: {rag_err}")
+                await emit(f"⚠️ 嵌入服务不可用（{rag_err}），跳过向量检索，继续基础审计")
             except asyncio.CancelledError:
                 raise
 
         await run_indexing_with_timeout()
 
-        if indexing_timed_out:
+        if rag_unavailable:
+            # 🔥 wave4/B4: 嵌入服务不可用 → 跳过 RAG 检索器创建，继续基础审计
+            logger.error("⚠️ 嵌入服务不可用，跳过 RAG 检索器初始化，继续执行审计")
+            await emit("⚠️ 嵌入服务不可用，跳过 RAG 检索，使用基础审计模式")
+            retriever = None
+            rag_indexed_files = 0
+            rag_total_chunks = 0
+        elif indexing_timed_out:
             # 🔥 超时后跳过 RAG 检索器创建，但继续审计
             logger.info("⚠️ 跳过 RAG 检索器初始化，继续执行审计")
             await emit("⚠️ 跳过 RAG 检索，使用基础审计模式")

@@ -90,19 +90,13 @@ adapter._send_request(request)
 
 各适配器（litellm/baidu/doubao/minimax）在 `_send_request` 中调用 `self.retry()`。litellm 用 max_attempts=5, delay=2.0。
 
-### 3.4 ⚠️ circuit_breaker 未接入
+### 3.4 circuit_breaker（2026-08-20 复核：已接线）
 
-**重大发现**：AGENTS.md 声称"所有 LLM 调用必须经过 circuit_breaker"，但代码中：
-- `core/circuit_breaker.py` 定义了 `CircuitBreaker`/`with_circuit_breaker`/`CircuitBreakerRegistry`
-- `core/__init__.py` 导出这些符号
-- **全代码库无实际调用点**（`with_circuit_breaker` 装饰器/`breaker.call()`/`registry.get()` 均无使用）
-- 唯一引用：`config.py:511` 的 `if not config.circuit_breaker_enabled` 配置检查（未接入逻辑）
+> 本文 2026-06-22 初稿结论为"定义未调用"，**现已过时**：熔断器已接入 LLM 调用外层——`agents/base.py:1144` `await get_llm_circuit().call(_consume)`，熔断开启时返回 `[API_ERROR:circuit_open]` 拒绝调用（`base.py:1145-1147`）。配置见 `config.py`（`circuit_failure_threshold` 默认 10、`circuit_recovery_timeout_seconds` 默认 60、`circuit_half_open_max_calls` 默认 3）。
 
-**实际弹性机制**：仅 adapter 层的 `retry()`（指数退避），无熔断。连续 LLM 失败不会触发熔断暂停。
+### 3.5 rate_limiter（2026-08-20 复核：已接线）
 
-### 3.5 rate_limiter 同样未接入
-
-`core/rate_limiter.py` 定义了令牌桶，但 grep 未发现调用点。限流实际依赖 LLM 提供商自身的速率限制（429 响应 → adapter retry）。
+初稿"grep 未发现调用点"同样过时：令牌桶限流已接入——`agents/base.py:1142` `await self._get_llm_rate_limiter().acquire()` 在每次 LLM 调用前获取令牌。
 
 ## 4. 工具执行链路（base.py:1149 execute_tool）
 
@@ -179,9 +173,9 @@ agent_tasks.py: set_cancel_callback(check_global_cancel)  # 外部回调注入
 
 | 机制 | AGENTS.md 声称 | 代码实际 | 状态 |
 |------|:---:|:---:|:---:|
-| 熔断器 | 所有 LLM 调用必须经过 | 定义未调用 | ⚠️ 未接入 |
+| 熔断器 | 所有 LLM 调用必须经过 | base.py:1144 get_llm_circuit().call() | ✓ 已接线（2026-08） |
 | 重试 | 指数退避 max_attempts=3 | adapter.retry() 已实现 | ✓ 在适配器层 |
-| 限流 | 令牌桶 rate=1.0/s | 定义未调用 | ⚠️ 未接入 |
+| 限流 | 令牌桶 rate=1.0/s | base.py:1142 rate_limiter.acquire() | ✓ 已接线（2026-08） |
 | 降级 | 6 种 FallbackAction | fallback.py 定义 | 待核调用点 |
 | 检查点 | 状态持久化 | persistence.py | 待核调用点 |
 
