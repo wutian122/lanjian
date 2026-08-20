@@ -80,7 +80,7 @@ export interface InitStep {
   status: 'start' | 'done';
 }
 
-interface AgentAuditState {
+export interface AgentAuditState {
   task: AgentTask | null;
   findings: AgentFinding[];
   agentTree: AgentTreeResponse | null;

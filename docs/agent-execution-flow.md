@@ -4,6 +4,8 @@
 范围：backend/app/services/agent/（base.py + orchestrator.py + core/executor.py）
 类型：只读分析产出
 
+> ⚠️ **2026-08-19 复核**：本文为 2026-06-22 代码级分析，行号有漂移；**熔断器与令牌桶限流现已接线**（`core/circuit_breaker.py`、`core/rate_limiter.py` 有实际调用点）、SSE 事件已 27 种、覆盖门禁 D1-D10 已含核心三角；仅作架构参考。
+
 ## 1. 架构总览
 
 ```

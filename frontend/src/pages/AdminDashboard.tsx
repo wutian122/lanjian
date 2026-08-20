@@ -52,7 +52,7 @@ export default function AdminDashboard() {
     full_name: "", department: "", phone: "", role: "user",
   });
 
-  const isSuperAdmin = user?.role === "super_admin" || user?.is_superuser;
+  const isSuperAdmin = user?.role === "super_admin";
   // C3: 后端 RBAC 允许 admin 管理下辖用户（parent_admin_id 数据范围），前端同步放开用户管理入口
   const canManageUsers = isSuperAdmin || user?.role === "admin";
 

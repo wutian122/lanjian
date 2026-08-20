@@ -425,6 +425,7 @@ export default function CreateTaskDialog({
                         await api.uploadProjectZip(selectedProject.id, zipState.zipFile);
                         toast.success("文件上传成功");
                         zipState.switchToStored();
+                        setSelectedFiles(undefined); // B3: 新文件上传后清空旧的文件范围，避免全量/旧范围误扫
                         loadProjects();
                       } catch (error) {
                         const msg = error instanceof Error ? error.message : "上传失败";
@@ -766,11 +767,7 @@ function ZipUploadCard({
             <input
               type="radio"
               checked={!zipState.useStoredZip}
-              onChange={() => {
-                zipState.switchToUpload();
-                // B3: 切到"上传新文件"后清空旧的已选文件范围，避免 UI 残留误导 + 新文件被旧范围过滤
-                setSelectedFiles(undefined);
-              }}
+              onChange={() => zipState.switchToUpload()}
               className="w-4 h-4 accent-emerald-500"
             />
             <span className="text-emerald-700 dark:text-emerald-300">上传新文件</span>

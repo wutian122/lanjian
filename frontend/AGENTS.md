@@ -13,7 +13,7 @@ React 18，TypeScript 5.7，Vite 5，Radix UI + Tailwind CSS + shadcn/ui。
 | 样式 | Tailwind CSS 3 + Radix UI + shadcn/ui | 实用优先 + 无头 UI |
 | 状态 | React Context + useReducer | 无 Zustand |
 | 图表 | Recharts 2.15 | 仪表盘图表 |
-| 表单 | react-hook-form 7 + zod | 类型安全表单校验 |
+| 表单 | 原生 HTML 表单 | zod 无依赖无引用；react-hook-form 仅 shadcn 的 components/ui/form.tsx 模板引用，零业务使用 |
 | HTTP | Axios + fetch | Axios 用于 API，fetch 用于 SSE |
 | SSE | 自定义 parseSSE | Agent 流式输出 |
 | 主题 | next-themes | 明暗主题切换 |
@@ -30,7 +30,7 @@ frontend/
 │   │   ├── main.tsx              # 入口（ThemeProvider + AuthProvider + HelmetProvider）
 │   │   ├── App.tsx               # 根组件（BrowserRouter + Routes）
 │   │   ├── routes.tsx            # 路由配置表（13 条路由，含隐藏路由）
-│   │   └── ProtectedRoute.tsx    # 路由守卫（未认证→/login，超管→/admin）
+│   │   └── ProtectedRoute.tsx    # 路由守卫（未认证→/login，已认证 / → /dashboard，无角色分流）
 │   ├── pages/                    # 路由页面
 │   │   ├── AgentAudit/           # ⭐ Agent 审计 UI（最复杂页面，模块化拆分）
 │   │   │   ├── index.tsx         # 主页面入口
@@ -38,8 +38,8 @@ frontend/
 │   │   │   ├── constants.tsx     # 视觉配置（颜色、图标、轮询间隔）
 │   │   │   ├── utils.ts          # 工具函数（树构建、日志过滤、AI 上下文摘要）
 │   │   │   ├── hooks/
-│   │   │   │   ├── useAgentAuditState.ts  # 核心状态 Hook（useReducer，14 种 Action）
-│   │   │   │   └── useResilientStream.ts  # SSE 弹性流 Hook（531 行）
+│   │   │   │   ├── useAgentAuditState.ts  # 核心状态 Hook（useReducer，23 个 case）
+│   │   │   │   └── useResilientStream.ts  # SSE 弹性流 Hook（604 行）
 │   │   │   └── components/
 │   │   │       ├── Header.tsx            # 页头（任务状态、取消/导出/新建）
 │   │   │       ├── SplashScreen.tsx      # 欢迎屏
@@ -50,7 +50,6 @@ frontend/
 │   │   │       ├── AICollaborationPanel.tsx # AI 协作面板
 │   │   │       ├── ConnectionStatus.tsx  # SSE 连接状态
 │   │   │       ├── AgentErrorBoundary.tsx # 错误边界
-│   │   │       ├── ReportExportDialog.tsx # 报告导出
 │   │   │       └── StatusBadge.tsx       # 状态徽章
 │   │   ├── AI/                   # AI 全局控制中心
 │   │   │   ├── index.tsx         # 主页面
@@ -78,13 +77,13 @@ frontend/
 │   │   ├── Login.tsx             # 登录
 │   │   └── NotFound.tsx          # 404
 │   ├── components/               # UI 组件
-│   │   ├── ui/                   # shadcn/ui 基础组件（56 个）
-│   │   │   ├── 布局：card, dialog, sheet, drawer, resizable, separator, scroll-area
-│   │   │   ├── 表单：input, textarea, select, checkbox, radio-group, switch, form, slider
-│   │   │   ├── 导航：sidebar, navigation-menu, menubar, breadcrumb, pagination, tabs
-│   │   │   ├── 数据展示：table, badge, avatar, skeleton, progress, chart, accordion
+│   │   ├── ui/                   # shadcn/ui 基础组件（37 个）
+│   │   │   ├── 布局：card, dialog, sheet, separator, scroll-area
+│   │   │   ├── 表单：input, textarea, select, checkbox, radio-group, switch, form
+│   │   │   ├── 导航：sidebar, tabs
+│   │   │   ├── 数据展示：table, badge, avatar, skeleton, progress, accordion
 │   │   │   ├── 反馈：toast, alert, alert-dialog, sonner, tooltip, popover
-│   │   │   ├── 交互：button, toggle, command, dropdown-menu, calendar
+│   │   │   ├── 交互：button, dropdown-menu
 │   │   │   └── 业务扩展：metric-card, section-panel, status-badge, branch-selector, multi-select
 │   │   ├── agent/                # Agent 相关组件
 │   │   │   ├── CreateAgentTaskDialog.tsx  # Agent 审计任务创建
@@ -109,7 +108,6 @@ frontend/
 │   │   ├── system/               # 系统配置组件
 │   │   ├── analysis/             # 分析相关组件
 │   │   ├── common/               # 通用组件（EmptyState、ErrorBoundary）
-│   │   └── debug/                # 调试面板
 │   ├── features/                 # 功能模块（业务服务封装）
 │   │   ├── analysis/services/    # 即时代码分析引擎
 │   │   ├── projects/services/    # 仓库审计、ZIP 扫描
@@ -138,7 +136,7 @@ frontend/
 │   │   │   └── taskControl.ts    # 任务取消/重启控制
 │   │   ├── types/                # 共享类型定义
 │   │   └── utils/                # 工具函数
-│   │       ├── apiInterceptor.ts # Axios 拦截器（性能监控 + 慢请求告警）
+│   │       ├── apiInterceptor.ts # 遗留代码（Axios 拦截器，性能监控 + 慢请求告警；未接线、无调用方）
 │   │       ├── errorHandler.ts   # 统一错误处理（分类 + toast + 日志）
 │   │       ├── fetchWrapper.ts   # 原生 fetch 包装
 │   │       ├── logger.ts         # 日志系统（5 级、4 类别、localStorage 持久化）
@@ -147,7 +145,6 @@ frontend/
 │   │       ├── uiText.ts         # UI 文案映射
 │   │       ├── zipStorage.ts     # ZIP 文件存储
 │   │       └── utils.ts          # 通用工具（cn className 合并）
-│   ├── hooks/                    # 全局 Hooks
 │   ├── assets/                   # 静态资源
 │   └── global.d.ts               # 全局类型声明
 ├── public/                       # 公共静态资源
@@ -208,9 +205,14 @@ disconnected → connecting → connected
                  failed (超过 maxReconnectAttempts)
 ```
 
+关键能力：
+- 长操作心跳放宽：semgrep 等外部工具调用期间心跳阈值放宽至 **180s**（普通 45s）
+- 高水位续传：请求携带 `Last-Event-ID` header + `after_sequence`，重连时 sequence **不清零**，从断点续传
+- paused 状态感知：任务暂停状态可感知，避免误判为连接异常
+
 ## AgentAudit 页面状态管理
 
-采用 `useReducer` 集中状态（14 种 Action）：
+采用 `useReducer` 集中状态（23 个 case）：
 
 - `SET_TASK` / `SET_FINDINGS` / `ADD_FINDING` — 任务和发现
 - `SET_AGENT_TREE` — Agent 树结构
@@ -236,8 +238,7 @@ Login → POST /auth/login → 获取 token → AuthContext
 
 ProtectedRoute
   ├── !isAuthenticated → /login
-  ├── super_admin + / → /admin
-  └── 普通用户 + / → /dashboard
+  └── 已认证（任意角色）+ / → /dashboard（ProtectedRoute.tsx:16-19，无角色分流）
 ```
 
 前端仅做登录校验，无细粒度路由守卫，权限控制依赖后端 API。
@@ -259,9 +260,9 @@ ProtectedRoute
 错误处理链：
 ```
 fetchWrapper.ts → 拦截原生 fetch，失败时记录日志
-serverClient.ts → Axios 401 自动登出
+serverClient.ts → Axios 401 自动登出（自建 Axios 实例，内置请求/响应拦截器）
 errorHandler.ts → 统一错误分类 + toast 通知
-apiInterceptor.ts → 性能监控 + 慢请求告警
+apiInterceptor.ts → 未接线、无调用方（serverClient.ts 自建实例，不走 apiInterceptor）
 ```
 
 ## 编码规范

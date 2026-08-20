@@ -537,7 +537,7 @@ function AgentAuditPageContent() {
     includeToolCalls: true,
     // 🔥 使用 state 变量，确保在历史事件加载后能获取最新值
     afterSequence: afterSequence,
-    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string }; sequence?: number }) => {
+    onEvent: (event: { type: string; message?: string; metadata?: { agent_name?: string; agent?: string; init_step?: string; init_status?: string }; sequence?: number }) => {
       // 🔥 FIX F1: SSE 事件到达时同步更新 lastEventSequenceRef，防止 loadHistoricalEvents 重复拉取
       if (event.sequence && event.sequence > lastEventSequenceRef.current) {
         lastEventSequenceRef.current = event.sequence;
