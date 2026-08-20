@@ -50,6 +50,17 @@ EXCLUDE_FILES = {
     "Cargo.lock", "poetry.lock", "composer.lock", "Gemfile.lock",
 }
 
+# 前端构建产物目录段：相对路径中任意一级目录段命中即剪枝整棵子树，
+# 不进入分块循环（覆盖 Nacos 风格 static/next/assets、static/console-ui/assets 等结构）
+BUILD_ARTIFACT_DIR_SEGMENTS = {
+    "static", "assets", "console-ui", "public",
+    "js", "css", "map", "maps",
+}
+
+# Minified 产物启发式阈值：单行超长或文件超大判定为构建产物，跳过索引
+MAX_SINGLE_LINE_LENGTH = 2000  # 单行超过该字符数视为 minified
+MAX_SOURCE_FILE_SIZE = 2 * 1024 * 1024  # 文件超过 2MB 视为构建产物
+
 
 class IndexUpdateMode(Enum):
     """索引更新模式"""
@@ -1379,6 +1390,14 @@ class CodeIndexer:
             # 过滤目录
             dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
 
+            # 前端构建产物目录段剪枝：相对路径任意一级目录段命中即整棵子树不再下钻
+            rel_root = os.path.relpath(root, directory)
+            if rel_root != "." and any(
+                seg in BUILD_ARTIFACT_DIR_SEGMENTS for seg in rel_root.split(os.sep)
+            ):
+                dirs[:] = []
+                continue
+
             for filename in filenames:
                 # 检查扩展名
                 ext = os.path.splitext(filename)[1].lower()
@@ -1411,6 +1430,22 @@ class CodeIndexer:
                             break
                     if not included:
                         continue
+
+                # Minified 产物启发式：文件超大或单行超长 → 跳过索引
+                try:
+                    file_size = os.path.getsize(file_path)
+                    if file_size > MAX_SOURCE_FILE_SIZE:
+                        logger.debug(f"跳过疑似构建产物（文件超过 {MAX_SOURCE_FILE_SIZE} 字节）: {file_path}")
+                        continue
+                    # 文件足够大才读内容检查单行长度，小文件直接放行
+                    if file_size > MAX_SINGLE_LINE_LENGTH:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            if any(len(line) > MAX_SINGLE_LINE_LENGTH for line in f):
+                                logger.debug(f"跳过疑似构建产物（单行超长）: {file_path}")
+                                continue
+                except OSError:
+                    # 文件读取失败时交给后续分块流程处理，不阻断收集
+                    pass
 
                 files.append(file_path)
 
