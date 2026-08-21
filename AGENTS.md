@@ -66,12 +66,13 @@ docker compose logs -f backend                  # 日志
 | docker build | 需代理 `10.129.1.238:10808`（**未配通**），代码靠现场 override compose | 直连正常，可本地 build |
 | 其它业务 | 宿主机 nginx `:8080`（`/etc/nginx/conf.d/drone-platform.conf` 反代，2026-08-03 启用） | 宿主机 xrdp + Xvnc + xray（运维远程/代理用） |
 | 蓝鉴 compose | `docker-compose.b-amd64.yml`（落仓精简版，含 `db seccomp:unconfined`；实测为生效 compose） | `docker-compose.yml`（仓库默认；实测为生效 compose） |
-| IMAGE_TAG | compose 显式锁 `v5.3.0`（backend/frontend），sandbox 锁 `v5.1.0`（`.env` 未设此变量） | compose 显式锁 `v5.3.0`（backend/frontend），sandbox 锁 `v5.1.0`（`.env` 残留惰性 `IMAGE_TAG=v5.0.0`，compose 已硬编码 tag 不受影响） |
+| IMAGE_TAG | compose 显式锁 `v5.4.0`（backend/frontend），sandbox 锁 `v5.1.0`（`.env` 未设此变量） | compose 显式锁 `v5.4.0`（backend/frontend），sandbox 锁 `v5.1.0`（`.env` 残留惰性 `IMAGE_TAG=v5.0.0`，compose 已硬编码 tag 不受影响） |
 
 - 两台均跑 5 容器：`db`（postgres:15-alpine）、`redis`（redis:7-alpine）、`backend`、`frontend`、沙箱（`restart: no` 保持 Exited，仅作 docker.sock 动态起 PoC 容器的基底）。
-- 镜像来自 Docker Hub 组织 `wutian449`（lanjian-backend / lanjian-frontend / lanjian-sandbox），`v5.3.0`（backend/frontend）与 `v5.1.0`（sandbox）均为多架构（amd64 + arm64）；生产已锁 `v5.3.0` / `v5.1.0`，禁止 `:latest` 浮动。
+- 镜像来自 Docker Hub 组织 `wutian449`（lanjian-backend / lanjian-frontend / lanjian-sandbox），`v5.4.0`（backend/frontend）与 `v5.1.0`（sandbox）均为多架构（amd64 + arm64）；生产已锁 `v5.4.0` / `v5.1.0`，禁止 `:latest` 浮动。
 - **2026-08-19 只读实测**：两台 5 容器全部 `v5.1.0`、db/redis healthy、sandbox 按设计 Exited(0)；生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）；A 机另有 buildx buildkit 常驻容器（本地构建用）。
 - **2026-08-20 v5.3.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v5.3.0`，**sandbox 仍锁 `v5.1.0`**（本次未重建沙箱镜像）。本次为**每台服务器本地重新构建镜像**（非重打 tag）：基础镜像走国内 registry 镜像源 `docker.m.daocloud.io` + `docker.1ms.run`；backend Dockerfile 改为 `pip install uv`（阿里云 PyPI）替代 `COPY --from=docker.io/astral/uv`。生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）。
+- **2026-08-21 v5.4.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v5.4.0`，**sandbox 仍锁 `v5.1.0`**（本次未重建沙箱镜像）。本次同样为**每台服务器本地重新构建镜像**（基于 v5.3.0 镜像叠加 v5.4.0 代码），内容为验证引擎根治（R1-R7 确定性证据判定与门禁终止）+ 北京时间统一输出。
 - ⚠️ **v5.1.0 镜像是重打 tag，不是重新构建**（历史教训）：三个镜像的层创建于 2026-06/07（v5.0.0 时代），v5.1.0 为纯版本号升级；两台前端容器显示的 5.1.0 是 2026-08-18 容器重建后**就地 sed 修补 dist**（index/icons/utils 三个 JS bundle）的产物--**recreate 容器后版本号显示会回退 5.0.0**。**v5.3.0 已改为真正重新构建**（见上一条），改代码必须重新 build 镜像再更新两台，只 bump 版本号无效。
 - 部署凭证（SUPERADMIN/POSTGRES 密码、SECRET_KEY）见 `docs/security-hardening-2026-07-DELIVERY.md` §6，登录凭证已录入 remote-shell 加密凭证库（credctl）。
 - **远程操作唯一入口是 remote-shell 技能**，默认只读，危险操作须老板确认。
@@ -100,16 +101,17 @@ docker compose logs -f backend                  # 日志
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
 - RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离；项目资源访问统一走 `assert_can_access_project`（2026-08 安全加固已补上 members.py 遗漏的断言；前端用户管理已对 admin 开放，与后端下辖管理 RBAC 对齐）。
 - 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`（容器 read_only + cap_drop ALL + 默认 network none + 60s 超时；SANDBOX_IMAGE 代码默认 `:latest`，生产靠 compose 锁 v5.1.0 覆盖）。
-- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 5.3.0；动依赖先 `uv lock` 再全量测试。
+- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 5.4.0；动依赖先 `uv lock` 再全量测试。
 - **SSE 只服务 Agent 审计页**：前端 useResilientStream 用 fetch+ReadableStream（非 EventSource，需 Bearer header），心跳 45s/长操作 180s、Last-Event-ID + after_sequence 续传、最多重连 5 次；普通审计任务是 setInterval 轮询（2s->60s 分级），无 SSE。
 - **前端版本号在构建期硬编码进 JS bundle**（package.json version 经 vite 注入），运行时不可配；升版本必须重构建前端镜像。
 
-## 代码速览（2026-08-19 全量深读核验）
+## 代码速览（2026-08-21 全量深读核验）
 
-- 后端：13 个 API 端点模块（`agent_tasks.py` 最大，4784 行）；16 张表 / 9 个 model 文件；24 个 alembic 迁移（head=`023_drop_dead`）；78 个测试文件约 559 个用例（asyncio_mode=auto，含 2026-08 新增 `tests/rag/test_indexing_hardening.py`）。
+- 后端：13 个 API 端点模块（`agent_tasks.py` 最大，4803 行）；16 张表 / 9 个 model 文件；24 个 alembic 迁移（head=`023_drop_dead`）；82 个测试文件 575 个用例（asyncio_mode=auto，含 2026-08 新增 `tests/rag/test_indexing_hardening.py`、`tests/agent/test_verification_evidence.py`、`tests/agent/test_orchestrator_gates.py`）。
 - 审计引擎：OrchestratorAgent（ReAct 循环 + Semgrep 预扫描）调度 Recon/Analysis/Verification 三子 Agent；27 种 SSE 事件（`models/agent_task.py` 的 `AgentEventType` 枚举）；D1-D10 十维度覆盖率门禁；LLM 调用经熔断器 + 令牌桶限流（均已接线）。
 - 静态检测三套：沙箱内外部工具 7 种（Semgrep/Bandit/Gitleaks/TruffleHog/npm audit/Safety/OSV-Scanner）+ 内置 OWASP 正则模式库 + DB 中的 AuditRuleSet（LLM 提示词规则）。
 - **RAG 索引加固（v5.3.0 新增）**：`indexer.py` 构建产物路径段排除 + minified 启发式（`BUILD_ARTIFACT_DIR_SEGMENTS` / `MAX_SINGLE_LINE_LENGTH=2000` / `MAX_SOURCE_FILE_SIZE=2MB`）、单文件分块护栏（`FILE_CHUNK_TIMEOUT=20s` 跳过、`MAX_CHUNKS_PER_FILE=500` 截断）、有界并发（`CHUNK_CONCURRENCY=4` 分批 gather）、嵌入快速失败（`EmbeddingUnavailableError` 重试耗尽后抛出，agent_tasks `rag_unavailable` 分支，禁止写入零向量）、进度消息分阶段标注（`CHUNK_PROGRESS_MSG_TEMPLATE`=分块进度 / `EMBED_PROGRESS_MSG_TEMPLATE`=嵌入进度）。烟雾脚本 `backend/smoke_rag_indexing.py`，新测试 `backend/tests/rag/test_indexing_hardening.py`。
+- **验证引擎根治（v5.4.0 新增）**：`verification.py` 新增纯函数 `compute_verification_status`（R1 确定性状态引擎：由 sandbox_attempts 证据推导 verification_status/is_verified，不信任 LLM 自述 verdict；仅保留 false_positive / sandbox_skip_reason 两个显式标注位）+ `_bind_runtime_evidence_to_all`（R2 全量证据按 finding_id 强制绑定，LLM 漏报不丢证据）+ `FABRICATION_MARKERS` 反伪造（R3：Simulated/模拟输出/源码缺失标记 `fabricated`，排除出判定与门禁）+ 确定性沙箱执行（R3 前置执行全部预生成 PoC）；`orchestrator.py` 门禁 3 次终止（R4 `verification_max_force_redispatch` 默认 3）+ Bug D 判定修正（R5：needs_context 视为未验证）+ observations 记录（R6）+ 中断收口（R7 补发 dispatch_complete/phase_complete）；`agent_tasks.py` 持久化 observations 到 `agent_tasks.observations`；`app/core/timeutil.py` 新增北京时间统一序列化（UTC+8），`main.py`/`agent_tasks.py` 全部 API/SSE 时间字段走 `serialize_cst`。测试见 `tests/agent/test_verification_evidence.py`（42 用例）与 `tests/agent/test_orchestrator_gates.py`。
 - 前端：16 个页面 / 13 条业务路由（无角色分流，权限全靠后端 API）；React Context + useReducer（无 zustand）；无单测框架（仅 3 个静态断言脚本）；三层 lint = tsgo + Biome（单规则）+ ast-grep。
 
 ## 编码规范
