@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,6 +8,7 @@ from app.core.config import settings
 from app.api.v1.api import api_router
 from app.db.session import AsyncSessionLocal
 from app.db.init_db import init_db
+from app.core.timeutil import serialize_cst
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -100,7 +102,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    lifespan=lifespan
+    lifespan=lifespan,
+    json_encoders={
+        # 所有 API 响应中的 datetime 统一序列化为北京时间（UTC+8）
+        datetime: serialize_cst,
+    },
 )
 
 # P0-3: CORS 白名单

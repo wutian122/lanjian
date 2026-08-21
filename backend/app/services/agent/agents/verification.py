@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_FAILURE_MARKERS = ("工具执行失败", "Traceback", "Error:", "Exception:", "\n失败:", "\n错误:")
 
+# R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
+# LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
+FABRICATION_MARKERS = (
+    "simulated", "simulation", "模拟", "模拟执行",
+    "source file not found", "source not found", "文件未找到", "文件不存在",
+)
+
 # B3 严标准：真正的漏洞触发证据标记（confirmed 档要求含其中之一）
 # 仅 "退出码:0"/"Verification Complete" 等"PoC 跑完"标记不算真证据
 # 已去掉 "static_confirmed"（状态名，不应作为 sandbox 证据）和 "vulnerable"（太宽，"not vulnerable" 也匹配）
@@ -40,6 +47,83 @@ VULN_EVIDENCE_MARKERS = (
 )
 
 LANGUAGE_TEST_TOOL_NAMES = {"python_test", "php_test", "javascript_test", "java_test", "go_test", "ruby_test", "shell_test", "bash_test"}
+
+
+# R1 确定性验证状态引擎：由运行时沙箱证据推导验证结论，不信任 LLM 自述 verdict
+# 返回 (verification_status, is_verified, notes)
+# 证据优先级：confirmed(动态铁证) > static_confirmed(代码推理) > not_reproducible(尝试未复现)
+# false_positive 仅由 LLM 显式标注 + 无 confirmed 证据时生效
+def compute_verification_status(
+    finding: dict[str, Any],
+    attempts: list[Any],
+    attempt_has_vuln_evidence_fn=None,
+    attempt_matches_finding_fn=None,
+) -> tuple[str, bool, dict]:
+    """由 sandbox_attempts 确定性推导验证状态。
+
+    - attempts: finding 的 sandbox_attempts（已由 _attach_runtime_sandbox_attempts 绑定）
+    - attempt_has_vuln_evidence_fn / attempt_matches_finding_fn: 可注入的判定函数
+      （默认用模块级轻量实现，便于单测；运行时由 Verification 实例注入复用 B3 严标准）
+    """
+    # 过滤伪造/不可信证据
+    real_attempts = [
+        a for a in attempts if isinstance(a, dict) and not a.get("fabricated")
+    ]
+    evidence_has_vuln = (
+        attempt_has_vuln_evidence_fn or _attempt_has_vuln_evidence_default
+    )
+    evidence_matches = (
+        attempt_matches_finding_fn or _attempt_matches_finding_default
+    )
+
+    # 1) confirmed：成功执行 + 漏洞触发证据 + 匹配 finding
+    for a in real_attempts:
+        if a.get("success") is True and a.get("exit_code") == 0:
+            if evidence_has_vuln(a) and evidence_matches(a, finding):
+                return VerificationStatus.CONFIRMED, True, {}
+
+    # 2) static_confirmed：成功执行但无动态铁证（weak_evidence 宽松兜底）
+    for a in real_attempts:
+        if a.get("success") is True and (a.get("weak_evidence") or a.get("static_evidence")):
+            return VerificationStatus.STATIC_CONFIRMED, True, {}
+
+    # 3) false_positive：LLM 显式标注且无 confirmed 证据
+    llm_verdict = str(finding.get("verdict") or finding.get("verification_status") or "").lower()
+    if llm_verdict == VerificationStatus.FALSE_POSITIVE:
+        return VerificationStatus.FALSE_POSITIVE, False, {}
+
+    # 4) not_reproducible：尝试过但未复现
+    if real_attempts:
+        return VerificationStatus.NOT_REPRODUCIBLE, False, {
+            "reason": "sandbox attempts executed but no confirmation evidence"
+        }
+
+    # 5) needs_context：无证据（LLM 可带 sandbox_skip_reason 说明原因）
+    notes = {}
+    skip_reason = finding.get("sandbox_skip_reason")
+    if skip_reason:
+        notes["sandbox_skip_reason"] = str(skip_reason)[:500]
+    return VerificationStatus.NEEDS_CONTEXT, False, notes
+
+
+def _attempt_has_vuln_evidence_default(attempt: dict[str, Any]) -> bool:
+    """模块级默认证据判定（与实例方法 _attempt_has_vuln_evidence 同标准）。"""
+    evidence_summary = str(attempt.get("evidence_summary") or "")
+    ev_lower = evidence_summary.lower()
+    if "vulnerability_confirmed(static)" in ev_lower:
+        return False
+    if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+        return False
+    return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
+
+
+def _attempt_matches_finding_default(attempt: dict[str, Any], finding: dict[str, Any]) -> bool:
+    """模块级默认匹配（宽松：success + exit_code 0 即可，精确匹配由实例注入）。"""
+    if attempt.get("success") is not True:
+        return False
+    if attempt.get("exit_code") != 0:
+        return False
+    return True
 
 
 
@@ -56,6 +140,12 @@ VERIFICATION_SYSTEM_PROMPT = """你是蓝鉴的漏洞验证 Agent，一个**自�
 ## 🔴 强制规则：必须使用沙箱执行
 **每个漏洞都必须通过 sandbox_exec 在 Docker 沙箱中执行验证。** 这是不可跳过的步骤。
 你不应该仅通过代码阅读或 LLM 分析来判断漏洞——必须在隔离沙箱中实际运行测试代码。
+
+## 🔴 反伪造规则（强制，违者判定为验证失败）
+1. **禁止模拟/编造 PoC 输出**。不得输出 "Simulated ..."、伪造的确认标记或虚构的沙箱结果。
+2. 若沙箱中**无法读取到目标源码**（如 Source file not found），必须在 Final Answer 中为该 finding 标注 `sandbox_skip_reason` 如实说明原因，**不得**声称漏洞已确认。
+3. 所有 `VULNERABILITY_CONFIRMED` 结论必须来自真实沙箱命令的 stdout 输出。
+4. 系统会独立执行预生成的 PoC 并据其实证据判定状态；你的自述 verdict 不作为最终依据。
 
 ## 你可以使用的工具
 
@@ -836,6 +926,11 @@ class VerificationAgent(BaseAgent):
         await self.emit_thinking("🔐 Verification Agent 启动，LLM 开始自主验证漏洞...")
         
         try:
+            # R3 确定性沙箱执行：进入 LLM 循环前先对全部预生成 PoC 执行一次，
+            # 确保每个 finding 都有运行时证据，不依赖 LLM 是否主动调用 sandbox_exec。
+            if not self.is_cancelled:
+                await self._run_deterministic_sandbox_commands(sandbox_commands, sandbox_project_root)
+
             for iteration in range(self.config.max_iterations):
                 if self.is_cancelled:
                     break
@@ -1265,6 +1360,11 @@ class VerificationAgent(BaseAgent):
                         f"[{self.name}] Fallback sandbox_exec failed: {fallback_err}"
                     )
 
+            # R2 全量证据强制绑定：LLM 漏报的 finding 也必须获得运行时沙箱证据。
+            # LLM Final Answer 只覆盖它自己报告的 findings；这里对全部 findings_to_verify
+            # 兜底附加 runtime evidence，避免证据因 LLM 漏报而丢失（历史任务 4/5 丢失）。
+            self._bind_runtime_evidence_to_all(verified_findings, findings_to_verify)
+
             # 统计
             confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
             not_reproducible_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NOT_REPRODUCIBLE])
@@ -1351,6 +1451,10 @@ class VerificationAgent(BaseAgent):
         if not observation:
             return False
         obs = str(observation)
+        # R3 反伪造：模拟/源码缺失输出即使带成功标记也不计为成功
+        obs_lower = obs.lower()
+        if any(marker.lower() in obs_lower for marker in FABRICATION_MARKERS):
+            return False
         # 明确失败标记
         fail_markers = [
             "Error: 工具执行异常", "文件不存在", "FileNotFoundError",
@@ -1410,6 +1514,11 @@ class VerificationAgent(BaseAgent):
             "vulnerability_confirmed(static)" not in obs_lower
             and any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
         )
+        # R3 反伪造：源码缺失/模拟输出 + 声称确认 → 证据不可信
+        # （真实读取源码并打印确认标记的 attempt 不受影响）
+        fabricated = has_vuln_evidence and any(
+            marker.lower() in obs_lower for marker in FABRICATION_MARKERS
+        )
         # success = exit_code==0 AND (有漏洞证据 OR 没有失败标记且有输出)
         has_output = len(obs_lower.strip()) >= 50  # 有实质性输出（>=50 字符，避免边界值误判）
         # 修复：exit_code None（regex 未匹配）时，仅依据证据判定，避免 None==0 假阴性
@@ -1417,6 +1526,9 @@ class VerificationAgent(BaseAgent):
             success = not has_failure_marker and (has_vuln_evidence or has_output)
         else:
             success = not has_failure_marker and exit_code == 0 and (has_vuln_evidence or has_output)
+        # R3: 伪造证据强制降级为失败，杜绝"Simulated + VULNERABILITY_CONFIRMED"被当铁证
+        if fabricated:
+            success = False
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
@@ -1432,6 +1544,7 @@ class VerificationAgent(BaseAgent):
                 "network_enabled": bool((action_input or {}).get("network_enabled", False)),
                 "evidence_summary": (observation or "")[:5000],
                 "finding_id": finding_id,
+                "fabricated": fabricated,
             }
         )
 
@@ -1627,6 +1740,42 @@ class VerificationAgent(BaseAgent):
             finding["sandbox_attempts"] = existing_attempts + [weak_a]
             return
 
+    def _bind_runtime_evidence_to_all(
+        self, verified_findings: List[Dict], findings_to_verify: List[Dict]
+    ) -> None:
+        """R2: 对全部待验证 finding 强制绑定运行时沙箱证据。
+
+        LLM Final Answer 只覆盖它报告的部分 findings；漏报的 finding 若不在此
+        兜底，其 sandbox_attempts 会永久丢失。此处按 _sandbox_finding_id /
+        路径反查把运行时证据附加到每个 finding，并重新归一化验证状态。
+        """
+        if not findings_to_verify:
+            return
+        # 建立 verified_findings 的路径→条目索引，避免重复插入
+        seen_paths: dict[str, Dict] = {}
+        for vf in verified_findings:
+            fp = str(vf.get("file_path") or "").strip().lower()
+            if fp:
+                seen_paths.setdefault(fp, vf)
+
+        for orig in findings_to_verify:
+            fp = str(orig.get("file_path") or "").strip().lower()
+            target = seen_paths.get(fp) if fp else None
+            if target is None:
+                # LLM 漏报的 finding：用原始 dict 兜底，attach 证据并归一化
+                target = dict(orig)
+                verified_findings.append(target)
+                if fp:
+                    seen_paths[fp] = target
+            if target.get("sandbox_attempts"):
+                continue
+            self._attach_runtime_sandbox_attempts(target)
+            # 证据可能改变状态（needs_context → confirmed/not_reproducible），重新归一化
+            if target.get("sandbox_attempts"):
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
+
     def _attempt_has_vuln_evidence(self, attempt: dict[str, Any]) -> bool:
         """B3 严标准：判断沙箱 attempt 是否含真正的漏洞触发证据（VULNERABILITY_CONFIRMED 等）。
 
@@ -1639,12 +1788,18 @@ class VerificationAgent(BaseAgent):
         # 排除 (static) 变体：静态分析降级输出不应被当作动态铁证
         if "vulnerability_confirmed(static)" in ev_lower:
             return False
+        # R3 反伪造：模拟/源码缺失输出不得作为漏洞触发证据
+        if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+            return False
         return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
     def _sandbox_attempt_matches_finding(self, attempt: dict[str, Any], finding: dict[str, Any]) -> bool:
         if attempt.get("success") is not True:
             return False
         if attempt.get("exit_code") != 0:
+            return False
+        # R3 反伪造：伪造证据一律不匹配
+        if attempt.get("fabricated"):
             return False
         evidence_summary = str(attempt.get("evidence_summary") or "")
         if any(marker in evidence_summary for marker in SANDBOX_FAILURE_MARKERS):
@@ -1719,17 +1874,9 @@ class VerificationAgent(BaseAgent):
         return False
 
     def _normalize_verification_outcome(self, finding: Dict[str, Any]) -> Dict[str, Any]:
-        status = str(
-            finding.get("verification_status")
-            or finding.get("verdict")
-            or VerificationStatus.NEEDS_CONTEXT
-        ).lower()
-        if status == "likely":
-            status = VerificationStatus.CONFIRMED
-        elif status == "uncertain":
-            status = VerificationStatus.NEEDS_CONTEXT
-        if status not in VerificationStatus.ALL:
-            status = VerificationStatus.NEEDS_CONTEXT
+        # R1 确定性状态引擎：验证结论由运行时沙箱证据推导，不信任 LLM 自述 verdict。
+        # LLM 的 verdict 仅保留两个显式标注位：false_positive、sandbox_skip_reason。
+        # 其余一律由 compute_verification_status 从 sandbox_attempts 计算。
 
         # Semgrep deterministic findings: 静态分析确认（无动态沙箱复现）
         # Bug4-fix: 改为 STATIC_CONFIRMED 而非 CONFIRMED，符合 B3 严标准
@@ -1737,91 +1884,65 @@ class VerificationAgent(BaseAgent):
         if finding.get("source") == "semgrep":
             deterministic_types = ["hardcoded_secret", "weak_crypto", "deserialization", "xxe"]
             if finding.get("vulnerability_type") in deterministic_types:
-                status = VerificationStatus.STATIC_CONFIRMED
                 finding["is_verified"] = True
                 normalized = dict(finding)
-                normalized["verification_status"] = status
-                normalized["verdict"] = status
+                normalized["verification_status"] = VerificationStatus.STATIC_CONFIRMED
+                normalized["verdict"] = VerificationStatus.STATIC_CONFIRMED
                 normalized["is_verified"] = True
                 normalized["verification_method"] = "semgrep_static_analysis"
                 normalized["verified_at"] = datetime.now(timezone.utc).isoformat()
                 return normalized
 
         attempts = finding.get("sandbox_attempts") or []
-        has_sandbox_evidence = any(
-            self._sandbox_attempt_matches_finding(a, finding) for a in attempts if isinstance(a, dict)
+        status, is_verified, notes = compute_verification_status(
+            finding,
+            attempts,
+            attempt_has_vuln_evidence_fn=self._attempt_has_vuln_evidence,
+            attempt_matches_finding_fn=self._sandbox_attempt_matches_finding,
         )
-        # B3 严标准：区分 confirmed（动态铁证）与 static_confirmed（代码推理）
-        if status == VerificationStatus.CONFIRMED and not has_sandbox_evidence:
+
+        # 代码推理链确认（soft evidence）：沙箱环境受限无法动态复现时，
+        # 有 dataflow+code_snippet+高置信度+verification_method → static_confirmed。
+        # 仅当证据引擎未给出 confirmed/static_confirmed 时才兜底（避免覆盖铁证）。
+        if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE):
             VULN_TYPES_SOFT_EVIDENCE = {
                 "xss", "ssrf", "auth_bypass", "csrf", "auth_missing", "tenant_isolation", "idor",
                 "business_logic", "race_condition", "open_redirect",
                 "path_traversal", "command_injection", "sql_injection",
             }
             vuln_type = (finding.get("vulnerability_type") or "").lower()
-            # B3-strict (Path B): 区分三档证据
-            # - has_strict_weak: attempt 含真证据（VULNERABILITY_CONFIRMED）但未严匹配路径 → 保持 confirmed 由后续处理
-            # - has_weak_evidence_fallback: 方案C 宽松兜底补入的 attempt（weak_evidence=True，LLM 自写 PoC 成功但无标记）→ 主动判 static_confirmed
-            # - has_soft_evidence: 纯代码推理（dataflow+snippet+confidence）→ static_confirmed
-            has_strict_weak = bool(finding.get("verification_method")) and any(
-                a.get("success") and self._attempt_has_vuln_evidence(a)
-                for a in attempts if isinstance(a, dict)
+            has_soft_evidence = (
+                vuln_type in VULN_TYPES_SOFT_EVIDENCE
+                and bool(finding.get("dataflow_path"))
+                and bool(finding.get("code_snippet"))
+                and finding.get("ai_confidence", 0) >= 0.75
+                and bool(finding.get("verification_method"))
             )
-            has_weak_evidence_fallback = any(
-                isinstance(a, dict) and a.get("success") and a.get("weak_evidence")
-                for a in attempts
-            )
-            # 方案C: 宽松兜底 weak_evidence → 主动判 static_confirmed（非 confirmed，保持 B3 严标准核心）
-            if has_weak_evidence_fallback:
-                finding["verification_status"] = VerificationStatus.STATIC_CONFIRMED
+            if has_soft_evidence:
+                status = VerificationStatus.STATIC_CONFIRMED
+                is_verified = True
                 finding["verification_note"] = (
-                    "沙箱 PoC 成功复现但未输出标准证据标记，经宽松兜底匹配确认为真实漏洞（静态确认）"
+                    "沙箱环境限制无法动态复现，通过代码推理链路静态确认为真实漏洞"
                 )
-                normalized = dict(finding)
-                normalized["verification_status"] = VerificationStatus.STATIC_CONFIRMED
-                normalized["verdict"] = VerificationStatus.STATIC_CONFIRMED
-                normalized["is_verified"] = True
-                normalized["verified_at"] = datetime.now(timezone.utc).isoformat()
-                return normalized
-            has_soft_evidence = False
-            if not has_strict_weak and vuln_type in VULN_TYPES_SOFT_EVIDENCE:
-                has_soft_evidence = (
-                    bool(finding.get("dataflow_path"))
-                    and bool(finding.get("code_snippet"))
-                    and finding.get("ai_confidence", 0) >= 0.75
-                    and bool(finding.get("verification_method"))
-                )
-                if has_soft_evidence:
-                    finding["verification_status"] = VerificationStatus.STATIC_CONFIRMED
-                    finding["verification_note"] = (
-                        "沙箱环境限制无法动态复现，通过代码推理链路静态确认为真实漏洞"
-                    )
-                    finding["verification_method"] = (
-                        finding.get("verification_method", "static_reasoning")
-                        + " (沙箱受限，代码推理链确认)"
-                    )
-                    normalized = dict(finding)
-                    normalized["verification_status"] = VerificationStatus.STATIC_CONFIRMED
-                    normalized["verdict"] = VerificationStatus.STATIC_CONFIRMED
-                    normalized["is_verified"] = True
-                    normalized["verified_at"] = datetime.now(timezone.utc).isoformat()
-                    return normalized
-            if not has_strict_weak and not has_soft_evidence:
-                status = VerificationStatus.NOT_REPRODUCIBLE
-                finding.setdefault(
-                    "failure_reason",
-                    "confirmed verdict rejected: no matched sandbox evidence for this finding",
+                finding["verification_method"] = (
+                    finding.get("verification_method", "static_reasoning")
+                    + " (沙箱受限，代码推理链确认)"
                 )
 
         normalized = dict(finding)
         normalized["verification_status"] = status
         normalized["verdict"] = status
-        normalized["is_verified"] = status in (VerificationStatus.CONFIRMED, VerificationStatus.STATIC_CONFIRMED)
+        normalized["is_verified"] = is_verified
         normalized["verified_at"] = (
             datetime.now(timezone.utc).isoformat()
-            if status in (VerificationStatus.CONFIRMED, VerificationStatus.STATIC_CONFIRMED)
+            if is_verified
             else None
         )
+        if notes:
+            normalized["verification_note"] = (
+                str(normalized.get("verification_note") or "")
+                + " " + "; ".join(f"{k}={v}" for k, v in notes.items())
+            ).strip()
         return normalized
 
     def _backfill_original_metadata(self, llm_finding: Dict[str, Any], original_findings: List[Dict[str, Any]]) -> None:
@@ -1945,6 +2066,60 @@ class VerificationAgent(BaseAgent):
             if hasattr(tool, 'sandbox_manager'):
                 return tool.sandbox_manager
         return None
+
+    async def _run_deterministic_sandbox_commands(
+        self, sandbox_commands: List[Dict], sandbox_project_root: Optional[str]
+    ) -> None:
+        """R3: 进入 LLM 循环前，确定性执行全部预生成 PoC。
+
+        确保每个 finding 都有运行时沙箱证据，不依赖 LLM 是否主动调用 sandbox_exec。
+        单条命令失败不影响整体（证据如实记录）；超时受预生成命令自带 timeout 控制。
+        """
+        if not sandbox_commands:
+            return
+        sandbox_mgr = self._get_sandbox_manager()
+        executed = 0
+        for sc in sandbox_commands:
+            if self.is_cancelled:
+                break
+            try:
+                cmd_input = sc.get("input") or {}
+                command = cmd_input.get("command", "")
+                if not command:
+                    continue
+                timeout = cmd_input.get("timeout", 60)
+                if sandbox_mgr and sandbox_project_root:
+                    result_dict = await sandbox_mgr.execute_with_files(
+                        command=command,
+                        host_project_dir=sandbox_project_root,
+                        timeout=timeout,
+                    )
+                    result = self._format_sandbox_result(result_dict)
+                else:
+                    result = await self.execute_tool("sandbox_exec", cmd_input)
+
+                # 与 LLM 调用路径一致地记录证据与计数
+                self._sandbox_exec_calls += 1
+                self._sandbox_exec_attempts += 1
+                if self._is_sandbox_success(str(result)):
+                    self._sandbox_exec_success += 1
+                    finding_idx = self._parse_finding_index_from_command(command)
+                    if finding_idx is not None:
+                        self._verified_finding_indices.add(finding_idx)
+                self._record_sandbox_attempt(cmd_input, result)
+                executed += 1
+                logger.info(
+                    f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.name}] Deterministic sandbox exec failed for {sc.get('label', '')}: {e}"
+                )
+        if executed:
+            await self.emit_event(
+                "info",
+                f"✅ 确定性沙箱执行完成: {executed} 条预生成 PoC 已运行"
+            )
 
     def _build_sandbox_commands(self, findings: List[Dict]) -> List[Dict]:
         """为每个发现自动生成 sandbox_exec 命令，确保 LLM 有可直接执行的沙箱指令"""

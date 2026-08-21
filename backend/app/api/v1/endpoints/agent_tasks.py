@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy import case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -28,6 +28,7 @@ from app.core.rbac import (
     build_agent_task_filter,
     get_subordinate_user_ids,
 )
+from app.core.timeutil import serialize_cst
 from app.db.session import async_session_factory, get_db
 from app.models.agent_task import (
     AgentCheckpoint,
@@ -195,6 +196,10 @@ class AgentTaskResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
+    @field_serializer("created_at", "started_at", "completed_at", "paused_at", when_used="json")
+    def _ser_time(self, dt: datetime | None) -> str | None:
+        return serialize_cst(dt)
+
     # 配置
     audit_scope: dict | None = None
     target_vulnerabilities: list[str] | None = None
@@ -224,6 +229,10 @@ class AgentEventResponse(BaseModel):
     sequence: int
     # 🔥 ORM 字段名是 created_at，序列化为 timestamp
     created_at: datetime = Field(serialization_alias="timestamp")
+
+    @field_serializer("created_at", when_used="json")
+    def _ser_event_time(self, dt: datetime) -> str:
+        return serialize_cst(dt) or ""
 
     # 工具相关字段
     tool_name: str | None = None
@@ -271,6 +280,10 @@ class AgentFindingResponse(BaseModel):
     verification_method: str | None = None
 
     created_at: datetime
+
+    @field_serializer("created_at", when_used="json")
+    def _ser_finding_time(self, dt: datetime) -> str:
+        return serialize_cst(dt) or ""
 
     model_config = {
         "from_attributes": True,
@@ -943,6 +956,12 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 # 🔥 CRITICAL FIX: Log and save findings with detailed debugging
                 findings = result.data.get("findings", [])
                 logger.info(f"[AgentTask] Task {task_id} completed with {len(findings)} findings from Orchestrator")
+
+                # R6: 持久化门禁拒绝/兜底原因到 agent_tasks.observations（历史字段无写入点）
+                _orch_obs = result.data.get("observations") or []
+                if _orch_obs:
+                    task.observations = list(_orch_obs)
+                    logger.info(f"[AgentTask] Task {task_id} persisted {len(_orch_obs)} gate observations")
 
                 # 🔥 Debug: Log each finding for verification
                 for i, f in enumerate(findings[:5]):  # Log first 5
@@ -2852,7 +2871,7 @@ async def reverify_finding(
         "exit_code": result.get("exit_code"),
         "stdout": (result.get("stdout") or "")[:2000],
         "stderr": (result.get("stderr") or "")[:2000],
-        "executed_at": now.isoformat(),
+        "executed_at": serialize_cst(now),
     }
     from app.models.agent_task import VerificationStatus
     finding.verification_status = (
@@ -3016,7 +3035,7 @@ async def stream_agent_events(
                         "phase": phase_str,
                         "message": event.message,
                         "sequence": event.sequence,
-                        "timestamp": event.created_at.isoformat() if event.created_at else None,
+                        "timestamp": serialize_cst(event.created_at) if event.created_at else None,
                         "progress_percent": event.progress_percent,
                         "tool_name": event.tool_name,
                     }
@@ -3188,7 +3207,7 @@ async def stream_agent_with_thinking(
                                 "phase": str(event.phase) if event.phase else None,
                                 "message": event.message,
                                 "sequence": event.sequence,
-                                "timestamp": event.created_at.isoformat() if event.created_at else None,
+                                "timestamp": serialize_cst(event.created_at) if event.created_at else None,
                             }
 
                             # 添加详情
@@ -3227,7 +3246,7 @@ async def stream_agent_with_thinking(
                     last_heartbeat += poll_interval
                     if last_heartbeat >= heartbeat_interval:
                         last_heartbeat = 0
-                        yield format_sse_event({"type": "heartbeat", "timestamp": datetime.now(UTC).isoformat()})
+                        yield format_sse_event({"type": "heartbeat", "timestamp": serialize_cst(datetime.now(UTC))})
 
                     # 超时
                     if idle_time >= max_idle:
@@ -4208,7 +4227,7 @@ async def list_checkpoints(
             findings_count=cp.findings_count or 0,
             checkpoint_type=cp.checkpoint_type or "auto",
             checkpoint_name=cp.checkpoint_name,
-            created_at=cp.created_at.isoformat() if cp.created_at else None,
+            created_at=serialize_cst(cp.created_at) if cp.created_at else None,
         )
         for cp in checkpoints
     ]
@@ -4263,7 +4282,7 @@ async def get_checkpoint_detail(
         "checkpoint_name": checkpoint.checkpoint_name,
         "state_data": state_data,
         "metadata": checkpoint.checkpoint_metadata,
-        "created_at": checkpoint.created_at.isoformat() if checkpoint.created_at else None,
+        "created_at": serialize_cst(checkpoint.created_at) if checkpoint.created_at else None,
     }
 
 
@@ -4454,7 +4473,7 @@ async def generate_audit_report(
                 "task_id": task.id,
                 "project_id": task.project_id,
                 "project_name": project.name,
-                "generated_at": datetime.now(UTC).isoformat(),
+                "generated_at": serialize_cst(datetime.now(UTC)),
                 "task_status": task.status,
                 "duration_seconds": int((task.completed_at - task.started_at).total_seconds()) if task.completed_at and task.started_at else None,
             },
@@ -4498,7 +4517,7 @@ async def generate_audit_report(
                     "verification_result": f.verification_result,
                     "verification_method": f.verification_method,
                     "sandbox_attempts": f.sandbox_attempts,
-                    "created_at": f.created_at.isoformat() if f.created_at else None,
+                    "created_at": serialize_cst(f.created_at) if f.created_at else None,
                 } for f in findings
             ]
         }

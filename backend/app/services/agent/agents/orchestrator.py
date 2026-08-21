@@ -270,6 +270,10 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_hot_files: list[str] = []
         self._semgrep_findings: list[dict[str, Any]] = []
         self._full_verification_dispatched: bool = False
+        # R4: 连续被"无沙箱证据"门禁拒绝 finish 的次数；达上限后停止强制重派
+        self._finish_gate_rejections: int = 0
+        # R6: 门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations
+        self._gate_observations: list[dict[str, Any]] = []
 
         self._pause_requested: bool = False
         self._pause_future: asyncio.Future[str] | None = None
@@ -449,6 +453,7 @@ class OrchestratorAgent(BaseAgent):
                 if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
                     has_success = any(
                         isinstance(a, dict) and a.get("success") is True and a.get("exit_code") == 0
+                        and not a.get("fabricated")  # R3: 伪造证据不计入有效证据
                         for a in sandbox_attempts
                     )
                     if has_success:
@@ -457,6 +462,15 @@ class OrchestratorAgent(BaseAgent):
             if finding.get("verification_status") == "static_confirmed":
                 return True
         return False
+
+    def _record_gate_observation(self, gate: str, reason: str) -> None:
+        """R6: 记录门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations。"""
+        from datetime import datetime, timezone
+        self._gate_observations.append({
+            "gate": gate,
+            "reason": reason,
+            "time": datetime.now(timezone.utc).isoformat(),
+        })
 
     def _evaluate_current_coverage(self) -> Any:
         """基于当前 findings 与文本证据评估软覆盖率。"""
@@ -858,7 +872,22 @@ Action Input: {{"参数": "值"}}
                     verification_dispatched = "verification" in self._dispatched_tasks
                     verification_count = self._dispatched_tasks.get("verification", 0)
                     has_sandbox_evidence = self._has_valid_sandbox_evidence()
+                    # R4: 连续被门禁拒绝达上限后，停止强制重派 verification，直接放行按覆盖率收尾。
+                    # 根治历史"拒绝→重派→再拒绝"的 token 黑洞循环（生产任务 8 轮失控）。
+                    try:
+                        from app.services.agent.config import get_agent_config
+                        max_redispatch = getattr(
+                            get_agent_config(), "verification_max_force_redispatch", 3
+                        )
+                    except Exception:
+                        max_redispatch = 3
                     if has_findings and (not verification_dispatched or (verification_count > 0 and not has_sandbox_evidence)):
+                        self._finish_gate_rejections += 1
+                        self._record_gate_observation(
+                            "verification_evidence_gate",
+                            f"发现 {len(self._all_findings)} 个漏洞但无有效沙箱证据（第 {self._finish_gate_rejections} 次拒绝）",
+                        )
+                    if has_findings and (not verification_dispatched or (verification_count > 0 and not has_sandbox_evidence)) and self._finish_gate_rejections < max_redispatch:
                         if not verification_dispatched:
                             await self.emit_event(
                                 "warning",
@@ -895,6 +924,24 @@ Action Input: {{"参数": "值"}}
                             ),
                         })
                         continue
+                    elif has_findings and self._finish_gate_rejections >= max_redispatch:
+                        # R4 放行：达到上限后不再强制重派，fall-through 到后续门禁链并完成收尾。
+                        # 不 continue，避免"再输出 finish → 再 +1 → 再放行"的二次循环。
+                        await self.emit_event(
+                            "warning",
+                            f"⚠️ 验证门禁已达最大重试次数（{max_redispatch} 次），不再强制重派 verification，按覆盖率收尾"
+                        )
+                        await self.emit_llm_decision(
+                            "放行完成",
+                            f"已连续拒绝 {max_redispatch} 次仍无沙箱证据，停止强制重派，按当前结果收尾",
+                        )
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": (
+                                f"⚠️ **系统提示**: 验证门禁已连续拒绝 {max_redispatch} 次，"
+                                "沙箱证据仍不可得。系统不再强制你重试 verification，直接完成审计。"
+                            ),
+                        })
 
                     # 🔥 P3: Semgrep 发现强制验证 — 工具扫描发现的漏洞也必须经过沙箱确认
                     # 检查未验证的 Semgrep 发现（matched_rule_code 非空 或 matched_pattern 非空）
@@ -946,9 +993,13 @@ Action Input: {{"参数": "值"}}
                         continue
 
                     # Bug D fix: 全量验证门禁 - 确保所有 findings 都被发送给 Verification
+                    # R5: 判定修正——needs_context（未确认/未尝试）视为未验证。
+                    # 原逻辑 `not verification_status` 被 analysis 默认写入的 needs_context 击穿，
+                    # 导致"确保所有 finding 都送去验证"永不触发（生产任务 4/5 发现从未送验）。
+                    UNVERIFIED_TERMINAL = {"confirmed", "static_confirmed", "not_reproducible", "false_positive"}
                     unverified_findings = [
                         f for f in self._all_findings
-                        if not f.get("verification_status")
+                        if f.get("verification_status") not in UNVERIFIED_TERMINAL
                         and f.get("is_verified") is not True
                     ]
                     if unverified_findings and verification_count > 0 and not self._full_verification_dispatched:
@@ -1108,6 +1159,12 @@ Action Input: {{"参数": "值"}}
                             total_dimensions=10,
                             gaps=hard_coverage.gaps(),
                             block_count=self._hard_coverage_block_count,
+                        )
+                        # R6: 记录覆盖率兜底原因
+                        self._record_gate_observation(
+                            "coverage_gate",
+                            f"覆盖率 {hard_coverage.covered_count}/10 未达标，"
+                            f"连续拦截 {self._hard_coverage_block_count} 次后放行",
                         )
 
                     # 🔥 LLM 决定完成审计（已通过门禁或无发现）
@@ -1295,6 +1352,7 @@ Action Input: {{"参数": "值"}}
                     "findings": self._all_findings,
                     "attack_chains": attack_chains,  # ✅ P1-1: 攻击链结果
                     "summary": final_result or self._generate_default_summary(),
+                    "observations": list(self._gate_observations),  # R6: 门禁拒绝/兜底原因
                     "steps": [
                         {
                             "thought": s.thought,
@@ -1869,13 +1927,52 @@ Action Input: {{"参数": "值"}}
                 )
             except TimeoutError:
                 logger.warning(f"[{self.name}] Sub-agent {agent_name} timed out after {timeout}s")
+                # R7: 中断收口——补发 dispatch_complete/phase_complete，保证事件流完整
+                await self.emit_event(
+                    "dispatch_complete",
+                    f"⏹️ {agent_name} Agent 执行超时",
+                    agent=agent_name,
+                    interrupted=True,
+                )
+                await self.emit_event(
+                    "phase_complete",
+                    f"⏹️ {agent_name} 阶段超时终止",
+                    phase=current_phase,
+                    agent=agent_name,
+                )
                 return f"## {agent_name} Agent 执行超时\n\n子 Agent 执行超过 {timeout} 秒，已强制终止。请尝试更具体的任务或使用其他 Agent。"
             except asyncio.CancelledError:
                 logger.info(f"[{self.name}] Sub-agent {agent_name} was cancelled")
+                # R7: 中断收口
+                await self.emit_event(
+                    "dispatch_complete",
+                    f"⏹️ {agent_name} Agent 被取消",
+                    agent=agent_name,
+                    interrupted=True,
+                )
+                await self.emit_event(
+                    "phase_complete",
+                    f"⏹️ {agent_name} 阶段取消",
+                    phase=current_phase,
+                    agent=agent_name,
+                )
                 return f"## {agent_name} Agent 执行取消\n\n任务已被用户取消"
 
             # 🔥 执行后再次检查取消状态
             if self.is_cancelled:
+                # R7: 中断收口
+                await self.emit_event(
+                    "dispatch_complete",
+                    f"⏹️ {agent_name} Agent 执行中断",
+                    agent=agent_name,
+                    interrupted=True,
+                )
+                await self.emit_event(
+                    "phase_complete",
+                    f"⏹️ {agent_name} 阶段中断",
+                    phase=current_phase,
+                    agent=agent_name,
+                )
                 return f"## {agent_name} Agent 执行中断\n\n任务已被用户取消"
 
             await self.emit_event(
