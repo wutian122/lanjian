@@ -1,6 +1,6 @@
 name: lanjian
 
-# 镜像锁版本：v5.3.0。变更前先 git tag + 更新两台服务器并验证。
+# 镜像锁版本：v5.4.0。变更前先 git tag + 更新两台服务器并验证。
 
 services:
   db:
@@ -38,7 +38,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v5.3.0
+    image: wutian449/lanjian-backend:v5.4.0
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -90,7 +90,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:v5.3.0
+    image: wutian449/lanjian-frontend:v5.4.0
     restart: unless-stopped
     ports:
       - "80:80"

@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v5.3.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v5.4.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -16,6 +16,7 @@
 - **外部工具集成**：Semgrep、Bandit、Gitleaks、npm audit、Safety、TruffleHog、OSV Scanner
 - **RAG 语义检索**：tree-sitter AST 拆分 + ChromaDB 向量存储 + 7 提供商 embedding 适配
 - **Docker 沙箱验证**：动态 PoC 生成 + 多语言执行环境（PHP/Python/JS/Java/Go/Ruby/Shell）
+- **确定性验证证据引擎**（v5.4.0）：验证结论由运行时沙箱证据代码化推导，不信任 LLM 自述；伪造/模拟沙箱输出被识别排除；证据按 finding 强制绑定；门禁连续拒绝达上限后确定性终止
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -47,7 +48,7 @@ lanjian/
 │   │   │   └── scanner.py     # 传统 SAST 扫描器
 │   │   └── main.py            # FastAPI 入口
 │   ├── alembic/               # 数据库迁移（001 → 023）
-│   ├── tests/                 # 60+ 个 pytest 用例
+│   ├── tests/                 # 82 个 pytest 文件 / 575 个用例
 │   └── pyproject.toml
 ├── frontend/                   # React 前端
 │   ├── src/
@@ -106,16 +107,16 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v5.3.0`（生产已禁用 `:latest` 浮动 tag）。`v5.3.0` 为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v5.4.0`（生产已禁用 `:latest` 浮动 tag）。`v5.4.0` 为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
 ```bash
-IMAGE_TAG=v5.3.0 docker compose pull
-IMAGE_TAG=v5.3.0 docker compose up -d
+IMAGE_TAG=v5.4.0 docker compose pull
+IMAGE_TAG=v5.4.0 docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v5.3.0" > .env`。
+可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v5.4.0" > .env`。
 
 > **镜像说明**：backend / frontend / sandbox 三镜像均发布多架构清单（manifest list）。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10，避免浮动 tag 重建引入不兼容）。
 
@@ -192,6 +193,8 @@ docker compose logs -f backend                     # 追踪日志
 ## 关键设计
 
 - **覆盖率门禁**：D1-D10 十维度覆盖率矩阵（注入 / 认证 / 授权 / 反序列化 / 文件 / SSRF / 加密 / 配置 / 业务逻辑 / 供应链）。达标条件为覆盖 ≥6/10（浅覆盖计入）且核心三角 D1/D2/D3 深度覆盖；硬拦截最多 3 次后安全阀放行（`COMPLETED_WITH_GAPS`）
+- **确定性验证状态**（v5.4.0）：`verification_status`/`is_verified` 由 `sandbox_attempts` 证据经 `compute_verification_status` 纯函数推导（confirmed > static_confirmed > not_reproducible > needs_context）；伪造证据（Simulated/模拟输出/源码缺失）标记 `fabricated` 并排除出判定与门禁；验证门禁连续拒绝 `verification_max_force_redispatch`（默认 3）次后终止重派，缺口原因写入 `agent_tasks.observations`
+- **统一北京时间输出**（v5.4.0）：API/SSE 时间字段统一由 `app/core/timeutil.py` 序列化为北京时间（Asia/Shanghai, UTC+8），消除"数据库 UTC vs 页面本地时间"的 8 小时观感差异
 - **审计记忆注入**：任务启动时从 `agent_findings` 加载同项目历史 confirmed/static_confirmed 发现，按 fingerprint 去重后作为线索注入编排上下文（复用 Semgrep 线索注入范式，零表结构变更）
 - **暂停恢复**：Orchestrator 通过 `request_pause()` 落 checkpoint，`resume_state` 序列化编排状态
 - **Token 预算**：默认 60M，超限降级为 `COMPLETED_WITH_GAPS`
@@ -233,4 +236,3 @@ openspec instructions apply --change "<name>" --json
 - [Agent 引擎架构](backend/app/services/agent/AGENTS.md)
 - [RAG 管道设计](backend/app/services/rag/AGENTS.md)
 - [审计引擎规格](openspec/specs/audit-engine/spec.md)
-- [历史交付日志](docs/history/)

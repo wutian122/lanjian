@@ -14,7 +14,7 @@ backend/
 │   │   └── v1/
 │   │       ├── api.py                # 路由聚合器（13 个端点模块）
 │   │       └── endpoints/
-│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期，4784 行）
+│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期，4803 行）
 │   │           ├── auth.py           # 登录、注册、验证码、改密、登出
 │   │           ├── users.py          # 用户 CRUD + 状态切换 + 级联删除
 │   │           ├── projects.py       # 项目管理 + ZIP + 分支 + 文件树（826 行）
@@ -80,8 +80,8 @@ backend/
 │       └── repo_utils.py             # Git 仓库操作
 ├── alembic/                          # 数据库迁移（24 个迁移文件）
 │   └── versions/                     # 001_initial → 023_drop_dead（含一次 merge heads 4c280754c680）
-├── tests/                            # 测试（78 个测试文件，约 559 个用例）
-│   ├── agent/                        # Agent 专项测试（58 个：验证/沙箱/覆盖率/严格发现等）
+├── tests/                            # 测试（82 个测试文件，575 个用例）
+│   ├── agent/                        # Agent 专项测试（62 个：验证/沙箱/覆盖率/严格发现等）
 │   ├── rag/                          # RAG 测试（test_indexing_hardening.py：B1-B5 索引进度加固）
 │   └── test_*.py                     # 认证/RBAC/攻击链/覆盖率/跨轮次/文件选择测试
 ├── uploads/                          # 上传文件存储
@@ -138,6 +138,8 @@ backend/
 ```
 
 > **v5.3.0 起 RAG 索引经 B1-B5 加固**：构建产物路径段排除 + minified 启发式（`indexer.py` `BUILD_ARTIFACT_DIR_SEGMENTS` / `MAX_SINGLE_LINE_LENGTH=2000` / `MAX_SOURCE_FILE_SIZE=2MB`）、单文件分块护栏（`FILE_CHUNK_TIMEOUT=20s` 跳过 / `MAX_CHUNKS_PER_FILE=500` 截断）、有界并发（`CHUNK_CONCURRENCY=4` 分批 gather）、嵌入快速失败（`embeddings.py` 重试耗尽抛 `EmbeddingUnavailableError`，agent_tasks 走 `rag_unavailable` 分支，禁止写入零向量）、进度消息分阶段标注（`CHUNK_PROGRESS_MSG_TEMPLATE` / `EMBED_PROGRESS_MSG_TEMPLATE`）。测试见 `tests/rag/test_indexing_hardening.py`，烟雾脚本 `smoke_rag_indexing.py`。
+
+> **v5.4.0 验证引擎根治（R1-R7）**：`verification.py` 新增确定性状态引擎 `compute_verification_status`（R1：由 sandbox_attempts 证据推导状态，不信任 LLM 自述 verdict，仅保留 false_positive/sandbox_skip_reason 两个显式标注位）、`_bind_runtime_evidence_to_all`（R2：证据按 finding_id 强制绑定，LLM 漏报不丢证据）、`FABRICATION_MARKERS` 反伪造（R3：Simulated/模拟/源码缺失标记 `fabricated` 并排除出判定与门禁）+ 确定性沙箱执行；`orchestrator.py` 门禁 3 次终止（R4 `verification_max_force_redispatch`）、Bug D 判定修正（R5：needs_context 视为未验证）、observations 记录（R6）、中断收口（R7）。`app/core/timeutil.py` 统一 API/SSE 时间为北京时间（UTC+8）。测试见 `tests/agent/test_verification_evidence.py` 与 `tests/agent/test_orchestrator_gates.py`。
 
 ## 数据库迁移演进
 

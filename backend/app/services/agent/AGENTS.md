@@ -246,6 +246,7 @@ Agent 执行 → AgentEventEmitter.emit(event_data)
 | `circuit_breaker.recovery_timeout` | 60s | 熔断器恢复超时 |
 | `circuit_breaker.half_open_max_calls` | 3 | 半开状态最大调用数 |
 | `per_finding_budget` | 8 | 单发现弹性验证预算（迭代次数） |
+| `verification_max_force_redispatch` | 3 | R4 验证门禁连续拒绝最大次数：达上限后停止强制重派 verification，直接按覆盖率收尾（根治 token 黑洞循环） |
 
 ## 反模式
 

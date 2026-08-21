@@ -89,6 +89,10 @@ class AgentConfig(BaseSettings):
         default=8,
         description="Per-finding iteration budget for verification (elastic total)"
     )
+    verification_max_force_redispatch: int = Field(
+        default=3,
+        description="R4: 连续被'无沙箱证据'门禁拒绝 finish 的最大次数，达上限后停止强制重派 verification（根治 token 黑洞循环）"
+    )
 
     # ============ Agent Timeouts ============
     orchestrator_timeout_seconds: int = Field(
