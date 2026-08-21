@@ -2,6 +2,8 @@ from app.services.agent.agents.verification import VerificationAgent
 
 
 def test_confirmed_without_sandbox_evidence_is_downgraded():
+    """R1: 无任何沙箱尝试 → needs_context（未尝试/无法验证），而非 not_reproducible。
+    not_reproducible 语义是"尝试过但未复现"；无证据说明未尝试。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
@@ -11,7 +13,7 @@ def test_confirmed_without_sandbox_evidence_is_downgraded():
 
     normalized = agent._normalize_verification_outcome(finding)
 
-    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
 
 
@@ -57,23 +59,25 @@ def test_empty_finding_defaults_to_needs_context():
     assert normalized["is_verified"] is False
 
 
-def test_likely_is_converted_to_not_reproducible():
+def test_likely_is_converted_to_needs_context():
+    """R1: verdict=likely 但无任何沙箱尝试 → needs_context（不信任 LLM 自述，无证据未尝试）。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {"verdict": "likely", "sandbox_attempts": []}
 
     normalized = agent._normalize_verification_outcome(finding)
 
-    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
 
 
-def test_uncertain_is_converted_to_needs_context():
+def test_uncertain_with_attempts_is_not_reproducible():
+    """R1: verdict=uncertain 但有沙箱尝试（失败）→ not_reproducible（尝试过但未复现）。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {"verdict": "uncertain", "sandbox_attempts": [{"success": False}]}
 
     normalized = agent._normalize_verification_outcome(finding)
 
-    assert normalized["verification_status"] == "needs_context"
+    assert normalized["verification_status"] == "not_reproducible"
     assert normalized["is_verified"] is False
 
 
@@ -146,7 +150,7 @@ def test_runtime_sandbox_attempts_do_not_attach_to_unmatched_finding():
     normalized = agent._normalize_verification_outcome(finding)
 
     assert "sandbox_attempts" not in finding
-    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
 
 

@@ -47,6 +47,7 @@ def test_static_confirmed_when_weak_evidence_no_sandbox_but_soft_evidence():
 
 
 def test_not_reproducible_when_no_evidence():
+    """R1: 无沙箱尝试且无软证据 → needs_context（未尝试），而非 not_reproducible。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
@@ -60,12 +61,12 @@ def test_not_reproducible_when_no_evidence():
         "ai_confidence": 0.3,
     }
     normalized = agent._normalize_verification_outcome(finding)
-    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
 
 
 def test_static_confirmed_low_confidence_not_promoted():
-    """ai_confidence < 0.75 不应升为 static_confirmed。"""
+    """ai_confidence < 0.75 不应升为 static_confirmed；无沙箱尝试 → needs_context。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
@@ -79,7 +80,7 @@ def test_static_confirmed_low_confidence_not_promoted():
         "ai_confidence": 0.6,
     }
     normalized = agent._normalize_verification_outcome(finding)
-    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
 
 
