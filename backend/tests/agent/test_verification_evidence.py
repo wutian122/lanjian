@@ -339,3 +339,45 @@ def test_attach_id_branch_no_double_count_on_rebind():
     agent._attach_runtime_sandbox_attempts(finding)
     agent._attach_runtime_sandbox_attempts(finding)
     assert len(finding["sandbox_attempts"]) == 1, "语义重复的 attempt 必须去重，不得双计"
+
+
+# ============ V6 B3（REQ-VE-3）: 空 Final Answer 回填证据 ============
+
+def test_empty_final_answer_backfills_attempts():
+    """空 Final Answer + 确定性证据存在 → 回填 attempts、状态据实、非全 needs_context。"""
+    agent = _make_agent()
+    att_confirmed = {
+        "success": True,
+        "exit_code": 0,
+        "evidence_summary": "VULNERABILITY_CONFIRMED: sqli dynamically verified",
+        "target_ref": "console/AppController.java:113",
+        "command": "python3 /tmp/poc_0.py",
+        "finding_id": "f-b3-1",
+    }
+    att_failed = {
+        "success": False,
+        "exit_code": 1,
+        "evidence_summary": "Traceback in stderr, not reproduced",
+        "target_ref": "console/AppController.java:200",
+        "command": "python3 /tmp/poc_1.py",
+        "finding_id": "f-b3-2",
+    }
+    agent._sandbox_attempts = [att_confirmed, att_failed]
+    agent._runtime_attempts_by_finding_id = {
+        "f-b3-1": [att_confirmed],
+        "f-b3-2": [att_failed],
+    }
+    findings = [
+        _finding(_sandbox_finding_id="f-b3-1", line_start=113),
+        _finding(_sandbox_finding_id="f-b3-2", line_start=200),
+    ]
+    results = agent._finalize_findings_without_final_answer(findings)
+    assert len(results) == 2
+    by_line = {r.get("line_start"): r for r in results}
+    r1, r2 = by_line[113], by_line[200]
+    assert r1.get("sandbox_attempts"), "成功证据必须回填（落库非 NULL）"
+    assert r1["verification_status"] == "confirmed"
+    assert r1["is_verified"] is True
+    assert r2.get("sandbox_attempts"), "失败证据也必须回填（落库非 NULL）"
+    assert r2["verification_status"] == "not_reproducible"
+    assert r2["is_verified"] is False

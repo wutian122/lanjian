@@ -1309,16 +1309,11 @@ class VerificationAgent(BaseAgent):
 
                     verified_findings.append(strict)
             else:
-                # 如果没有最终结果，使用原始发现
-                for f in findings_to_verify:
-                    verified_findings.append(
-                        self._normalize_verification_outcome({
-                            **f,
-                            "verdict": "needs_context",
-                            "confidence": 0.5,
-                            "is_verified": False,
-                        })
-                    )
+                # V6 B3（REQ-VE-3）：LLM 空 Final Answer——回填运行时证据后再归一化，
+                # 状态由 compute_verification_status 据实推导，不得一律 needs_context
+                verified_findings.extend(
+                    self._finalize_findings_without_final_answer(findings_to_verify)
+                )
 
             # === FIX P0-1: 兜底沙箱验证 ===
             # 如果循环自然结束（LLM 始终未调用 sandbox_exec），
@@ -1723,6 +1718,27 @@ class VerificationAgent(BaseAgent):
                 seen.add(key)
                 merged.append(a)
         return merged
+
+    def _finalize_findings_without_final_answer(self, findings_to_verify: List[Dict]) -> List[Dict]:
+        """V6 B3（REQ-VE-3）：LLM 空 Final Answer 时的回退收口。
+
+        归一化前先按 finding_id 回填运行时证据（消费 B4 索引与扁平列表），
+        状态由 compute_verification_status 据实推导——
+        有铁证 → confirmed/static_confirmed；执行未复现 → not_reproducible；
+        禁止直接以 needs_context 覆盖有证据的 finding。
+        """
+        results: List[Dict] = []
+        for f in findings_to_verify:
+            target = {
+                **f,
+                "verdict": "needs_context",
+                "confidence": 0.5,
+                "is_verified": False,
+            }
+            if not target.get("sandbox_attempts"):
+                self._attach_runtime_sandbox_attempts(target)
+            results.append(self._normalize_verification_outcome(target))
+        return results
 
     def _attach_runtime_sandbox_attempts(self, finding: dict[str, Any]) -> None:
         """Attach runtime sandbox evidence when the LLM omitted sandbox_attempts in Final Answer.
