@@ -176,7 +176,14 @@ def test_llm_supplied_unmatched_sandbox_attempt_does_not_confirm_finding():
     assert normalized["is_verified"] is False
 
 
-def test_record_sandbox_attempt_marks_zero_exit_with_failure_marker_as_failed():
+def test_record_sandbox_attempt_zero_exit_ignores_incidental_failure_marker():
+    """V6 B2（REQ-VE-2）：exit 0 时 stdout 正文里 incidental 的 'Traceback' 子串不再误杀成功输出。
+
+    旧语义（任意失败子串全文匹配判失败）在 v6 收窄：子串级标记仅在 exit_code!=0
+    或位于 stderr/错误段内生效。真失败识别的用例见
+    tests/agent/test_verification_evidence.py 的
+    test_exit0_with_stderr_traceback_still_fails 与 test_exit1_with_traceback_fails。
+    """
     agent = VerificationAgent.__new__(VerificationAgent)
     agent._sandbox_attempts = []
 
@@ -185,7 +192,7 @@ def test_record_sandbox_attempt_marks_zero_exit_with_failure_marker_as_failed():
         "🐳 沙箱执行结果\n退出码: 0\n标准输出:\nTraceback: PoC failed before reaching target",
     )
 
-    assert agent._sandbox_attempts[0]["success"] is False
+    assert agent._sandbox_attempts[0]["success"] is True
     assert agent._sandbox_attempts[0]["target_ref"] == "app.py:1"
 
 

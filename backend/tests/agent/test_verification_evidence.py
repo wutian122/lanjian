@@ -381,3 +381,59 @@ def test_empty_final_answer_backfills_attempts():
     assert r2.get("sandbox_attempts"), "失败证据也必须回填（落库非 NULL）"
     assert r2["verification_status"] == "not_reproducible"
     assert r2["is_verified"] is False
+
+
+# ============ V6 B6（REQ-VE-6）: 模板 PoC 源码断言与证据分级 ============
+
+def test_template_demo_confirmation_downgrades_to_static():
+    """演示性模板确认（与目标源码无数据流因果）→ static_evidence → static_confirmed 而非 confirmed。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "# FINDING_ID:f-b6-1\npython3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 0\n标准输出:\n```\nSource: 4039 chars loaded\n"
+        "payload=1' OR '1'='1 rows=3 -> INJECTABLE\n"
+        "VULNERABILITY_CONFIRMED(STATIC): SQL injection demo (source-asserted)\n"
+        "=== Verification Complete ===\n```",
+    )
+    a = agent._sandbox_attempts[0]
+    assert a.get("static_evidence") is True, "演示性确认必须携带 static_evidence 标记"
+    assert a["success"] is True
+    finding = _finding(_sandbox_finding_id="f-b6-1")
+    agent._runtime_attempts_by_finding_id = {"f-b6-1": [a]}
+    agent._attach_runtime_sandbox_attempts(finding)
+    normalized = agent._normalize_verification_outcome(finding)
+    assert normalized["verification_status"] == "static_confirmed", "演示性证据最高只能 static_confirmed"
+    assert normalized["is_verified"] is True
+
+
+def test_source_missing_attempt_not_success():
+    """源码缺失 → 输出 Source not found 且无确认标记 → attempt 不判成功。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 1\n标准输出:\n```\nSource not found: /workspace/src/app.py\n```",
+    )
+    a = agent._sandbox_attempts[0]
+    assert a["success"] is False
+    assert not agent._attempt_has_vuln_evidence(a)
+
+
+def test_template_source_missing_exits_without_confirmation():
+    """模板命令文本：源码缺失分支必须 exit(1) 不进演示段；演示确认标记必须是 (STATIC) 变体。"""
+    import re as _re
+
+    agent = _make_agent()
+    for vuln_type in ("sql_injection", "command_injection", "xss", "path_traversal",
+                      "ssrf", "hardcoded_secret", "deserialization"):
+        cmd = agent._gen_sandbox_command(vuln_type, "app.py", 10, "t", 0)
+        script = cmd["input"]["command"]
+        assert "Source not found" in script, f"{vuln_type} 模板须有源码缺失提示"
+        assert _re.search(r"Source not found[^\n]*'\)\s*\n\s*sys\.exit\(1\)", script), (
+            f"{vuln_type} 模板源码缺失分支必须 sys.exit(1)，不得继续演示"
+        )
+    # 演示确认标记全部使用 (STATIC) 变体（裸标记不再由模板输出）
+    for vuln_type in ("sql_injection", "command_injection", "xss", "ssrf",
+                      "auth_missing", "tenant_isolation", "idor"):
+        script = agent._gen_sandbox_command(vuln_type, "app.py", 10, "t", 0)["input"]["command"]
+        assert "VULNERABILITY_CONFIRMED(STATIC)" in script, f"{vuln_type} 演示确认须为 STATIC 变体"
+        assert "VULNERABILITY_CONFIRMED:" not in script, f"{vuln_type} 模板不得输出裸确认标记"

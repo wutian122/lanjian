@@ -1547,8 +1547,12 @@ class VerificationAgent(BaseAgent):
         # ✅ P2-1: 增加语义检查 - 仅 exit_code==0 不够，还需检查 PoC 输出是否包含漏洞触发证据
         # 注意：marker 与 observation 都转小写比较，避免大小写不匹配漏判
         obs_lower = (observation or "").lower()
+        # V6 B6（REQ-VE-6）：演示性确认（与目标源码无数据流因果，模板 PoC 输出
+        # VULNERABILITY_CONFIRMED(STATIC) 变体）→ static_evidence 降档标记，
+        # compute_verification_status 分支 2 消费判 static_confirmed，不得判 confirmed
+        static_evidence = "vulnerability_confirmed(static)" in obs_lower
         has_vuln_evidence = (
-            "vulnerability_confirmed(static)" not in obs_lower
+            not static_evidence
             and any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
         )
         # R3 反伪造：源码缺失/模拟输出 + 声称确认 → 证据不可信
@@ -1581,6 +1585,7 @@ class VerificationAgent(BaseAgent):
             "evidence_summary": (observation or "")[:5000],
             "finding_id": finding_id,
             "fabricated": fabricated,
+            "static_evidence": static_evidence,
         }
         self._sandbox_attempts.append(attempt)
         # V6 B4（REQ-VE-4）：双写——按 finding_id 登记运行时证据索引，
@@ -2268,7 +2273,9 @@ class VerificationAgent(BaseAgent):
                     f"    for kw in ['execute','raw','query','cursor','executescript','sql']:\n"
                     f"        cnt = content.lower().count(kw)\n"
                     f"        if cnt: print(f'  SQL sink \"{{kw}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: in-memory SQLite ---')\n"
                     f"conn = sqlite3.connect(':memory:')\n"
                     f"cur = conn.cursor()\n"
@@ -2295,7 +2302,7 @@ class VerificationAgent(BaseAgent):
                     f"        if p != '1':\n"
                     f"            print(f'    -> syntax break indicates injection surface')\n"
                     f"if injectable:\n"
-                    f"    print('VULNERABILITY_CONFIRMED: SQL injection dynamically verified (in-memory SQLite)')\n"
+                    f"    print('VULNERABILITY_CONFIRMED(STATIC): SQL injection pattern verified via in-memory SQLite demo (source-asserted, no data-flow to target)')\n"
                     f"elif content:\n"
                     f"    print('NOTE: dynamic exec did not confirm; verify SQL sink reaches user input manually')\n"
                     f"print('=== Verification Complete ===')\n"
@@ -2307,7 +2314,7 @@ class VerificationAgent(BaseAgent):
             'command_injection': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import subprocess, os, re\n"
+                    f"import subprocess, os, re, sys\n"
                     f"print('=== SANDBOX Command Injection Verification (dynamic) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2319,7 +2326,9 @@ class VerificationAgent(BaseAgent):
                     f"    for kw in ['subprocess','os.system','os.popen','eval(','exec(','shell=True']:\n"
                     f"        cnt = content.count(kw)\n"
                     f"        if cnt: print(f'  Dangerous call \"{{kw}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: shell injection simulation ---')\n"
                     f"user_input = 'hello; id; whoami'\n"
                     f"try:\n"
@@ -2328,7 +2337,7 @@ class VerificationAgent(BaseAgent):
                     f"    print(f'  shell output: {{out.strip()[:200]}}')\n"
                     f"    uid = re.search(r'uid=\\d+', out)\n"
                     f"    if uid:\n"
-                    f"        print(f'VULNERABILITY_CONFIRMED: shell injection executed id -> {{uid.group(0)}}')\n"
+                    f"        print(f'VULNERABILITY_CONFIRMED(STATIC): shell injection demo executed id -> {{uid.group(0)}} (no data-flow to target source)')\n"
                     f"    else:\n"
                     f"        print('NOTE: shell=True with user input is exploitable; verify sink reaches user input')\n"
                     f"except Exception as e:\n"
@@ -2342,7 +2351,7 @@ class VerificationAgent(BaseAgent):
             'xss': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX XSS/SSTI Verification (dynamic) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2362,6 +2371,7 @@ class VerificationAgent(BaseAgent):
                     f"            print(f'  sink {{pat}}: {{len(ms)}} matches')\n"
                     f"else:\n"
                     f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: Jinja2 SSTI render ---')\n"
                     f"ssti_confirmed = False\n"
                     f"try:\n"
@@ -2378,7 +2388,7 @@ class VerificationAgent(BaseAgent):
                     f"        except Exception as e:\n"
                     f"            print(f'  probe {{probe}} error: {{e}}')\n"
                     f"    if ssti_confirmed:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: SSTI dynamically verified (Jinja2 rendered {{{{7*7}}}}=49)')\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): SSTI demo verified (Jinja2 rendered {{{{7*7}}}}=49; no data-flow to target source)')\n"
                     f"    elif sink_found:\n"
                     f"        print('VULNERABILITY_STATIC_ONLY: dangerous XSS/SSTI sink present; verify it reaches user input')\n"
                     f"    else:\n"
@@ -2398,7 +2408,7 @@ class VerificationAgent(BaseAgent):
             'path_traversal': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX Path Traversal Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2409,7 +2419,9 @@ class VerificationAgent(BaseAgent):
                     f"    for pat in [r'os\\.path\\.join', r'\\.\\./', r'open\\\\(', r'pathlib', r'send_file', r'send_from_directory']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Pattern \"{{pat}}\": {{cnt}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"paths = ['/etc/passwd', '../../../etc/passwd', '....//....//etc/passwd']\n"
                     f"for p in paths: print(f'Testing path: {{p}}, exists={{os.path.exists(p)}}')\n"
                     f"print('=== Verification Complete ===')\n"
@@ -2421,7 +2433,7 @@ class VerificationAgent(BaseAgent):
             'ssrf': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re, urllib.request\n"
+                    f"import os, re, sys, urllib.request\n"
                     f"print('=== SANDBOX SSRF Verification (enhanced) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2433,7 +2445,9 @@ class VerificationAgent(BaseAgent):
                     f"    for pat in [r'requests\\.get', r'httpx', r'urllib', r'aiohttp', r'fetch\\\\(']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  HTTP call \"{{pat}}\": {{cnt}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"# 检查源码是否对用户输入 URL 做过滤/校验\n"
                     f"has_filter = bool(re.search(r'valid|filter|sanitiz|allowlist|blocklist|urlparse', content, re.I))\n"
                     f"print(f'URL filter/validate in source: {{has_filter}}')\n"
@@ -2449,7 +2463,7 @@ class VerificationAgent(BaseAgent):
                     f"# 判定\n"
                     f"sink_found = bool(re.search(r'requests\\.get|httpx|urllib|aiohttp|fetch\\\\(', content))\n"
                     f"if metadata_hit:\n"
-                    f"    print('VULNERABILITY_CONFIRMED: SSRF dynamically verified (cloud metadata reachable via user-controlled URL)')\n"
+                    f"    print('VULNERABILITY_CONFIRMED(STATIC): SSRF demo - cloud metadata reachable via PoC-initiated request (no data-flow to target source)')\n"
                     f"elif sink_found and not has_filter:\n"
                     f"    # bridge 不可用降级：未联网但源码存在未过滤的 HTTP 调用 sink\n"
                     f"    print('STATIC_CONFIRMED: SSRF sink present without URL filter/validate; degraded 检查 URL 解析逻辑 (bridge unavailable, 未真实联网)')\n"
@@ -2499,7 +2513,7 @@ class VerificationAgent(BaseAgent):
                     f"    body = resp.read().decode()\n"
                     f"    print(f'no-auth request: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
                     f"    if resp.getcode() == 200 and 'users' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: 无认证即可访问敏感接口 (missing authentication)')\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): 无认证即可访问敏感接口 (loopback mock 演示，与目标源码无数据流因果)')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 无凭证请求被拒绝或无敏感数据')\n"
                     f"except Exception as e:\n"
@@ -2555,7 +2569,7 @@ class VerificationAgent(BaseAgent):
                     f"    body = resp.read().decode()\n"
                     f"    print(f'tenant B request: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
                     f"    if resp.getcode() == 200 and 'a-key-123' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: 多租户隔离失效 (B 租户读到 A 租户数据)')\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): 多租户隔离失效 (loopback mock 演示，与目标源码无数据流因果)')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 租户隔离生效，跨租户数据不可读')\n"
                     f"except Exception as e:\n"
@@ -2609,7 +2623,7 @@ class VerificationAgent(BaseAgent):
                     f"    body = resp.read().decode()\n"
                     f"    print(f'guest request user/999: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
                     f"    if resp.getcode() == 200 and 'user999' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: IDOR 越权可访问他人资源 (guest 读取 user/999)')\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): IDOR 越权可访问他人资源 (loopback mock 演示，与目标源码无数据流因果)')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 资源归属校验生效，越权不可读')\n"
                     f"except Exception as e:\n"
@@ -2628,7 +2642,7 @@ class VerificationAgent(BaseAgent):
             'hardcoded_secret': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX Hardcoded Secret Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2644,7 +2658,9 @@ class VerificationAgent(BaseAgent):
                     f"    for pat in patterns:\n"
                     f"        matches = re.findall(pat, content)\n"
                     f"        if matches: print(f'  Secret pattern found: {{len(matches)}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('=== Verification Complete ===')\n"
                     f"POC_EOF\n"
                     f"python3 /tmp/poc_{index}.py"
@@ -2654,7 +2670,7 @@ class VerificationAgent(BaseAgent):
             'deserialization': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re, pickle, json\n"
+                    f"import os, re, sys, pickle, json\n"
                     f"print('=== SANDBOX Deserialization Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2665,7 +2681,9 @@ class VerificationAgent(BaseAgent):
                     f"    for pat in [r'pickle\\.load', r'yaml\\.load', r'json\\.loads', r'marshal\\.load', r'eval\\\\(']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Unsafe call \"{{pat}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"safe_data = json.dumps({{'test': 'data'}})\n"
                     f"print(f'JSON safe: {{json.loads(safe_data)}}')\n"
                     f"print(f'pickle available: True')\n"
@@ -2693,7 +2711,7 @@ class VerificationAgent(BaseAgent):
                 'input': {
                     'command': (
                         f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                        f"import os, re\n"
+                        f"import os, re, sys\n"
                         f"print('=== SANDBOX Vulnerability Verification ===')\n"
                         f"print('Target: {file_ref}')\n"
                         f"print('Type: {vuln_type}')\n"
@@ -2702,7 +2720,9 @@ class VerificationAgent(BaseAgent):
                         f"if os.path.exists(src):\n"
                         f"    with open(src) as f: content = f.read()\n"
                         f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                        f"else: print(f'Source not found: {{src}}')\n"
+                        f"else:\n"
+                        f"    print(f'Source not found: {{src}}')\n"
+                        f"    sys.exit(1)\n"
                         f"print('=== Verification Complete ===')\n"
                         f"POC_EOF\n"
                         f"python3 /tmp/poc_{index}.py"
