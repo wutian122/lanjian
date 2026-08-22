@@ -1741,7 +1741,11 @@ class VerificationAgent(BaseAgent):
         if len(text) <= max_chars:
             return text
         head, tail = 1500, 1500
-        omitted = len(text) - head - tail
+        # 防御：配置值过小（<3000+标注空间）时收缩头尾，避免 omitted 为负/内容重复
+        budget = max(max_chars - 200, 200)
+        if head + tail > budget:
+            head = tail = budget // 2
+        omitted = max(len(text) - head - tail, 0)
         return (
             text[:head]
             + f"\n...[observation truncated: {omitted} chars omitted]...\n"
