@@ -4,7 +4,7 @@
  */
 
 import { useState, FormEvent, useEffect } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/shared/context/AuthContext";
 import { apiClient } from "@/shared/api/serverClient";
 import { Button } from "@/components/ui/button";
@@ -39,10 +39,10 @@ export default function Login() {
   const [rememberMe, setRememberMe] = useState(false);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
-  const location = useLocation();
   const { login, isAuthenticated } = useAuth();
 
-  const from = location.state?.from?.pathname || "/";
+  // REQ-LR-1: 登录成功后固定跳转仪表盘，不再回跳原业务页
+  const from = "/dashboard";
 
   useEffect(() => {
     const savedUsername = localStorage.getItem("remembered_username");
