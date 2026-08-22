@@ -1043,11 +1043,12 @@ class VerificationAgent(BaseAgent):
                 if step.thought:
                     await self.emit_llm_thought(step.thought, iteration + 1)
                 
-                # 添加 LLM 响应到历史
+                # 添加 LLM 响应到历史（V6 B5：assistant 输出同样过截断 + 压缩检查）
                 self._conversation_history.append({
                     "role": "assistant",
-                    "content": llm_output,
+                    "content": self._truncate_observation_for_history(llm_output),
                 })
+                self._compress_history_if_needed()
                 
                 # 检查是否完成
                 if step.is_final:
@@ -1149,12 +1150,12 @@ class VerificationAgent(BaseAgent):
                             "4. 继续用 sandbox_exec 验证下一个发现，不要卡在同一个发现上"
                         )
                         
-                        # 模拟观察结果，跳过实际执行
+                        # 模拟观察结果，跳过实际执行（V6 B5：截断后入历史）
                         step.observation = observation
                         await self.emit_llm_observation(observation)
                         self._conversation_history.append({
                             "role": "user",
-                            "content": f"Observation:\n{observation}",
+                            "content": "Observation:\n" + self._truncate_observation_for_history(observation),
                         })
                         continue
 
@@ -1231,11 +1232,12 @@ class VerificationAgent(BaseAgent):
                     # 🔥 发射 LLM 观察事件
                     await self.emit_llm_observation(observation)
                     
-                    # 添加观察结果到历史
+                    # 添加观察结果到历史（V6 B5/REQ-VE-5：单条截断 + 累计压缩，会话有界）
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": "Observation:\n" + self._truncate_observation_for_history(observation),
                     })
+                    self._compress_history_if_needed()
                 else:
                     # LLM 没有选择工具，提示它继续
                     await self.emit_llm_decision("继续验证", "LLM 需要更多验证")
@@ -1723,6 +1725,67 @@ class VerificationAgent(BaseAgent):
                 seen.add(key)
                 merged.append(a)
         return merged
+
+    def _truncate_observation_for_history(self, observation: str) -> str:
+        """V6 B5（REQ-VE-5）：单条 observation 写入历史前截断，保头尾 1500+1500。
+
+        PoC 输出的铁证标记（退出码/VULNERABILITY_CONFIRMED）通常在尾部，保尾防丢证据；
+        头部保留命令/目标上下文。
+        """
+        text = str(observation or "")
+        try:
+            from app.services.agent.config import get_agent_config
+            max_chars = int(get_agent_config().observation_history_max_chars)
+        except Exception:
+            max_chars = 4000
+        if len(text) <= max_chars:
+            return text
+        head, tail = 1500, 1500
+        omitted = len(text) - head - tail
+        return (
+            text[:head]
+            + f"\n...[observation truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
+        )
+
+    def _compress_history_if_needed(self) -> None:
+        """V6 B5（REQ-VE-5）：累计历史超软上限时，最旧一半压缩为一条摘要消息。
+
+        保留 system 提示与最近一半消息；摘要保留工具调用结论要点
+        （退出码/铁证标记/最终答案行）。完整证据不受影响（在 sandbox_attempts 与索引中）。
+        """
+        history = getattr(self, "_conversation_history", None) or []
+        try:
+            from app.services.agent.config import get_agent_config
+            soft_limit = int(get_agent_config().history_soft_limit_messages)
+        except Exception:
+            soft_limit = 40
+        if len(history) <= soft_limit:
+            return
+        # history[0] 为 system 提示；压缩其后的最旧一半 user/assistant 消息
+        compressible = history[1:]
+        half = len(compressible) // 2
+        if half <= 0:
+            return
+        oldest, kept = compressible[:half], compressible[half:]
+        key_markers = (
+            "VULNERABILITY_CONFIRMED", "退出码", "INJECTABLE", "Final Answer",
+            "not found", "FALSE_POSITIVE", "Verification Complete",
+        )
+        parts = []
+        for msg in oldest:
+            content = str(msg.get("content") or "")
+            key_lines = [
+                ln.strip() for ln in content.splitlines()
+                if any(k.lower() in ln.lower() for k in key_markers)
+            ]
+            digest = " | ".join(key_lines[:3])[:300] or content.strip()[:120]
+            parts.append(f"[{msg.get('role', '?')}] {digest}")
+        summary = (
+            f"[会话压缩] 早期 {len(oldest)} 条消息已压缩为摘要（保留工具结论要点，"
+            f"完整证据已记录在 sandbox_attempts）：\n" + "\n".join(parts)
+        )
+        self._conversation_history = [history[0], {"role": "user", "content": summary}] + kept
 
     def _finalize_findings_without_final_answer(self, findings_to_verify: List[Dict]) -> List[Dict]:
         """V6 B3（REQ-VE-3）：LLM 空 Final Answer 时的回退收口。

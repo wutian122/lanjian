@@ -437,3 +437,52 @@ def test_template_source_missing_exits_without_confirmation():
         script = agent._gen_sandbox_command(vuln_type, "app.py", 10, "t", 0)["input"]["command"]
         assert "VULNERABILITY_CONFIRMED(STATIC)" in script, f"{vuln_type} 演示确认须为 STATIC 变体"
         assert "VULNERABILITY_CONFIRMED:" not in script, f"{vuln_type} 模板不得输出裸确认标记"
+
+
+# ============ V6 B5（REQ-VE-5）: 会话上下文有界 ============
+
+def test_observation_truncated_head_and_tail():
+    """单条 observation 超 4000 字符 → 截断保头尾 1500+1500 + 省略标注。"""
+    agent = _make_agent()
+    long_obs = "A" * 2000 + "B" * 2000 + "C" * 2000  # 6000 字符
+    truncated = agent._truncate_observation_for_history(long_obs)
+    assert len(truncated) < 3600, "超长 observation 必须被截断"
+    assert truncated.startswith("A" * 1500), "头部 1500 字符保留"
+    assert truncated.endswith("C" * 1500), "尾部 1500 字符保留（铁证标记通常在尾部）"
+    assert "truncated" in truncated.lower()
+
+
+def test_history_compressed_over_soft_limit():
+    """历史超 40 条 → 最旧一半压缩为一条摘要消息，总数回落到阈值内。"""
+    agent = _make_agent()
+    agent._conversation_history = [{"role": "system", "content": "sys"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} " + "x" * 100}
+        for i in range(60)
+    ]
+    agent._compress_history_if_needed()
+    h = agent._conversation_history
+    assert len(h) <= 40, "压缩后历史必须回到软上限内"
+    assert h[0]["role"] == "system", "system 提示不参与压缩"
+    assert any("压缩" in str(m.get("content")) for m in h[:3]), "必须存在摘要消息"
+
+
+def test_final_answer_parseable_after_long_session():
+    """60 轮模拟长 observation：历史上界成立，末轮 Final Answer 文本仍可解析。"""
+    import re as _re
+
+    agent = _make_agent()
+    agent._conversation_history = [{"role": "system", "content": "sys"}]
+    final_text = None
+    for i in range(60):
+        obs = "O" * 5000 + f"\nVULNERABILITY_CONFIRMED(STATIC): round {i}\n"
+        agent._conversation_history.append({"role": "assistant", "content": f"Thought {i}"})
+        agent._conversation_history.append({
+            "role": "user",
+            "content": "Observation:\n" + agent._truncate_observation_for_history(obs),
+        })
+        agent._compress_history_if_needed()
+        if i == 59:
+            final_text = 'Final Answer: {"findings": []}'
+    assert len(agent._conversation_history) <= 40, "60 轮后历史上界仍成立"
+    m = _re.search(r"Final Answer:\s*(\{.*\})", final_text)
+    assert m and m.group(1) == '{"findings": []}', "Final Answer 可正常解析"

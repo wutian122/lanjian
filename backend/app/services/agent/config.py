@@ -93,6 +93,14 @@ class AgentConfig(BaseSettings):
         default=3,
         description="R4: 连续被'无沙箱证据'门禁拒绝 finish 的最大次数，达上限后停止强制重派 verification（根治 token 黑洞循环）"
     )
+    observation_history_max_chars: int = Field(
+        default=4000,
+        description="B5: 单条 observation 写入 conversation_history 的截断阈值（超出时保头尾 1500+1500 并加省略标注）"
+    )
+    history_soft_limit_messages: int = Field(
+        default=40,
+        description="B5: verification 会话历史消息数软上限（超出时压缩最旧一半为摘要消息）"
+    )
 
     # ============ Agent Timeouts ============
     orchestrator_timeout_seconds: int = Field(
