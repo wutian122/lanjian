@@ -929,6 +929,9 @@ class VerificationAgent(BaseAgent):
         self._steps = []
         self._sandbox_exec_calls = 0
         self._sandbox_attempts = []
+        # V6 B4（REQ-VE-4）：运行时证据按 finding_id 建索引（确定性执行显式直写，
+        # 绑定/回填消费索引，正确性不依赖命令文本注释反解）
+        self._runtime_attempts_by_finding_id: Dict[str, List[Dict[str, Any]]] = {}
         self._backfill_used_indices = set()
         # B2 弹性总上限：按 finding 数量动态调整，避免队尾饿死
         n_findings = len(findings_to_verify)
@@ -1511,21 +1514,31 @@ class VerificationAgent(BaseAgent):
         )
 
 
-    def _record_sandbox_attempt(self, action_input: dict[str, Any], observation: str) -> None:
-        """Persist structured evidence for sandbox_exec calls made during this verification run."""
+    def _record_sandbox_attempt(
+        self, action_input: dict[str, Any], observation: str,
+        finding_id: Optional[str] = None,
+    ) -> None:
+        """Persist structured evidence for sandbox_exec calls made during this verification run.
+
+        V6 B4（REQ-VE-4）：finding_id 可由确定性执行路径显式传入（直写索引），
+        未传时保留命令注释反解 + 反查两条既有路径（LLM 路径兼容）。
+        """
         if not hasattr(self, "_sandbox_attempts"):
             self._sandbox_attempts = []
+        if not hasattr(self, "_runtime_attempts_by_finding_id"):
+            self._runtime_attempts_by_finding_id = {}
 
         command = (action_input or {}).get("command") or ""
 
-        # Opt-1: Parse finding_id from command comment
-        finding_id_match = re.search(r"# FINDING_ID:(\S+)", command)
-        finding_id = finding_id_match.group(1) if finding_id_match else None
-
-        # P4 修复：LLM 自写 PoC 无 # FINDING_ID 注释时，反查 findings 显式绑定 finding_id
-        # 不再依赖命令文本注释，用命令中的 file_path/target_ref 反查 _sandbox_finding_id
+        # Opt-1: Parse finding_id from command comment（显式传入优先，注释仅作 LLM 路径兜底）
         if finding_id is None:
-            finding_id = self._resolve_finding_id_from_command(command)
+            finding_id_match = re.search(r"# FINDING_ID:(\S+)", command)
+            finding_id = finding_id_match.group(1) if finding_id_match else None
+
+            # P4 修复：LLM 自写 PoC 无 # FINDING_ID 注释时，反查 findings 显式绑定 finding_id
+            # 不再依赖命令文本注释，用命令中的 file_path/target_ref 反查 _sandbox_finding_id
+            if finding_id is None:
+                finding_id = self._resolve_finding_id_from_command(command)
 
         exit_code = None
         exit_match = re.search(r"退出码:\s*(-?\d+)", observation or "")
@@ -1562,20 +1575,24 @@ class VerificationAgent(BaseAgent):
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
 
-        self._sandbox_attempts.append(
-            {
-                "tool": "sandbox_exec",
-                "success": success,
-                "exit_code": exit_code,
-                "command": command,
-                "target_ref": target_ref,
-                "language": (action_input or {}).get("language"),
-                "network_enabled": bool((action_input or {}).get("network_enabled", False)),
-                "evidence_summary": (observation or "")[:5000],
-                "finding_id": finding_id,
-                "fabricated": fabricated,
-            }
-        )
+        attempt = {
+            "tool": "sandbox_exec",
+            "success": success,
+            "exit_code": exit_code,
+            "command": command,
+            "target_ref": target_ref,
+            "language": (action_input or {}).get("language"),
+            "network_enabled": bool((action_input or {}).get("network_enabled", False)),
+            "evidence_summary": (observation or "")[:5000],
+            "finding_id": finding_id,
+            "fabricated": fabricated,
+        }
+        self._sandbox_attempts.append(attempt)
+        # V6 B4（REQ-VE-4）：双写——按 finding_id 登记运行时证据索引，
+        # 绑定/回填消费索引（同一对象引用，避免双计）
+        if finding_id:
+            self._runtime_attempts_by_finding_id.setdefault(str(finding_id), []).append(attempt)
+        return attempt
 
     def _resolve_finding_id_from_command(self, command: str) -> Optional[str]:
         """P4 修复：LLM 自写 PoC（无 # FINDING_ID 注释）时，从命令文本反查 finding_id。
@@ -1681,6 +1698,32 @@ class VerificationAgent(BaseAgent):
             }
         )
 
+    @staticmethod
+    def _attempt_dedupe_key(attempt: dict[str, Any]) -> tuple:
+        """V6 B4：attempt 语义去重键（命令+退出码+证据摘要前缀）。"""
+        return (
+            str(attempt.get("command") or "")[:200],
+            attempt.get("exit_code"),
+            str(attempt.get("evidence_summary") or "")[:200],
+        )
+
+    def _merge_attempts_deduped(
+        self, existing: List[dict[str, Any]], incoming: List[dict[str, Any]]
+    ) -> List[dict[str, Any]]:
+        """V6 B4（REQ-VE-4）：合并 attempt 并按语义键去重，防止索引/扁平列表/重入绑定双计。"""
+        seen = {
+            self._attempt_dedupe_key(a) for a in existing if isinstance(a, dict)
+        }
+        merged = list(existing)
+        for a in incoming:
+            if not isinstance(a, dict):
+                continue
+            key = self._attempt_dedupe_key(a)
+            if key not in seen:
+                seen.add(key)
+                merged.append(a)
+        return merged
+
     def _attach_runtime_sandbox_attempts(self, finding: dict[str, Any]) -> None:
         """Attach runtime sandbox evidence when the LLM omitted sandbox_attempts in Final Answer.
 
@@ -1700,12 +1743,18 @@ class VerificationAgent(BaseAgent):
         # V6 B1（REQ-VE-1）：绑定层不再以 success=True 为前置——失败 attempt 也如实绑定，
         # 成败判定交给 compute_verification_status（有失败尝试 → not_reproducible 而非
         # needs_context）。生产任务 5a1f7ab6：21 次执行因该前置过滤 0 证据落库。
+        # V6 B4（REQ-VE-4）：优先消费 finding_id 索引（确定性执行直写，反解失败也齐全），
+        # 索引缺失时回退扁平列表过滤；合并前按语义键去重防止双计。
         finding_id = finding.get("_sandbox_finding_id")
         if finding_id:
-            id_matched = [a for a in attempts
-                          if a.get("finding_id") == finding_id]
+            index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
+            id_matched = index.get(str(finding_id)) or [
+                a for a in attempts if a.get("finding_id") == finding_id
+            ]
             if id_matched:
-                finding["sandbox_attempts"] = existing_attempts + id_matched
+                finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                    existing_attempts, id_matched
+                )
                 logger.info(
                     f"[{self.name}] ID-based sandbox match: finding_id={finding_id} "
                     f"-> {len(id_matched)} attempts"
@@ -2137,7 +2186,7 @@ class VerificationAgent(BaseAgent):
                     finding_idx = self._parse_finding_index_from_command(command)
                     if finding_idx is not None:
                         self._verified_finding_indices.add(finding_idx)
-                self._record_sandbox_attempt(cmd_input, result)
+                self._record_sandbox_attempt(cmd_input, result, finding_id=sc.get("finding_id"))
                 executed += 1
                 logger.info(
                     f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"

@@ -245,3 +245,97 @@ def test_exit0_with_stderr_traceback_still_fails():
         "Sandbox result\n退出码: 0\n标准输出:\n```\nVULNERABILITY_CONFIRMED: x\n```\n标准错误:\n```\nTraceback ...\n```",
     )
     assert agent._sandbox_attempts[0]["success"] is False
+
+
+# ============ V6 B4（REQ-VE-4）: 确定性执行按 finding_id 直写索引 ============
+
+def test_record_attempt_with_explicit_finding_id_registers_index():
+    """显式 finding_id 直写索引：命令文本无 # FINDING_ID 注释也能登记（不依赖命令文本解析）。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 0\nVULNERABILITY_CONFIRMED: sql injection verified",
+        finding_id="f-det-1",
+    )
+    idx = agent._runtime_attempts_by_finding_id
+    assert "f-det-1" in idx, "显式 finding_id 必须登记到运行时证据索引"
+    assert len(idx["f-det-1"]) == 1
+    assert len(agent._sandbox_attempts) == 1, "扁平列表同步双写"
+
+
+def test_deterministic_run_registers_all_finding_ids():
+    """确定性执行 N 条命令 → 索引 N 个 finding_id 全部登记且内容不依赖命令注释。"""
+    import asyncio
+
+    agent = _make_agent()
+    agent._sandbox_exec_calls = 0
+    agent._sandbox_exec_attempts = 0
+    agent._sandbox_exec_success = 0
+    agent._verified_finding_indices = set()
+    agent._cancelled = False
+    agent._cancel_callback = None
+    agent._get_sandbox_manager = lambda: None
+
+    async def _fake_exec(tool, cmd_input):
+        return "Sandbox result\n退出码: 0\nVULNERABILITY_CONFIRMED: demo"
+
+    async def _fake_emit(kind, msg):
+        pass
+
+    agent.execute_tool = _fake_exec
+    agent.emit_event = _fake_emit
+    commands = [
+        {"finding_id": f"f-{i}", "input": {"command": f"python3 /tmp/poc_{i}.py", "timeout": 1}}
+        for i in range(3)
+    ]
+    asyncio.run(agent._run_deterministic_sandbox_commands(commands, None))
+    idx = agent._runtime_attempts_by_finding_id
+    assert set(idx.keys()) == {"f-0", "f-1", "f-2"}, "N 条命令 → N 个 finding_id 均有索引记录"
+
+
+def test_binding_consumes_index_full_set():
+    """绑定层 ID 分支优先消费索引：反解失败（扁平列表无 id）的 attempt 也能按索引全量绑定。"""
+    agent = _make_agent()
+    att_ok = {
+        "success": True,
+        "exit_code": 0,
+        "evidence_summary": "VULNERABILITY_CONFIRMED: sqli",
+        "target_ref": "console/AppController.java:113",
+        "command": "python3 /tmp/poc_0.py",
+        "finding_id": "f-idx-1",
+    }
+    att_fail = {
+        "success": False,
+        "exit_code": 1,
+        "evidence_summary": "Traceback in stderr",
+        "target_ref": "console/AppController.java:113",
+        "command": "python3 /tmp/poc_0.py --retry",
+        "finding_id": None,  # 命令文本反解失败：扁平列表里无 finding_id
+    }
+    agent._sandbox_attempts = [att_ok, att_fail]
+    # 确定性执行按显式 finding_id 登记（含反解失败的那条）
+    agent._runtime_attempts_by_finding_id = {"f-idx-1": [att_ok, att_fail]}
+    finding = _finding(_sandbox_finding_id="f-idx-1")
+    agent._attach_runtime_sandbox_attempts(finding)
+    assert len(finding["sandbox_attempts"]) == 2, (
+        "索引消费必须全量：反解失败的 attempt 也要按索引绑定（扁平过滤只得 1 条是缺陷）"
+    )
+
+
+def test_attach_id_branch_no_double_count_on_rebind():
+    """同一 finding 重复进入 ID 绑定分支（R2 全量绑定重入等）不得重复附加同一批 attempt。"""
+    agent = _make_agent()
+    att = {
+        "success": True,
+        "exit_code": 0,
+        "evidence_summary": "ran poc, no vuln marker",
+        "target_ref": "console/AppController.java:113",
+        "command": "python3 /tmp/poc_0.py",
+        "finding_id": "f-dup-1",
+    }
+    agent._sandbox_attempts = [att]
+    agent._runtime_attempts_by_finding_id = {"f-dup-1": [att]}
+    finding = _finding(_sandbox_finding_id="f-dup-1")
+    agent._attach_runtime_sandbox_attempts(finding)
+    agent._attach_runtime_sandbox_attempts(finding)
+    assert len(finding["sandbox_attempts"]) == 1, "语义重复的 attempt 必须去重，不得双计"
