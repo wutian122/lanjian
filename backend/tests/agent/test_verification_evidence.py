@@ -163,3 +163,85 @@ def test_evidence_bound_for_all_findings_including_llm_omitted():
     f2_merged = [vf for vf in verified if vf.get("file_path") == "app/Other.java"][0]
     assert f2_merged.get("sandbox_attempts")
     assert f2_merged["verification_status"] == "confirmed"
+
+
+# ============ V6 B1（REQ-VE-1）: 绑定层取消 success 前置 ============
+
+def test_failed_attempt_still_bound_by_finding_id():
+    """REQ-VE-1 Scenario 2：同 finding_id 的全部 attempt 均绑定，不过滤 success。"""
+    agent = _make_agent()
+    agent._sandbox_attempts = [
+        {
+            "tool": "sandbox_exec",
+            "success": False,
+            "exit_code": 1,
+            "command": "python3 /tmp/poc_0.py",
+            "target_ref": "console/AppController.java:113",
+            "evidence_summary": "payload executed but assertion failed",
+            "finding_id": "f1",
+        }
+    ]
+    finding = _finding(_sandbox_finding_id="f1")
+    agent._attach_runtime_sandbox_attempts(finding)
+    assert finding.get("sandbox_attempts"), "失败 attempt 必须如实绑定，不得被 success 前置过滤丢弃"
+
+
+def test_all_failed_attempts_lead_to_not_reproducible():
+    """REQ-VE-1 Scenario 1：全部尝试失败 → 绑定后判 not_reproducible 而非 needs_context。"""
+    agent = _make_agent()
+    agent._sandbox_attempts = [
+        {
+            "tool": "sandbox_exec",
+            "success": False,
+            "exit_code": 1,
+            "command": "python3 /tmp/poc_0.py",
+            "target_ref": "console/AppController.java:113",
+            "evidence_summary": "Traceback in stderr, no marker",
+            "finding_id": "f1",
+        }
+    ]
+    finding = _finding(_sandbox_finding_id="f1")
+    agent._attach_runtime_sandbox_attempts(finding)
+    normalized = agent._normalize_verification_outcome(finding)
+    assert finding.get("sandbox_attempts"), "证据必须落库（非 NULL）"
+    assert normalized["verification_status"] == "not_reproducible"
+    assert normalized["is_verified"] is False
+
+
+# ============ V6 B2（REQ-VE-2）: 失败标记收窄 ============
+
+def test_exit0_with_evidence_and_incidental_error_marker_succeeds():
+    """REQ-VE-2 Scenario 1：exit 0 + 铁证标记 + 正文 incidental 'Error:' 子串 → success=True。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 0\nSource: 4039 chars loaded\n"
+        "payload=1' OR '1'='1 rows=3 -> INJECTABLE\n"
+        "VULNERABILITY_CONFIRMED: SQL injection dynamically verified\n"
+        "note: some frameworks print Error: on recoverable path",
+    )
+    assert len(agent._sandbox_attempts) == 1
+    a = agent._sandbox_attempts[0]
+    assert a["success"] is True, "exit 0 且含铁证标记，不得因 incidental 'Error:' 子串被误杀"
+    assert a.get("fabricated") in (None, False)
+
+
+def test_exit1_with_traceback_fails():
+    """REQ-VE-2 Scenario 2：exit 1 + stderr 段 Traceback → success=False（真失败仍识别）。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 1\n标准输出:\n```\nok\n```\n标准错误:\n```\n"
+        "Traceback (most recent call last):\n  File \"/tmp/poc_0.py\", line 3\nAttributeError: 'list' object has no attribute 'add'\n```",
+    )
+    assert agent._sandbox_attempts[0]["success"] is False
+
+
+def test_exit0_with_stderr_traceback_still_fails():
+    """exit 0 但 stderr 段含 Traceback（沙箱包装异常）→ 仍判失败（stderr 段内标记生效）。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_0.py"},
+        "Sandbox result\n退出码: 0\n标准输出:\n```\nVULNERABILITY_CONFIRMED: x\n```\n标准错误:\n```\nTraceback ...\n```",
+    )
+    assert agent._sandbox_attempts[0]["success"] is False

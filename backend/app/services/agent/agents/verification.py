@@ -28,6 +28,35 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_FAILURE_MARKERS = ("工具执行失败", "Traceback", "Error:", "Exception:", "\n失败:", "\n错误:")
 
+# V6 B2（REQ-VE-2）：子串级失败标记仅在特定条件下生效，与工具级/行级标记区分
+_SUB_FAILURE_MARKERS = ("Traceback", "Error:", "Exception:")
+
+
+def _has_sandbox_failure_marker(observation: str, exit_code) -> bool:
+    """V6 B2（REQ-VE-2）失败标记收窄判定。
+
+    - "工具执行失败" 是工具级失败前缀，保留全文匹配；
+    - "\\n失败:"/"\\n错误:" 是行级失败标记，保留全文匹配；
+    - "Traceback"/"Error:"/"Exception:" 是子串级标记，仅在 exit_code!=0
+      或位于 stderr/错误段（"标准错误:"```...``` 与 "错误:" 行）内时生效，
+      防止 exit 0 且含铁证标记的成功输出被正文里 incidental 的 "Error:"
+      子串误杀（生产任务 5a1f7ab6：21 次执行 0 证据的直接原因之一）。
+    """
+    obs = observation or ""
+    if "工具执行失败" in obs or "\n失败:" in obs or "\n错误:" in obs:
+        return True
+    stderr_section = ""
+    m = re.search(r"标准错误:\s*```[^\n]*\n(.*?)```", obs, re.DOTALL)
+    if m:
+        stderr_section = m.group(1)
+    err_line = re.search(r"^错误:.*$", obs, re.MULTILINE)
+    if err_line:
+        stderr_section += "\n" + err_line.group(0)
+    if any(mk in stderr_section for mk in _SUB_FAILURE_MARKERS):
+        return True
+    exit_bad = exit_code is not None and exit_code != 0
+    return exit_bad and any(mk in obs for mk in _SUB_FAILURE_MARKERS)
+
 # R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
 # LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
 FABRICATION_MARKERS = (
@@ -1506,7 +1535,7 @@ class VerificationAgent(BaseAgent):
             except ValueError:
                 exit_code = None
 
-        has_failure_marker = any(marker in (observation or "") for marker in SANDBOX_FAILURE_MARKERS)
+        has_failure_marker = _has_sandbox_failure_marker(observation or "", exit_code)
         # ✅ P2-1: 增加语义检查 - 仅 exit_code==0 不够，还需检查 PoC 输出是否包含漏洞触发证据
         # 注意：marker 与 observation 都转小写比较，避免大小写不匹配漏判
         obs_lower = (observation or "").lower()
@@ -1616,7 +1645,7 @@ class VerificationAgent(BaseAgent):
             except ValueError:
                 exit_code = None
 
-        has_failure_marker = any(marker in (observation or "") for marker in SANDBOX_FAILURE_MARKERS)
+        has_failure_marker = _has_sandbox_failure_marker(observation or "", exit_code)
         # 修复：exit_code None（regex 未匹配）时，仅依据失败标记判定，避免 None==0 假阴性
         if exit_code is None:
             success = not has_failure_marker
@@ -1668,11 +1697,13 @@ class VerificationAgent(BaseAgent):
         attempts = getattr(self, "_sandbox_attempts", [])
 
         # Opt-1: ID-based matching (precise, before fuzzy)
+        # V6 B1（REQ-VE-1）：绑定层不再以 success=True 为前置——失败 attempt 也如实绑定，
+        # 成败判定交给 compute_verification_status（有失败尝试 → not_reproducible 而非
+        # needs_context）。生产任务 5a1f7ab6：21 次执行因该前置过滤 0 证据落库。
         finding_id = finding.get("_sandbox_finding_id")
         if finding_id:
             id_matched = [a for a in attempts
-                          if a.get("finding_id") == finding_id
-                          and a.get("success") is True]
+                          if a.get("finding_id") == finding_id]
             if id_matched:
                 finding["sandbox_attempts"] = existing_attempts + id_matched
                 logger.info(
