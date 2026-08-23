@@ -253,3 +253,81 @@ def test_handoff_verification_fallback_branch_uses_all_findings():
     titles = [f["title"] for f in handoff.key_findings]
     assert set(titles) == {"early-sqli", "latest-xss"}
     assert titles == ["latest-xss", "early-sqli"]
+
+
+# ============ T6 (REQ-VC-2): R4 放行前程序化补验 ============
+
+def _make_force_verify_agent():
+    agent = _make_agent()
+    agent._force_verification_dispatched = False
+    agent._dispatched_tasks = {}
+    return agent
+
+
+async def test_force_verification_dispatched_on_release_with_unverified(monkeypatch):
+    """T6 (REQ-VC-2): R4 达上限放行且 verification 从未调度、存在未验证 finding → 程序化补验调度一次。"""
+    agent = _make_force_verify_agent()
+    agent._finish_gate_rejections = 3  # >= max_redispatch，放行场景
+    agent._agent_results = {}  # verification 从未调度
+    agent._all_findings = [
+        {"title": "unverified-sqli", "verification_status": "needs_context"},
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+
+    assert len(calls) == 1
+    assert calls[0]["agent"] == "verification"
+    assert "系统收口" in calls[0]["task"]
+    assert "1 个未验证漏洞" in calls[0]["context"]
+    assert agent._force_verification_dispatched is True
+
+
+async def test_force_verification_idempotent(monkeypatch):
+    """T6 (REQ-VC-2): 同场景第二次调用不重复调度（一次性标志防抖）。"""
+    agent = _make_force_verify_agent()
+    agent._all_findings = [
+        {"title": "unverified-sqli", "verification_status": "needs_context"},
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+    await agent._maybe_dispatch_force_verification()
+
+    assert len(calls) == 1
+
+
+async def test_force_verification_skipped_when_all_verified(monkeypatch):
+    """T6 (REQ-VC-2): 全部 finding 已确认且有沙箱证据 → 不触发补验调度。"""
+    agent = _make_force_verify_agent()
+    agent._all_findings = [
+        {
+            "title": "confirmed-xss",
+            "verification_status": "confirmed",
+            "sandbox_attempts": [{"success": True, "exit_code": 0}],
+        },
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+
+    assert calls == []
+    assert agent._force_verification_dispatched is False

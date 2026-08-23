@@ -270,6 +270,8 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_hot_files: list[str] = []
         self._semgrep_findings: list[dict[str, Any]] = []
         self._full_verification_dispatched: bool = False
+        # T6 (REQ-VC-2): R4 放行前程序化补验的一次性标志（防重复调度）
+        self._force_verification_dispatched: bool = False
         # R4: 连续被"无沙箱证据"门禁拒绝 finish 的次数；达上限后停止强制重派
         self._finish_gate_rejections: int = 0
         # R6: 门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations
@@ -474,6 +476,31 @@ class OrchestratorAgent(BaseAgent):
             "gate": gate,
             "reason": reason,
             "time": datetime.now(timezone.utc).isoformat(),
+        })
+
+    async def _maybe_dispatch_force_verification(self) -> None:
+        """T6 (REQ-VC-2): R4 放行前的程序化收口——补发一次 verification 调度。
+
+        当验证门禁连续拒绝达上限即将放行收尾时，若仍存在未验证 finding，
+        程序化补发一次 verification 调度（LLM 可能已放弃重派），兜底不丢未验证项。
+        判定与全量验证门禁同款：非 confirmed/static_confirmed 等终态，或整体无有效
+        沙箱证据，即视为未验证；一次性标志 _force_verification_dispatched 防重复。
+        """
+        if self._force_verification_dispatched:
+            return
+        unverified = [
+            f for f in self._all_findings
+            if f.get("verification_status")
+            not in ("confirmed", "static_confirmed", "not_reproducible", "false_positive")
+            or not self._has_valid_sandbox_evidence()
+        ]
+        if not unverified:
+            return
+        self._force_verification_dispatched = True
+        await self._dispatch_agent({
+            "agent": "verification",
+            "task": "系统收口：验证剩余未验证漏洞",
+            "context": f"{len(unverified)} 个未验证漏洞",
         })
 
     def _evaluate_current_coverage(self) -> Any:
@@ -939,6 +966,8 @@ Action Input: {{"参数": "值"}}
                             "放行完成",
                             f"已连续拒绝 {max_redispatch} 次仍无沙箱证据，停止强制重派，按当前结果收尾",
                         )
+                        # T6 (REQ-VC-2): 放行前程序化收口——剩余未验证漏洞补发一次 verification 调度
+                        await self._maybe_dispatch_force_verification()
                         self._conversation_history.append({
                             "role": "user",
                             "content": (
