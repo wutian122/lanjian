@@ -1,6 +1,6 @@
 name: lanjian
 
-# 镜像锁版本：v6.0.0。变更前先 git tag + 更新两台服务器并验证。
+# 镜像锁版本：v6.0.1（backend）/ v6.0.0（frontend）。变更前先 git tag + 更新两台服务器并验证。
 
 services:
   db:
@@ -34,7 +34,7 @@ services:
       - lanjian-network
 
   db-migrate:
-    image: wutian449/lanjian-backend:v6.0.0
+    image: wutian449/lanjian-backend:v6.0.1
     restart: "no"
     env_file:
       - ./backend/.env
@@ -52,7 +52,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v6.0.0
+    image: wutian449/lanjian-backend:v6.0.1
     restart: unless-stopped
     env_file:
       - ./backend/.env
