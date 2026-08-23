@@ -846,8 +846,9 @@ class VerificationAgent(BaseAgent):
                 data={"findings": [], "verified_count": 0, "note": "未收到待验证的发现"},
             )
         
-        # 限制数量
-        findings_to_verify = findings_to_verify[:20]
+        # REQ-VC-1：不再按固定数量截断待验清单——全部传入 finding 均生成确定性 PoC 并执行，
+        # 规模由弹性迭代预算（per_finding*n 上限）与确定性执行线性成本约束。
+        # 历史缺陷：[:20] 硬截断把多轮 analysis 的尾部 finding（多为早期轮次）砍掉 → 零证据。
         
         await self.emit_event(
             "info",

@@ -559,3 +559,15 @@ def test_template_sink_assertion_gating():
         s = agent._gen_sandbox_command(vt, "app.py", 10, "t", 0)["input"]["command"]
         assert "Source not found" in s and "sys.exit(1)" in s, f"{vt} 须读源码断言（源码缺失 exit 1）"
         assert "NO_SINK" in s, f"{vt} 须有 NO_SINK 分支"
+
+
+# ============ 验证完整性 w1（REQ-VC-1）：全量送验 ============
+
+def test_build_commands_covers_all_findings():
+    """25 个 finding 生成 25 条确定性 PoC 命令（不再有 [:20] 截断），且每命令唯一 finding_id。"""
+    agent = _make_agent()
+    agent._all_findings = [_finding(file_path=f"f{i}.java", line_start=i) for i in range(25)]
+    cmds = agent._build_sandbox_commands(agent._all_findings)
+    assert len(cmds) == 25, f"应生成 25 条命令，实际 {len(cmds)}"
+    fids = {c.get("finding_id") for c in cmds}
+    assert len(fids) == 25, "每条命令携带唯一 finding_id"
