@@ -124,8 +124,31 @@ def test_has_valid_sandbox_evidence_accepts_real_evidence():
     assert agent._has_valid_sandbox_evidence() is True
 
 
-# ============ R5: Bug D 全量验证门禁判定修正 ============
+def test_static_confirmed_without_sandbox_evidence_is_invalid():
+    """T8 (REQ-VP-2): static_confirmed 且无 sandbox_attempts → 不视为有效沙箱证据。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "SQLi", "verification_status": "static_confirmed"},
+    ]
+    assert agent._has_valid_sandbox_evidence() is False
 
+
+def test_static_confirmed_with_sandbox_evidence_is_valid():
+    """T8 (REQ-VP-2): static_confirmed 且有 sandbox_attempts → 视为有效沙箱证据。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "title": "SQLi",
+            "verification_status": "static_confirmed",
+            "sandbox_attempts": [
+                {"success": True, "exit_code": 0, "evidence_summary": "VULNERABILITY_CONFIRMED"}
+            ],
+        }
+    ]
+    assert agent._has_valid_sandbox_evidence() is True
+
+
+# ============ R5: Bug D 全量验证门禁判定修正 ============
 def test_bugD_gate_treats_needs_context_as_unverified():
     """R5: needs_context 状态被视为未验证 → unverified_findings 非空（原逻辑被默认值击穿）。"""
     agent = _make_agent()
@@ -172,3 +195,221 @@ def test_record_gate_observation_accumulates():
     assert "覆盖率" in agent._gate_observations[1]["reason"]
     # 每条都带时间戳
     assert all("time" in obs for obs in agent._gate_observations)
+
+
+# ============ T5 (REQ-VC-1): 交接数据源改用 _all_findings 全量 ============
+
+def _make_analysis_handoff(key_findings):
+    from app.services.agent.agents.base import TaskHandoff
+    return TaskHandoff(
+        from_agent="analysis",
+        to_agent="verification",
+        summary="分析完成",
+        work_completed=["完成代码深度分析"],
+        key_findings=key_findings,
+        context_data={},
+    )
+
+
+def test_handoff_verification_priority_branch_uses_all_findings():
+    """T5 (REQ-VC-1): 优先分支——verification 交接 key_findings 改用 _all_findings 全量（含早期轮 finding）。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "early-sqli", "severity": "low", "file_path": "a.py"},
+        {"title": "latest-xss", "severity": "critical", "file_path": "b.py"},
+    ]
+    # analysis_handoff 只携带最新轮 finding（早期轮 finding 丢失正是本 bug 根因）
+    agent._agent_handoffs = {
+        "analysis": _make_analysis_handoff(
+            [{"title": "latest-xss", "severity": "critical", "file_path": "b.py"}]
+        )
+    }
+    agent._agent_results = {}
+
+    handoff = agent._build_handoff_for_agent("verification", "验证漏洞", "context")
+    assert handoff is not None
+    titles = [f["title"] for f in handoff.key_findings]
+    # 全量来源：包含早期轮 finding，且按 severity 排序（critical 在前）
+    assert set(titles) == {"early-sqli", "latest-xss"}
+    assert titles == ["latest-xss", "early-sqli"]
+
+
+def test_handoff_verification_fallback_branch_uses_all_findings():
+    """T5 (REQ-VC-1): 回退分支——无 analysis handoff 时 key_findings 亦用 _all_findings 全量。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "early-sqli", "severity": "low", "file_path": "a.py"},
+        {"title": "latest-xss", "severity": "high", "file_path": "b.py"},
+    ]
+    agent._agent_handoffs = {}
+    # analysis 最后一轮结果只报 1 条，早期轮 finding 仅存在于 _all_findings
+    agent._agent_results = {
+        "recon": {"tech_stack": {}, "entry_points": []},
+        "analysis": {"findings": [{"title": "latest-xss", "severity": "high", "file_path": "b.py"}]},
+    }
+
+    handoff = agent._build_handoff_for_agent("verification", "验证漏洞", "context")
+    assert handoff is not None
+    titles = [f["title"] for f in handoff.key_findings]
+    assert set(titles) == {"early-sqli", "latest-xss"}
+    assert titles == ["latest-xss", "early-sqli"]
+
+
+# ============ T6 (REQ-VC-2): R4 放行前程序化补验 ============
+
+def _make_force_verify_agent():
+    agent = _make_agent()
+    agent._force_verification_dispatched = False
+    agent._dispatched_tasks = {}
+    return agent
+
+
+async def test_force_verification_dispatched_on_release_with_unverified(monkeypatch):
+    """T6 (REQ-VC-2): R4 达上限放行且 verification 从未调度、存在未验证 finding → 程序化补验调度一次。"""
+    agent = _make_force_verify_agent()
+    agent._finish_gate_rejections = 3  # >= max_redispatch，放行场景
+    agent._agent_results = {}  # verification 从未调度
+    agent._all_findings = [
+        {"title": "unverified-sqli", "verification_status": "needs_context"},
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+
+    assert len(calls) == 1
+    assert calls[0]["agent"] == "verification"
+    assert "系统收口" in calls[0]["task"]
+    assert "1 个未验证漏洞" in calls[0]["context"]
+    assert agent._force_verification_dispatched is True
+
+
+async def test_force_verification_idempotent(monkeypatch):
+    """T6 (REQ-VC-2): 同场景第二次调用不重复调度（一次性标志防抖）。"""
+    agent = _make_force_verify_agent()
+    agent._all_findings = [
+        {"title": "unverified-sqli", "verification_status": "needs_context"},
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+    await agent._maybe_dispatch_force_verification()
+
+    assert len(calls) == 1
+
+
+async def test_force_verification_skipped_when_all_verified(monkeypatch):
+    """T6 (REQ-VC-2): 全部 finding 已确认且有沙箱证据 → 不触发补验调度。"""
+    agent = _make_force_verify_agent()
+    agent._all_findings = [
+        {
+            "title": "confirmed-xss",
+            "verification_status": "confirmed",
+            "sandbox_attempts": [{"success": True, "exit_code": 0}],
+        },
+    ]
+    calls = []
+
+    async def fake_dispatch(params):
+        calls.append(params)
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch)
+
+    await agent._maybe_dispatch_force_verification()
+
+    assert calls == []
+    assert agent._force_verification_dispatched is False
+
+
+# ============ T7 (REQ-VC-3): merge-back 按 _sandbox_finding_id 回写 ============
+
+def test_merge_back_matches_by_sandbox_finding_id_despite_path_drift():
+    """T7 (REQ-VC-3): 验证输出 finding 的 file_path 与原件漂移但 _sandbox_finding_id 一致
+    → 更新原对象（保留 id/finding_id），不追加副本。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "id": "finding-1",
+            "finding_id": "fid-1",
+            "_sandbox_finding_id": "f-abc-1",
+            "title": "SSRF",
+            "file_path": "src/old/path.py",
+            "line_start": 10,
+            "vulnerability_type": "ssrf",
+            "verification_status": "needs_context",
+        },
+    ]
+    # 验证输出 finding：file_path 漂移，但 _sandbox_finding_id 与原件一致
+    verification_output = {
+        "_sandbox_finding_id": "f-abc-1",
+        "title": "SSRF",
+        "file_path": "src/new/relocated.py",
+        "line_start": 10,
+        "vulnerability_type": "ssrf",
+        "verification_status": "confirmed",
+        "is_verified": True,
+        "sandbox_attempts": [
+            {"success": True, "exit_code": 0, "evidence_summary": "VULNERABILITY_CONFIRMED"}
+        ],
+    }
+    agent._merge_or_append_finding(verification_output)
+
+    assert len(agent._all_findings) == 1  # 只有一份，不追加副本
+    merged = agent._all_findings[0]
+    assert merged["id"] == "finding-1"  # 保留原 id
+    assert merged["finding_id"] == "fid-1"  # 保留原 finding_id
+    assert merged["_sandbox_finding_id"] == "f-abc-1"
+    assert merged["verification_status"] == "confirmed"
+    assert merged["is_verified"] is True
+    assert len(merged["sandbox_attempts"]) == 1  # 验证证据回写
+
+
+def test_merge_back_appends_when_no_sandbox_id_match():
+    """T7 (REQ-VC-3): _sandbox_finding_id 不匹配任何原件 → 追加为新 finding。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"id": "finding-1", "_sandbox_finding_id": "f-abc-1", "title": "A", "file_path": "a.py"},
+    ]
+    agent._merge_or_append_finding(
+        {"_sandbox_finding_id": "f-xyz-9", "title": "B", "file_path": "b.py"}
+    )
+    assert len(agent._all_findings) == 2
+    assert agent._all_findings[1]["_sandbox_finding_id"] == "f-xyz-9"
+
+
+def test_merge_back_still_dedupes_by_path_without_fid():
+    """T7 (REQ-VC-3): 无 _sandbox_finding_id 时保持原有 file/line/type 模糊去重行为。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "id": "finding-1",
+            "title": "XSS",
+            "file_path": "a.py",
+            "line_start": 5,
+            "vulnerability_type": "xss",
+            "verification_status": "needs_context",
+        },
+    ]
+    agent._merge_or_append_finding(
+        {
+            "title": "XSS",
+            "file_path": "a.py",
+            "line_start": 5,
+            "vulnerability_type": "xss",
+            "verification_status": "confirmed",
+        }
+    )
+    assert len(agent._all_findings) == 1
+    assert agent._all_findings[0]["verification_status"] == "confirmed"
