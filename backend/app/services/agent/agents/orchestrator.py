@@ -1367,6 +1367,14 @@ Action Input: {{"参数": "值"}}
                     except Exception:
                         pass
 
+            # T6 扩展（REQ-VC-2）：主循环退出（轮次/覆盖率耗尽）路径不经过任何验证门禁——
+            # 直接在此收尾前程序化补验一次未验证 finding，杜绝"全量零证据收尾"。
+            # 生产回归 ec0985ad 证实该路径现实存在（analysis 3 轮后轮次耗尽 → 5 finding 全零证据）。
+            try:
+                await self._maybe_dispatch_force_verification()
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Force verification on finalize failed (non-fatal): {e}")
+
             # ✅ P1-1: 攻击链分析 - 评估漏洞组合风险
             attack_chains = []
             if len(self._all_findings) >= 2:
