@@ -60,11 +60,22 @@ def test_has_valid_sandbox_evidence_true_when_sandbox_success():
     assert agent._has_valid_sandbox_evidence() is True
 
 
-def test_has_valid_sandbox_evidence_true_when_static_confirmed():
-    """static_confirmed（代码推理，B3 严标准）→ 有效。"""
+def test_has_valid_sandbox_evidence_true_when_static_confirmed_with_evidence():
+    """REQ-VP-2：static_confirmed 且有沙箱证据 → 有效。"""
+    agent = _make_agent()
+    agent._all_findings = [{
+        "title": "XSS",
+        "verification_status": "static_confirmed",
+        "sandbox_attempts": [{"success": True, "exit_code": 0, "static_evidence": True}],
+    }]
+    assert agent._has_valid_sandbox_evidence() is True
+
+
+def test_has_valid_sandbox_evidence_false_when_static_confirmed_without_evidence():
+    """REQ-VP-2：static_confirmed 但无沙箱证据（免沙箱路径）→ 无效，不击穿 finish 门禁。"""
     agent = _make_agent()
     agent._all_findings = [{"title": "XSS", "verification_status": "static_confirmed"}]
-    assert agent._has_valid_sandbox_evidence() is True
+    assert agent._has_valid_sandbox_evidence() is False
 
 
 def test_has_valid_sandbox_evidence_false_when_confirmed_without_evidence():
