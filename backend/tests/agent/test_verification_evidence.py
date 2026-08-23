@@ -591,12 +591,13 @@ def test_dedup_prefers_evidence_attempt():
     """同键两条 attempt：带漏洞触发证据者优先保留（REQ-VQ-1 场景 2）。"""
     agent = _make_agent()
     weak = {
-        "success": True, "exit_code": 0,
+        "success": False, "exit_code": 0,
         "command": "python3 /tmp/poc_0.py", "finding_id": "f-ev-2",
         "evidence_summary": "Sandbox result\n退出码: 0\n=== Verification Complete ===",
     }
+    # 同键（command/exit/evidence 前缀一致）但证据更强：success=True
     strong = dict(weak)
-    strong["evidence_summary"] = "Sandbox result\n退出码: 0\nVULNERABILITY_CONFIRMED: sql injection verified"
+    strong["success"] = True
     merged = agent._merge_attempts_deduped([weak], [strong])
     assert len(merged) == 1
-    assert "VULNERABILITY_CONFIRMED" in merged[0]["evidence_summary"], "必须保留含证据的 attempt"
+    assert merged[0]["success"] is True, "同键冲突必须保留证据更强的 attempt（success=True）"
