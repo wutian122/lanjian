@@ -331,3 +331,85 @@ async def test_force_verification_skipped_when_all_verified(monkeypatch):
 
     assert calls == []
     assert agent._force_verification_dispatched is False
+
+
+# ============ T7 (REQ-VC-3): merge-back 按 _sandbox_finding_id 回写 ============
+
+def test_merge_back_matches_by_sandbox_finding_id_despite_path_drift():
+    """T7 (REQ-VC-3): 验证输出 finding 的 file_path 与原件漂移但 _sandbox_finding_id 一致
+    → 更新原对象（保留 id/finding_id），不追加副本。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "id": "finding-1",
+            "finding_id": "fid-1",
+            "_sandbox_finding_id": "f-abc-1",
+            "title": "SSRF",
+            "file_path": "src/old/path.py",
+            "line_start": 10,
+            "vulnerability_type": "ssrf",
+            "verification_status": "needs_context",
+        },
+    ]
+    # 验证输出 finding：file_path 漂移，但 _sandbox_finding_id 与原件一致
+    verification_output = {
+        "_sandbox_finding_id": "f-abc-1",
+        "title": "SSRF",
+        "file_path": "src/new/relocated.py",
+        "line_start": 10,
+        "vulnerability_type": "ssrf",
+        "verification_status": "confirmed",
+        "is_verified": True,
+        "sandbox_attempts": [
+            {"success": True, "exit_code": 0, "evidence_summary": "VULNERABILITY_CONFIRMED"}
+        ],
+    }
+    agent._merge_or_append_finding(verification_output)
+
+    assert len(agent._all_findings) == 1  # 只有一份，不追加副本
+    merged = agent._all_findings[0]
+    assert merged["id"] == "finding-1"  # 保留原 id
+    assert merged["finding_id"] == "fid-1"  # 保留原 finding_id
+    assert merged["_sandbox_finding_id"] == "f-abc-1"
+    assert merged["verification_status"] == "confirmed"
+    assert merged["is_verified"] is True
+    assert len(merged["sandbox_attempts"]) == 1  # 验证证据回写
+
+
+def test_merge_back_appends_when_no_sandbox_id_match():
+    """T7 (REQ-VC-3): _sandbox_finding_id 不匹配任何原件 → 追加为新 finding。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"id": "finding-1", "_sandbox_finding_id": "f-abc-1", "title": "A", "file_path": "a.py"},
+    ]
+    agent._merge_or_append_finding(
+        {"_sandbox_finding_id": "f-xyz-9", "title": "B", "file_path": "b.py"}
+    )
+    assert len(agent._all_findings) == 2
+    assert agent._all_findings[1]["_sandbox_finding_id"] == "f-xyz-9"
+
+
+def test_merge_back_still_dedupes_by_path_without_fid():
+    """T7 (REQ-VC-3): 无 _sandbox_finding_id 时保持原有 file/line/type 模糊去重行为。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "id": "finding-1",
+            "title": "XSS",
+            "file_path": "a.py",
+            "line_start": 5,
+            "vulnerability_type": "xss",
+            "verification_status": "needs_context",
+        },
+    ]
+    agent._merge_or_append_finding(
+        {
+            "title": "XSS",
+            "file_path": "a.py",
+            "line_start": 5,
+            "vulnerability_type": "xss",
+            "verification_status": "confirmed",
+        }
+    )
+    assert len(agent._all_findings) == 1
+    assert agent._all_findings[0]["verification_status"] == "confirmed"
