@@ -124,6 +124,30 @@ def test_has_valid_sandbox_evidence_accepts_real_evidence():
     assert agent._has_valid_sandbox_evidence() is True
 
 
+def test_static_confirmed_without_sandbox_evidence_is_invalid():
+    """T8 (REQ-VP-2): static_confirmed 且无 sandbox_attempts → 不视为有效沙箱证据。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "SQLi", "verification_status": "static_confirmed"},
+    ]
+    assert agent._has_valid_sandbox_evidence() is False
+
+
+def test_static_confirmed_with_sandbox_evidence_is_valid():
+    """T8 (REQ-VP-2): static_confirmed 且有 sandbox_attempts → 视为有效沙箱证据。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {
+            "title": "SQLi",
+            "verification_status": "static_confirmed",
+            "sandbox_attempts": [
+                {"success": True, "exit_code": 0, "evidence_summary": "VULNERABILITY_CONFIRMED"}
+            ],
+        }
+    ]
+    assert agent._has_valid_sandbox_evidence() is True
+
+
 # ============ R5: Bug D 全量验证门禁判定修正 ============
 
 def test_bugD_gate_treats_needs_context_as_unverified():

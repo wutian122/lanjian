@@ -460,7 +460,11 @@ class OrchestratorAgent(BaseAgent):
                         return True
                 # Bug C fix: confirmed without sandbox evidence is not enough
             if finding.get("verification_status") == "static_confirmed":
-                return True
+                # T8 (REQ-VP-2): static_confirmed 必须有 sandbox_attempts 证据才计入沙箱验证
+                sandbox_attempts = finding.get("sandbox_attempts")
+                if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
+                    return True
+                continue
         return False
 
     def _record_gate_observation(self, gate: str, reason: str) -> None:
