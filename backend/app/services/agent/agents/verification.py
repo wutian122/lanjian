@@ -1599,7 +1599,7 @@ class VerificationAgent(BaseAgent):
             "target_ref": target_ref,
             "language": (action_input or {}).get("language"),
             "network_enabled": bool((action_input or {}).get("network_enabled", False)),
-            "evidence_summary": (observation or "")[:5000],
+            "evidence_summary": self._truncate_evidence_summary(observation),
             "finding_id": finding_id,
             "fabricated": fabricated,
             "static_evidence": static_evidence,
@@ -1712,9 +1712,23 @@ class VerificationAgent(BaseAgent):
                 "target_ref": target_ref,
                 "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
                 "network_enabled": False,
-                "evidence_summary": (observation or "")[:5000],
+                "evidence_summary": self._truncate_evidence_summary(observation),
                 "finding_id": finding_id,
             }
+        )
+
+    @staticmethod
+    def _truncate_evidence_summary(observation: str, capacity: int = 5000) -> str:
+        """REQ-VQ-1：证据摘要保头尾截断——确认标记常在 PoC 输出尾部，纯头部截断会丢证据。"""
+        text = str(observation or "")
+        if len(text) <= capacity:
+            return text
+        head = tail = capacity // 2
+        omitted = len(text) - head - tail
+        return (
+            text[:head]
+            + f"\n...[evidence truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
         )
 
     @staticmethod
@@ -1726,22 +1740,43 @@ class VerificationAgent(BaseAgent):
             str(attempt.get("evidence_summary") or "")[:200],
         )
 
+    def _attempt_evidence_stronger(self, new: dict[str, Any], old: dict[str, Any]) -> bool:
+        """REQ-VQ-1：比较两条 attempt 的证据强度——含漏洞触发证据者更强，去重时优先保留。"""
+        def _score(a: dict[str, Any]) -> int:
+            ev = str(a.get("evidence_summary") or "").lower()
+            s = 0
+            if "vulnerability_confirmed(static)" not in ev and any(
+                m.lower() in ev for m in VULN_EVIDENCE_MARKERS
+            ):
+                s += 2
+            if a.get("static_evidence"):
+                s += 1
+            if a.get("success") is True:
+                s += 1
+            return s
+        return _score(new) > _score(old)
+
     def _merge_attempts_deduped(
         self, existing: List[dict[str, Any]], incoming: List[dict[str, Any]]
     ) -> List[dict[str, Any]]:
-        """V6 B4（REQ-VE-4）：合并 attempt 并按语义键去重，防止索引/扁平列表/重入绑定双计。"""
-        seen = {
-            self._attempt_dedupe_key(a) for a in existing if isinstance(a, dict)
-        }
-        merged = list(existing)
+        """V6 B4（REQ-VE-4）：合并 attempt 并按语义键去重，防止索引/扁平列表/重入绑定双计。
+
+        REQ-VQ-1：同键冲突时保留证据更强的 attempt（先到者无证据、后到者带确认标记时，
+        不得丢弃带证据的 attempt——否则状态可能从 confirmed/static_confirmed 跌为未复现）。
+        """
+        by_key: dict[tuple, dict[str, Any]] = {}
+        for a in existing:
+            if isinstance(a, dict):
+                by_key[self._attempt_dedupe_key(a)] = a
         for a in incoming:
             if not isinstance(a, dict):
                 continue
             key = self._attempt_dedupe_key(a)
-            if key not in seen:
-                seen.add(key)
-                merged.append(a)
-        return merged
+            if key not in by_key:
+                by_key[key] = a
+            elif self._attempt_evidence_stronger(a, by_key[key]):
+                by_key[key] = a
+        return list(by_key.values())
 
     def _truncate_observation_for_history(self, observation: str) -> str:
         """V6 B5（REQ-VE-5）：单条 observation 写入历史前截断，保头尾 1500+1500。

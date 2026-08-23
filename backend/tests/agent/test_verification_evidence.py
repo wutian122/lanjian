@@ -571,3 +571,32 @@ def test_build_commands_covers_all_findings():
     assert len(cmds) == 25, f"应生成 25 条命令，实际 {len(cmds)}"
     fids = {c.get("finding_id") for c in cmds}
     assert len(fids) == 25, "每条命令携带唯一 finding_id"
+
+
+# ============ 验证完整性 w1（REQ-VQ-1）：证据保尾 + 去重证据优先 ============
+
+def test_evidence_summary_keeps_tail_confirmation():
+    """超长输出保头尾截断，尾部确认标记不丢（REQ-VQ-1 场景 1）。"""
+    agent = _make_agent()
+    obs = "A" * 3000 + "B" * 1000 + "C" * 1000 + "\nVULNERABILITY_CONFIRMED: tail marker\n"
+    agent._record_sandbox_attempt(
+        {"command": "# FINDING_ID:f-ev-1\npython3 /tmp/poc_0.py"},
+        obs,
+    )
+    ev = agent._sandbox_attempts[0]["evidence_summary"]
+    assert "VULNERABILITY_CONFIRMED: tail marker" in ev, "尾部确认标记必须在截断后保留"
+
+
+def test_dedup_prefers_evidence_attempt():
+    """同键两条 attempt：带漏洞触发证据者优先保留（REQ-VQ-1 场景 2）。"""
+    agent = _make_agent()
+    weak = {
+        "success": True, "exit_code": 0,
+        "command": "python3 /tmp/poc_0.py", "finding_id": "f-ev-2",
+        "evidence_summary": "Sandbox result\n退出码: 0\n=== Verification Complete ===",
+    }
+    strong = dict(weak)
+    strong["evidence_summary"] = "Sandbox result\n退出码: 0\nVULNERABILITY_CONFIRMED: sql injection verified"
+    merged = agent._merge_attempts_deduped([weak], [strong])
+    assert len(merged) == 1
+    assert "VULNERABILITY_CONFIRMED" in merged[0]["evidence_summary"], "必须保留含证据的 attempt"
