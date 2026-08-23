@@ -270,6 +270,8 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_hot_files: list[str] = []
         self._semgrep_findings: list[dict[str, Any]] = []
         self._full_verification_dispatched: bool = False
+        # T6 (REQ-VC-2): R4 放行前程序化补验的一次性标志（防重复调度）
+        self._force_verification_dispatched: bool = False
         # R4: 连续被"无沙箱证据"门禁拒绝 finish 的次数；达上限后停止强制重派
         self._finish_gate_rejections: int = 0
         # R6: 门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations
@@ -460,7 +462,11 @@ class OrchestratorAgent(BaseAgent):
                         return True
                 # Bug C fix: confirmed without sandbox evidence is not enough
             if finding.get("verification_status") == "static_confirmed":
-                return True
+                # T8 (REQ-VP-2): static_confirmed 必须有 sandbox_attempts 证据才计入沙箱验证
+                sandbox_attempts = finding.get("sandbox_attempts")
+                if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
+                    return True
+                continue
         return False
 
     def _record_gate_observation(self, gate: str, reason: str) -> None:
@@ -470,6 +476,31 @@ class OrchestratorAgent(BaseAgent):
             "gate": gate,
             "reason": reason,
             "time": datetime.now(timezone.utc).isoformat(),
+        })
+
+    async def _maybe_dispatch_force_verification(self) -> None:
+        """T6 (REQ-VC-2): R4 放行前的程序化收口——补发一次 verification 调度。
+
+        当验证门禁连续拒绝达上限即将放行收尾时，若仍存在未验证 finding，
+        程序化补发一次 verification 调度（LLM 可能已放弃重派），兜底不丢未验证项。
+        判定与全量验证门禁同款：非 confirmed/static_confirmed 等终态，或整体无有效
+        沙箱证据，即视为未验证；一次性标志 _force_verification_dispatched 防重复。
+        """
+        if self._force_verification_dispatched:
+            return
+        unverified = [
+            f for f in self._all_findings
+            if f.get("verification_status")
+            not in ("confirmed", "static_confirmed", "not_reproducible", "false_positive")
+            or not self._has_valid_sandbox_evidence()
+        ]
+        if not unverified:
+            return
+        self._force_verification_dispatched = True
+        await self._dispatch_agent({
+            "agent": "verification",
+            "task": "系统收口：验证剩余未验证漏洞",
+            "context": f"{len(unverified)} 个未验证漏洞",
         })
 
     def _evaluate_current_coverage(self) -> Any:
@@ -935,6 +966,8 @@ Action Input: {{"参数": "值"}}
                             "放行完成",
                             f"已连续拒绝 {max_redispatch} 次仍无沙箱证据，停止强制重派，按当前结果收尾",
                         )
+                        # T6 (REQ-VC-2): 放行前程序化收口——剩余未验证漏洞补发一次 verification 调度
+                        await self._maybe_dispatch_force_verification()
                         self._conversation_history.append({
                             "role": "user",
                             "content": (
@@ -1333,6 +1366,14 @@ Action Input: {{"参数": "值"}}
                         )
                     except Exception:
                         pass
+
+            # T6 扩展（REQ-VC-2）：主循环退出（轮次/覆盖率耗尽）路径不经过任何验证门禁——
+            # 直接在此收尾前程序化补验一次未验证 finding，杜绝"全量零证据收尾"。
+            # 生产回归 ec0985ad 证实该路径现实存在（analysis 3 轮后轮次耗尽 → 5 finding 全零证据）。
+            try:
+                await self._maybe_dispatch_force_verification()
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Force verification on finalize failed (non-fatal): {e}")
 
             # ✅ P1-1: 攻击链分析 - 评估漏洞组合风险
             attack_chains = []
@@ -2156,85 +2197,8 @@ Action Input: {{"参数": "值"}}
                         if normalized_new is None:
                             continue
 
-                        # Create fingerprint for deduplication (file + description similarity)
-                        new_file = normalized_new.get("file_path", "").lower().strip()
-                        new_desc = (normalized_new.get("description", "") or "").lower()[:100]
-                        new_type = (normalized_new.get("vulnerability_type", "") or "").lower()
-                        new_line = normalized_new.get("line_start") or normalized_new.get("line", 0)
-
-                        # Check if exists (more flexible matching)
-                        found = False
-                        for i, existing_f in enumerate(self._all_findings):
-                            existing_file = (existing_f.get("file_path", "") or existing_f.get("file", "")).lower().strip()
-                            existing_desc = (existing_f.get("description", "") or "").lower()[:100]
-                            existing_type = (existing_f.get("vulnerability_type", "") or existing_f.get("type", "")).lower()
-                            existing_line = existing_f.get("line_start") or existing_f.get("line", 0)
-
-                            # Match if same file AND (same line OR similar description OR same vulnerability type)
-                            same_file = new_file and existing_file and (
-                                new_file == existing_file or
-                                new_file.endswith(existing_file) or
-                                existing_file.endswith(new_file)
-                            )
-                            same_line = new_line and existing_line and new_line == existing_line
-                            similar_desc = new_desc and existing_desc and (
-                                new_desc in existing_desc or existing_desc in new_desc
-                            )
-                            same_type = new_type and existing_type and (
-                                new_type == existing_type or
-                                (new_type in existing_type) or (existing_type in new_type)
-                            )
-                            # 🔥 问题三修复：file_path 为空时用 title+type 去重
-                            no_file_path = not new_file and not existing_file
-                            title_match = (normalized_new.get('title', '').lower().strip() ==
-                                           (existing_f.get('title', '') or '').lower().strip())
-
-                            if (same_file and (same_line or similar_desc or same_type)) or (no_file_path and title_match and same_type):
-                                # Update existing with new info (e.g. verification results)
-                                # 🔥 FIX: Smart merge - don't overwrite good data with empty values
-                                merged = dict(existing_f)  # Start with existing data
-                                for key, value in normalized_new.items():
-                                    # Bug B fix: is_verified uses explicit priority (Verification > Analysis)
-                                    # Python False == 0 is True, so the generic guard skips False values.
-                                    if key == "is_verified":
-                                        if normalized_new.get("verification_status") or normalized_new.get("verdict"):
-                                            merged[key] = value
-                                        continue
-                                    # Bug B fix: verification_status also uses explicit priority
-                                    if key == "verification_status":
-                                        if value is not None and value != "":
-                                            merged[key] = value
-                                        continue
-                                    # Bug B fix: sandbox_attempts merge (list, not scalar)
-                                    if key == "sandbox_attempts" and isinstance(value, list) and len(value) > 0:
-                                        merged[key] = (merged.get(key) or []) + value
-                                        continue
-                                    # Default: skip None/empty/zero
-                                    if value is not None and value != "" and value != 0:
-                                        merged[key] = value
-                                    elif key not in merged or merged[key] is None:
-                                        # Fill in missing fields even with empty values
-                                        merged[key] = value
-
-                                # Keep the better title
-                                if normalized_new.get("title") and len(normalized_new.get("title", "")) > len(existing_f.get("title", "")):
-                                    merged["title"] = normalized_new["title"]
-                                # Bug B fix: removed forced is_verified=True override; Verification priority handled in merge guard above
-                                # 🔥 FIX: Preserve non-zero line numbers
-                                if existing_f.get("line_start") and not normalized_new.get("line_start"):
-                                    merged["line_start"] = existing_f["line_start"]
-                                # 🔥 FIX: Preserve vulnerability_type
-                                if existing_f.get("vulnerability_type") and not normalized_new.get("vulnerability_type"):
-                                    merged["vulnerability_type"] = existing_f["vulnerability_type"]
-
-                                self._all_findings[i] = merged
-                                found = True
-                                logger.info(f"[Orchestrator] Merged finding: {new_file}:{merged.get('line_start', 0)} ({merged.get('vulnerability_type', '')})")
-                                break
-
-                        if not found:
-                            self._all_findings.append(normalized_new)
-                            logger.info(f"[Orchestrator] Added new finding: {new_file}:{new_line} ({new_type})")
+                        # T7 (REQ-VC-3): merge-back 统一入口（_sandbox_finding_id 精确匹配优先）
+                        self._merge_or_append_finding(normalized_new)
 
                     logger.info(f"[Orchestrator] Total findings now: {len(self._all_findings)}")
                 else:
@@ -2411,6 +2375,105 @@ Action Input: {{"参数": "值"}}
             return True
 
         return False
+
+    def _merge_or_append_finding(self, normalized_new: dict[str, Any]) -> None:
+        """T7 (REQ-VC-3): 将标准化后的 finding merge 回 _all_findings。
+
+        优先按 _sandbox_finding_id（verification 侧分配，验证输出 finding 携带）精确匹配
+        原对象，命中即更新原对象（保留 id/finding_id），不追加副本——避免验证输出
+        file_path 漂移导致同一漏洞出现两份；未命中回退到原有 file/line/type 模糊去重，
+        仍不匹配则追加为新 finding。
+        """
+        # Create fingerprint for deduplication (file + description similarity)
+        new_file = normalized_new.get("file_path", "").lower().strip()
+        new_desc = (normalized_new.get("description", "") or "").lower()[:100]
+        new_type = (normalized_new.get("vulnerability_type", "") or "").lower()
+        new_line = normalized_new.get("line_start") or normalized_new.get("line", 0)
+        new_fid = normalized_new.get("_sandbox_finding_id")
+
+        # Check if exists (more flexible matching)
+        found = False
+        for i, existing_f in enumerate(self._all_findings):
+            existing_file = (existing_f.get("file_path", "") or existing_f.get("file", "")).lower().strip()
+            existing_desc = (existing_f.get("description", "") or "").lower()[:100]
+            existing_type = (existing_f.get("vulnerability_type", "") or existing_f.get("type", "")).lower()
+            existing_line = existing_f.get("line_start") or existing_f.get("line", 0)
+
+            # T7 (REQ-VC-3): _sandbox_finding_id 精确匹配优先于模糊判定
+            fid_match = bool(new_fid and existing_f.get("_sandbox_finding_id") == new_fid)
+
+            # Match if same file AND (same line OR similar description OR same vulnerability type)
+            same_file = new_file and existing_file and (
+                new_file == existing_file or
+                new_file.endswith(existing_file) or
+                existing_file.endswith(new_file)
+            )
+            same_line = new_line and existing_line and new_line == existing_line
+            similar_desc = new_desc and existing_desc and (
+                new_desc in existing_desc or existing_desc in new_desc
+            )
+            same_type = new_type and existing_type and (
+                new_type == existing_type or
+                (new_type in existing_type) or (existing_type in new_type)
+            )
+            # 🔥 问题三修复：file_path 为空时用 title+type 去重
+            no_file_path = not new_file and not existing_file
+            title_match = (normalized_new.get('title', '').lower().strip() ==
+                           (existing_f.get('title', '') or '').lower().strip())
+
+            if fid_match or ((same_file and (same_line or similar_desc or same_type)) or (no_file_path and title_match and same_type)):
+                # Update existing with new info (e.g. verification results)
+                # 🔥 FIX: Smart merge - don't overwrite good data with empty values
+                merged = dict(existing_f)  # Start with existing data
+                for key, value in normalized_new.items():
+                    # Bug B fix: is_verified uses explicit priority (Verification > Analysis)
+                    # Python False == 0 is True, so the generic guard skips False values.
+                    if key == "is_verified":
+                        if normalized_new.get("verification_status") or normalized_new.get("verdict"):
+                            merged[key] = value
+                        continue
+                    # Bug B fix: verification_status also uses explicit priority
+                    if key == "verification_status":
+                        if value is not None and value != "":
+                            merged[key] = value
+                        continue
+                    # Bug B fix: sandbox_attempts merge (list, not scalar)
+                    if key == "sandbox_attempts" and isinstance(value, list) and len(value) > 0:
+                        merged[key] = (merged.get(key) or []) + value
+                        continue
+                    # Default: skip None/empty/zero
+                    if value is not None and value != "" and value != 0:
+                        merged[key] = value
+                    elif key not in merged or merged[key] is None:
+                        # Fill in missing fields even with empty values
+                        merged[key] = value
+
+                # Keep the better title
+                if normalized_new.get("title") and len(normalized_new.get("title", "")) > len(existing_f.get("title", "")):
+                    merged["title"] = normalized_new["title"]
+                # Bug B fix: removed forced is_verified=True override; Verification priority handled in merge guard above
+                # 🔥 FIX: Preserve non-zero line numbers
+                if existing_f.get("line_start") and not normalized_new.get("line_start"):
+                    merged["line_start"] = existing_f["line_start"]
+                # 🔥 FIX: Preserve vulnerability_type
+                if existing_f.get("vulnerability_type") and not normalized_new.get("vulnerability_type"):
+                    merged["vulnerability_type"] = existing_f["vulnerability_type"]
+                # T7 (REQ-VC-3): 保留原对象 id/finding_id 与 _sandbox_finding_id（不随验证输出漂移）
+                if existing_f.get("id"):
+                    merged["id"] = existing_f["id"]
+                if existing_f.get("finding_id"):
+                    merged["finding_id"] = existing_f["finding_id"]
+                if existing_f.get("_sandbox_finding_id"):
+                    merged["_sandbox_finding_id"] = existing_f["_sandbox_finding_id"]
+
+                self._all_findings[i] = merged
+                found = True
+                logger.info(f"[Orchestrator] Merged finding: {new_file}:{merged.get('line_start', 0)} ({merged.get('vulnerability_type', '')})")
+                break
+
+        if not found:
+            self._all_findings.append(normalized_new)
+            logger.info(f"[Orchestrator] Added new finding: {new_file}:{new_line} ({new_type})")
 
     def _normalize_finding(self, finding: dict[str, Any]) -> dict[str, Any] | None:
         """
@@ -2619,6 +2682,9 @@ Action Input: {{"参数": "值"}}
         if target_agent == "recon" and not self._agent_results:
             return None
 
+        # T5 (REQ-VC-1): 严重程度排序映射，verification 交接 key_findings 按此对全量排序
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
         # 🔥 优先使用前序 Agent 返回的 handoff
         # Analysis Agent 需要 Recon 的 handoff
         if target_agent == "analysis" and "recon" in self._agent_handoffs:
@@ -2656,7 +2722,12 @@ Action Input: {{"参数": "值"}}
                 to_agent=target_agent,
                 summary=analysis_handoff.summary,
                 work_completed=analysis_handoff.work_completed,
-                key_findings=analysis_handoff.key_findings,
+                # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
+                # 按严重程度排序；analysis_handoff 仍提供 summary/insights 等其余信息
+                key_findings=sorted(
+                    self._all_findings,
+                    key=lambda f: severity_order.get(f.get("severity", "low"), 3),
+                ),
                 insights=analysis_handoff.insights,
                 suggested_actions=analysis_handoff.suggested_actions,
                 attention_points=analysis_handoff.attention_points,
@@ -2744,14 +2815,14 @@ Action Input: {{"参数": "值"}}
                 if findings:
                     work_completed.append(f"发现 {len(findings)} 个潜在漏洞")
 
-                    # 按严重程度排序，优先验证高危漏洞
-                    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+                    # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
+                    # 按严重程度排序，去掉 [:15] 截断
                     sorted_findings = sorted(
-                        findings,
+                        self._all_findings,
                         key=lambda x: severity_order.get(x.get("severity", "low"), 3)
                     )
 
-                    for f in sorted_findings[:15]:
+                    for f in sorted_findings:
                         if isinstance(f, dict):
                             key_findings.append(f)
                             suggested_actions.append({

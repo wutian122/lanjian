@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v5.4.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.0.1-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -17,6 +17,8 @@
 - **RAG 语义检索**：tree-sitter AST 拆分 + ChromaDB 向量存储 + 7 提供商 embedding 适配
 - **Docker 沙箱验证**：动态 PoC 生成 + 多语言执行环境（PHP/Python/JS/Java/Go/Ruby/Shell）
 - **确定性验证证据引擎**（v5.4.0）：验证结论由运行时沙箱证据代码化推导，不信任 LLM 自述；伪造/模拟沙箱输出被识别排除；证据按 finding 强制绑定；门禁连续拒绝达上限后确定性终止
+- **验证证据链根治**（v6.0.0）：失败沙箱尝试如实绑定（未复现 → not_reproducible，不再误报 needs_context）；失败标记按退出码与输出段收窄判定（exit 0 + 铁证不再被 incidental 子串误杀）；LLM 空 Final Answer 时按 finding_id 回填运行时证据；确定性沙箱执行直写证据索引；verification 会话有界（单条截断 + 历史压缩）；模板 PoC 源码断言 + 演示性证据降档 static_confirmed
+- **验证完整性修复**（v6.0.1）：待验清单全量送验（不再按数量截断/不再漏掉多轮 analysis 早期发现）；verification 交接用全量发现（含轮次耗尽与验证门禁双路径程序化补验，杜绝全量零证据收尾）；验证器（预生成模板 PoC）正则转义修复 + 崩溃分档（`poc_error` → needs_context 注明，不冒充未复现）；模板演示确认挂源码 sink 断言（无对应 sink 不确认，收敛假阳性）；static_confirmed 必须有沙箱证据才计入验证门禁；证据摘要保尾 + 去重证据优先
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -107,16 +109,16 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v5.4.0`（生产已禁用 `:latest` 浮动 tag）。`v5.4.0` 为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.0.1`（backend）/ `v6.0.0`（frontend）（生产已禁用 `:latest` 浮动 tag）。`v6.0.1`（backend）与 `v6.0.0`（frontend）为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
 ```bash
-IMAGE_TAG=v5.4.0 docker compose pull
-IMAGE_TAG=v5.4.0 docker compose up -d
+IMAGE_TAG=v6.0.1 docker compose pull
+IMAGE_TAG=v6.0.1 docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v5.4.0" > .env`。
+可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v6.0.1" > .env`。
 
 > **镜像说明**：backend / frontend / sandbox 三镜像均发布多架构清单（manifest list）。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10，避免浮动 tag 重建引入不兼容）。
 

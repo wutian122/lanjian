@@ -2,7 +2,7 @@
 # 仅在该机使用：`docker compose -f docker-compose.b-amd64.yml up -d`。
 # 差异说明：
 # - db 加 security_opt: seccomp:unconfined（CentOS 7 kernel 3.10 老内核，postgres 默认 seccomp 偶发启动失败）
-# - 锁 v5.4.0
+# - 锁 v6.0.1（backend）/ v6.0.0（frontend）
 # - 删除 P0/P3 注释（与功能无关）
 name: lanjian
 
@@ -44,7 +44,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v5.4.0
+    image: wutian449/lanjian-backend:v6.0.1
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -84,7 +84,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:v5.4.0
+    image: wutian449/lanjian-frontend:v6.0.0
     restart: unless-stopped
     ports:
       - "80:80"

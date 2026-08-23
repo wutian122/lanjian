@@ -28,6 +28,35 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_FAILURE_MARKERS = ("工具执行失败", "Traceback", "Error:", "Exception:", "\n失败:", "\n错误:")
 
+# V6 B2（REQ-VE-2）：子串级失败标记仅在特定条件下生效，与工具级/行级标记区分
+_SUB_FAILURE_MARKERS = ("Traceback", "Error:", "Exception:")
+
+
+def _has_sandbox_failure_marker(observation: str, exit_code) -> bool:
+    """V6 B2（REQ-VE-2）失败标记收窄判定。
+
+    - "工具执行失败" 是工具级失败前缀，保留全文匹配；
+    - "\\n失败:"/"\\n错误:" 是行级失败标记，保留全文匹配；
+    - "Traceback"/"Error:"/"Exception:" 是子串级标记，仅在 exit_code!=0
+      或位于 stderr/错误段（"标准错误:"```...``` 与 "错误:" 行）内时生效，
+      防止 exit 0 且含铁证标记的成功输出被正文里 incidental 的 "Error:"
+      子串误杀（生产任务 5a1f7ab6：21 次执行 0 证据的直接原因之一）。
+    """
+    obs = observation or ""
+    if "工具执行失败" in obs or "\n失败:" in obs or "\n错误:" in obs:
+        return True
+    stderr_section = ""
+    m = re.search(r"标准错误:\s*```[^\n]*\n(.*?)```", obs, re.DOTALL)
+    if m:
+        stderr_section = m.group(1)
+    err_line = re.search(r"^错误:.*$", obs, re.MULTILINE)
+    if err_line:
+        stderr_section += "\n" + err_line.group(0)
+    if any(mk in stderr_section for mk in _SUB_FAILURE_MARKERS):
+        return True
+    exit_bad = exit_code is not None and exit_code != 0
+    return exit_bad and any(mk in obs for mk in _SUB_FAILURE_MARKERS)
+
 # R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
 # LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
 FABRICATION_MARKERS = (
@@ -91,6 +120,15 @@ def compute_verification_status(
     llm_verdict = str(finding.get("verdict") or finding.get("verification_status") or "").lower()
     if llm_verdict == VerificationStatus.FALSE_POSITIVE:
         return VerificationStatus.FALSE_POSITIVE, False, {}
+
+    # 3.5) REQ-VE-2：验证器（PoC）自身崩溃与"未复现"分档。
+    # 全部 attempt 均为 poc_error（Traceback/SyntaxError/re.error 等）→ needs_context
+    # 并注明验证器崩溃，不得冒充 not_reproducible（"没复现"语义只留给 PoC 正常执行）。
+    if real_attempts and all(a.get("poc_error") for a in real_attempts):
+        return VerificationStatus.NEEDS_CONTEXT, False, {
+            "reason": "pre-generated PoC crashed",
+            "poc_error": True,
+        }
 
     # 4) not_reproducible：尝试过但未复现
     if real_attempts:
@@ -808,8 +846,9 @@ class VerificationAgent(BaseAgent):
                 data={"findings": [], "verified_count": 0, "note": "未收到待验证的发现"},
             )
         
-        # 限制数量
-        findings_to_verify = findings_to_verify[:20]
+        # REQ-VC-1：不再按固定数量截断待验清单——全部传入 finding 均生成确定性 PoC 并执行，
+        # 规模由弹性迭代预算（per_finding*n 上限）与确定性执行线性成本约束。
+        # 历史缺陷：[:20] 硬截断把多轮 analysis 的尾部 finding（多为早期轮次）砍掉 → 零证据。
         
         await self.emit_event(
             "info",
@@ -900,6 +939,9 @@ class VerificationAgent(BaseAgent):
         self._steps = []
         self._sandbox_exec_calls = 0
         self._sandbox_attempts = []
+        # V6 B4（REQ-VE-4）：运行时证据按 finding_id 建索引（确定性执行显式直写，
+        # 绑定/回填消费索引，正确性不依赖命令文本注释反解）
+        self._runtime_attempts_by_finding_id: Dict[str, List[Dict[str, Any]]] = {}
         self._backfill_used_indices = set()
         # B2 弹性总上限：按 finding 数量动态调整，避免队尾饿死
         n_findings = len(findings_to_verify)
@@ -1011,11 +1053,12 @@ class VerificationAgent(BaseAgent):
                 if step.thought:
                     await self.emit_llm_thought(step.thought, iteration + 1)
                 
-                # 添加 LLM 响应到历史
+                # 添加 LLM 响应到历史（V6 B5：assistant 输出同样过截断 + 压缩检查）
                 self._conversation_history.append({
                     "role": "assistant",
-                    "content": llm_output,
+                    "content": self._truncate_observation_for_history(llm_output),
                 })
+                self._compress_history_if_needed()
                 
                 # 检查是否完成
                 if step.is_final:
@@ -1117,12 +1160,12 @@ class VerificationAgent(BaseAgent):
                             "4. 继续用 sandbox_exec 验证下一个发现，不要卡在同一个发现上"
                         )
                         
-                        # 模拟观察结果，跳过实际执行
+                        # 模拟观察结果，跳过实际执行（V6 B5：截断后入历史）
                         step.observation = observation
                         await self.emit_llm_observation(observation)
                         self._conversation_history.append({
                             "role": "user",
-                            "content": f"Observation:\n{observation}",
+                            "content": "Observation:\n" + self._truncate_observation_for_history(observation),
                         })
                         continue
 
@@ -1199,11 +1242,12 @@ class VerificationAgent(BaseAgent):
                     # 🔥 发射 LLM 观察事件
                     await self.emit_llm_observation(observation)
                     
-                    # 添加观察结果到历史
+                    # 添加观察结果到历史（V6 B5/REQ-VE-5：单条截断 + 累计压缩，会话有界）
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": "Observation:\n" + self._truncate_observation_for_history(observation),
                     })
+                    self._compress_history_if_needed()
                 else:
                     # LLM 没有选择工具，提示它继续
                     await self.emit_llm_decision("继续验证", "LLM 需要更多验证")
@@ -1277,16 +1321,11 @@ class VerificationAgent(BaseAgent):
 
                     verified_findings.append(strict)
             else:
-                # 如果没有最终结果，使用原始发现
-                for f in findings_to_verify:
-                    verified_findings.append(
-                        self._normalize_verification_outcome({
-                            **f,
-                            "verdict": "needs_context",
-                            "confidence": 0.5,
-                            "is_verified": False,
-                        })
-                    )
+                # V6 B3（REQ-VE-3）：LLM 空 Final Answer——回填运行时证据后再归一化，
+                # 状态由 compute_verification_status 据实推导，不得一律 needs_context
+                verified_findings.extend(
+                    self._finalize_findings_without_final_answer(findings_to_verify)
+                )
 
             # === FIX P0-1: 兜底沙箱验证 ===
             # 如果循环自然结束（LLM 始终未调用 sandbox_exec），
@@ -1482,21 +1521,31 @@ class VerificationAgent(BaseAgent):
         )
 
 
-    def _record_sandbox_attempt(self, action_input: dict[str, Any], observation: str) -> None:
-        """Persist structured evidence for sandbox_exec calls made during this verification run."""
+    def _record_sandbox_attempt(
+        self, action_input: dict[str, Any], observation: str,
+        finding_id: Optional[str] = None,
+    ) -> None:
+        """Persist structured evidence for sandbox_exec calls made during this verification run.
+
+        V6 B4（REQ-VE-4）：finding_id 可由确定性执行路径显式传入（直写索引），
+        未传时保留命令注释反解 + 反查两条既有路径（LLM 路径兼容）。
+        """
         if not hasattr(self, "_sandbox_attempts"):
             self._sandbox_attempts = []
+        if not hasattr(self, "_runtime_attempts_by_finding_id"):
+            self._runtime_attempts_by_finding_id = {}
 
         command = (action_input or {}).get("command") or ""
 
-        # Opt-1: Parse finding_id from command comment
-        finding_id_match = re.search(r"# FINDING_ID:(\S+)", command)
-        finding_id = finding_id_match.group(1) if finding_id_match else None
-
-        # P4 修复：LLM 自写 PoC 无 # FINDING_ID 注释时，反查 findings 显式绑定 finding_id
-        # 不再依赖命令文本注释，用命令中的 file_path/target_ref 反查 _sandbox_finding_id
+        # Opt-1: Parse finding_id from command comment（显式传入优先，注释仅作 LLM 路径兜底）
         if finding_id is None:
-            finding_id = self._resolve_finding_id_from_command(command)
+            finding_id_match = re.search(r"# FINDING_ID:(\S+)", command)
+            finding_id = finding_id_match.group(1) if finding_id_match else None
+
+            # P4 修复：LLM 自写 PoC 无 # FINDING_ID 注释时，反查 findings 显式绑定 finding_id
+            # 不再依赖命令文本注释，用命令中的 file_path/target_ref 反查 _sandbox_finding_id
+            if finding_id is None:
+                finding_id = self._resolve_finding_id_from_command(command)
 
         exit_code = None
         exit_match = re.search(r"退出码:\s*(-?\d+)", observation or "")
@@ -1506,12 +1555,16 @@ class VerificationAgent(BaseAgent):
             except ValueError:
                 exit_code = None
 
-        has_failure_marker = any(marker in (observation or "") for marker in SANDBOX_FAILURE_MARKERS)
+        has_failure_marker = _has_sandbox_failure_marker(observation or "", exit_code)
         # ✅ P2-1: 增加语义检查 - 仅 exit_code==0 不够，还需检查 PoC 输出是否包含漏洞触发证据
         # 注意：marker 与 observation 都转小写比较，避免大小写不匹配漏判
         obs_lower = (observation or "").lower()
+        # V6 B6（REQ-VE-6）：演示性确认（与目标源码无数据流因果，模板 PoC 输出
+        # VULNERABILITY_CONFIRMED(STATIC) 变体）→ static_evidence 降档标记，
+        # compute_verification_status 分支 2 消费判 static_confirmed，不得判 confirmed
+        static_evidence = "vulnerability_confirmed(static)" in obs_lower
         has_vuln_evidence = (
-            "vulnerability_confirmed(static)" not in obs_lower
+            not static_evidence
             and any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
         )
         # R3 反伪造：源码缺失/模拟输出 + 声称确认 → 证据不可信
@@ -1529,24 +1582,36 @@ class VerificationAgent(BaseAgent):
         # R3: 伪造证据强制降级为失败，杜绝"Simulated + VULNERABILITY_CONFIRMED"被当铁证
         if fabricated:
             success = False
+        # REQ-VE-2：验证器（PoC）自身崩溃与"未复现"分档——崩溃特征打 poc_error 标记，
+        # 下游状态机据此判 needs_context（notes 注明），不冒充 not_reproducible、不被软证据兜底升级
+        obs_text = str(observation or "")
+        poc_error = any(m in obs_text for m in ("Traceback", "SyntaxError", "re.error", "unterminated"))
+        poc_error_type = "pre-generated PoC crashed" if poc_error else None
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
 
-        self._sandbox_attempts.append(
-            {
-                "tool": "sandbox_exec",
-                "success": success,
-                "exit_code": exit_code,
-                "command": command,
-                "target_ref": target_ref,
-                "language": (action_input or {}).get("language"),
-                "network_enabled": bool((action_input or {}).get("network_enabled", False)),
-                "evidence_summary": (observation or "")[:5000],
-                "finding_id": finding_id,
-                "fabricated": fabricated,
-            }
-        )
+        attempt = {
+            "tool": "sandbox_exec",
+            "success": success,
+            "exit_code": exit_code,
+            "command": command,
+            "target_ref": target_ref,
+            "language": (action_input or {}).get("language"),
+            "network_enabled": bool((action_input or {}).get("network_enabled", False)),
+            "evidence_summary": self._truncate_evidence_summary(observation),
+            "finding_id": finding_id,
+            "fabricated": fabricated,
+            "static_evidence": static_evidence,
+            "poc_error": poc_error,
+            "poc_error_type": poc_error_type,
+        }
+        self._sandbox_attempts.append(attempt)
+        # V6 B4（REQ-VE-4）：双写——按 finding_id 登记运行时证据索引，
+        # 绑定/回填消费索引（同一对象引用，避免双计）
+        if finding_id:
+            self._runtime_attempts_by_finding_id.setdefault(str(finding_id), []).append(attempt)
+        return attempt
 
     def _resolve_finding_id_from_command(self, command: str) -> Optional[str]:
         """P4 修复：LLM 自写 PoC（无 # FINDING_ID 注释）时，从命令文本反查 finding_id。
@@ -1616,7 +1681,7 @@ class VerificationAgent(BaseAgent):
             except ValueError:
                 exit_code = None
 
-        has_failure_marker = any(marker in (observation or "") for marker in SANDBOX_FAILURE_MARKERS)
+        has_failure_marker = _has_sandbox_failure_marker(observation or "", exit_code)
         # 修复：exit_code None（regex 未匹配）时，仅依据失败标记判定，避免 None==0 假阴性
         if exit_code is None:
             success = not has_failure_marker
@@ -1647,10 +1712,157 @@ class VerificationAgent(BaseAgent):
                 "target_ref": target_ref,
                 "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
                 "network_enabled": False,
-                "evidence_summary": (observation or "")[:5000],
+                "evidence_summary": self._truncate_evidence_summary(observation),
                 "finding_id": finding_id,
             }
         )
+
+    @staticmethod
+    def _truncate_evidence_summary(observation: str, capacity: int = 5000) -> str:
+        """REQ-VQ-1：证据摘要保头尾截断——确认标记常在 PoC 输出尾部，纯头部截断会丢证据。"""
+        text = str(observation or "")
+        if len(text) <= capacity:
+            return text
+        head = tail = capacity // 2
+        omitted = len(text) - head - tail
+        return (
+            text[:head]
+            + f"\n...[evidence truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
+        )
+
+    @staticmethod
+    def _attempt_dedupe_key(attempt: dict[str, Any]) -> tuple:
+        """V6 B4：attempt 语义去重键（命令+退出码+证据摘要前缀）。"""
+        return (
+            str(attempt.get("command") or "")[:200],
+            attempt.get("exit_code"),
+            str(attempt.get("evidence_summary") or "")[:200],
+        )
+
+    def _attempt_evidence_stronger(self, new: dict[str, Any], old: dict[str, Any]) -> bool:
+        """REQ-VQ-1：比较两条 attempt 的证据强度——含漏洞触发证据者更强，去重时优先保留。"""
+        def _score(a: dict[str, Any]) -> int:
+            ev = str(a.get("evidence_summary") or "").lower()
+            s = 0
+            if "vulnerability_confirmed(static)" not in ev and any(
+                m.lower() in ev for m in VULN_EVIDENCE_MARKERS
+            ):
+                s += 2
+            if a.get("static_evidence"):
+                s += 1
+            if a.get("success") is True:
+                s += 1
+            return s
+        return _score(new) > _score(old)
+
+    def _merge_attempts_deduped(
+        self, existing: List[dict[str, Any]], incoming: List[dict[str, Any]]
+    ) -> List[dict[str, Any]]:
+        """V6 B4（REQ-VE-4）：合并 attempt 并按语义键去重，防止索引/扁平列表/重入绑定双计。
+
+        REQ-VQ-1：同键冲突时保留证据更强的 attempt（先到者无证据、后到者带确认标记时，
+        不得丢弃带证据的 attempt——否则状态可能从 confirmed/static_confirmed 跌为未复现）。
+        """
+        by_key: dict[tuple, dict[str, Any]] = {}
+        for a in existing:
+            if isinstance(a, dict):
+                by_key[self._attempt_dedupe_key(a)] = a
+        for a in incoming:
+            if not isinstance(a, dict):
+                continue
+            key = self._attempt_dedupe_key(a)
+            if key not in by_key:
+                by_key[key] = a
+            elif self._attempt_evidence_stronger(a, by_key[key]):
+                by_key[key] = a
+        return list(by_key.values())
+
+    def _truncate_observation_for_history(self, observation: str) -> str:
+        """V6 B5（REQ-VE-5）：单条 observation 写入历史前截断，保头尾 1500+1500。
+
+        PoC 输出的铁证标记（退出码/VULNERABILITY_CONFIRMED）通常在尾部，保尾防丢证据；
+        头部保留命令/目标上下文。
+        """
+        text = str(observation or "")
+        try:
+            from app.services.agent.config import get_agent_config
+            max_chars = int(get_agent_config().observation_history_max_chars)
+        except Exception:
+            max_chars = 4000
+        if len(text) <= max_chars:
+            return text
+        head, tail = 1500, 1500
+        # 防御：配置值过小（<3000+标注空间）时收缩头尾，避免 omitted 为负/内容重复
+        budget = max(max_chars - 200, 200)
+        if head + tail > budget:
+            head = tail = budget // 2
+        omitted = max(len(text) - head - tail, 0)
+        return (
+            text[:head]
+            + f"\n...[observation truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
+        )
+
+    def _compress_history_if_needed(self) -> None:
+        """V6 B5（REQ-VE-5）：累计历史超软上限时，最旧一半压缩为一条摘要消息。
+
+        保留 system 提示与最近一半消息；摘要保留工具调用结论要点
+        （退出码/铁证标记/最终答案行）。完整证据不受影响（在 sandbox_attempts 与索引中）。
+        """
+        history = getattr(self, "_conversation_history", None) or []
+        try:
+            from app.services.agent.config import get_agent_config
+            soft_limit = int(get_agent_config().history_soft_limit_messages)
+        except Exception:
+            soft_limit = 40
+        if len(history) <= soft_limit:
+            return
+        # history[0] 为 system 提示；压缩其后的最旧一半 user/assistant 消息
+        compressible = history[1:]
+        half = len(compressible) // 2
+        if half <= 0:
+            return
+        oldest, kept = compressible[:half], compressible[half:]
+        key_markers = (
+            "VULNERABILITY_CONFIRMED", "退出码", "INJECTABLE", "Final Answer",
+            "not found", "FALSE_POSITIVE", "Verification Complete",
+        )
+        parts = []
+        for msg in oldest:
+            content = str(msg.get("content") or "")
+            key_lines = [
+                ln.strip() for ln in content.splitlines()
+                if any(k.lower() in ln.lower() for k in key_markers)
+            ]
+            digest = " | ".join(key_lines[:3])[:300] or content.strip()[:120]
+            parts.append(f"[{msg.get('role', '?')}] {digest}")
+        summary = (
+            f"[会话压缩] 早期 {len(oldest)} 条消息已压缩为摘要（保留工具结论要点，"
+            f"完整证据已记录在 sandbox_attempts）：\n" + "\n".join(parts)
+        )
+        self._conversation_history = [history[0], {"role": "user", "content": summary}] + kept
+
+    def _finalize_findings_without_final_answer(self, findings_to_verify: List[Dict]) -> List[Dict]:
+        """V6 B3（REQ-VE-3）：LLM 空 Final Answer 时的回退收口。
+
+        归一化前先按 finding_id 回填运行时证据（消费 B4 索引与扁平列表），
+        状态由 compute_verification_status 据实推导——
+        有铁证 → confirmed/static_confirmed；执行未复现 → not_reproducible；
+        禁止直接以 needs_context 覆盖有证据的 finding。
+        """
+        results: List[Dict] = []
+        for f in findings_to_verify:
+            target = {
+                **f,
+                "verdict": "needs_context",
+                "confidence": 0.5,
+                "is_verified": False,
+            }
+            if not target.get("sandbox_attempts"):
+                self._attach_runtime_sandbox_attempts(target)
+            results.append(self._normalize_verification_outcome(target))
+        return results
 
     def _attach_runtime_sandbox_attempts(self, finding: dict[str, Any]) -> None:
         """Attach runtime sandbox evidence when the LLM omitted sandbox_attempts in Final Answer.
@@ -1668,13 +1880,21 @@ class VerificationAgent(BaseAgent):
         attempts = getattr(self, "_sandbox_attempts", [])
 
         # Opt-1: ID-based matching (precise, before fuzzy)
+        # V6 B1（REQ-VE-1）：绑定层不再以 success=True 为前置——失败 attempt 也如实绑定，
+        # 成败判定交给 compute_verification_status（有失败尝试 → not_reproducible 而非
+        # needs_context）。生产任务 5a1f7ab6：21 次执行因该前置过滤 0 证据落库。
+        # V6 B4（REQ-VE-4）：优先消费 finding_id 索引（确定性执行直写，反解失败也齐全），
+        # 索引缺失时回退扁平列表过滤；合并前按语义键去重防止双计。
         finding_id = finding.get("_sandbox_finding_id")
         if finding_id:
-            id_matched = [a for a in attempts
-                          if a.get("finding_id") == finding_id
-                          and a.get("success") is True]
+            index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
+            id_matched = index.get(str(finding_id)) or [
+                a for a in attempts if a.get("finding_id") == finding_id
+            ]
             if id_matched:
-                finding["sandbox_attempts"] = existing_attempts + id_matched
+                finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                    existing_attempts, id_matched
+                )
                 logger.info(
                     f"[{self.name}] ID-based sandbox match: finding_id={finding_id} "
                     f"-> {len(id_matched)} attempts"
@@ -1904,7 +2124,10 @@ class VerificationAgent(BaseAgent):
         # 代码推理链确认（soft evidence）：沙箱环境受限无法动态复现时，
         # 有 dataflow+code_snippet+高置信度+verification_method → static_confirmed。
         # 仅当证据引擎未给出 confirmed/static_confirmed 时才兜底（避免覆盖铁证）。
-        if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE):
+        # REQ-VE-2：验证器崩溃（全 poc_error）的 finding 不得走软证据兜底，
+        # 否则"PoC 崩溃"会被洗成"已确认"（掩盖验证器故障）。
+        if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE) \
+                and not any(a.get("poc_error") for a in attempts):
             VULN_TYPES_SOFT_EVIDENCE = {
                 "xss", "ssrf", "auth_bypass", "csrf", "auth_missing", "tenant_isolation", "idor",
                 "business_logic", "race_condition", "open_redirect",
@@ -2106,7 +2329,7 @@ class VerificationAgent(BaseAgent):
                     finding_idx = self._parse_finding_index_from_command(command)
                     if finding_idx is not None:
                         self._verified_finding_indices.add(finding_idx)
-                self._record_sandbox_attempt(cmd_input, result)
+                self._record_sandbox_attempt(cmd_input, result, finding_id=sc.get("finding_id"))
                 executed += 1
                 logger.info(
                     f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"
@@ -2169,10 +2392,15 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
+                    f"    sink_found = False\n"
                     f"    for kw in ['execute','raw','query','cursor','executescript','sql']:\n"
                     f"        cnt = content.lower().count(kw)\n"
-                    f"        if cnt: print(f'  SQL sink \"{{kw}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"        if cnt:\n"
+                    f"            sink_found = True\n"
+                    f"            print(f'  SQL sink \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: in-memory SQLite ---')\n"
                     f"conn = sqlite3.connect(':memory:')\n"
                     f"cur = conn.cursor()\n"
@@ -2198,8 +2426,10 @@ class VerificationAgent(BaseAgent):
                     f"        print(f'  payload={{p!r}} error={{type(e).__name__}}: {{e}}')\n"
                     f"        if p != '1':\n"
                     f"            print(f'    -> syntax break indicates injection surface')\n"
-                    f"if injectable:\n"
-                    f"    print('VULNERABILITY_CONFIRMED: SQL injection dynamically verified (in-memory SQLite)')\n"
+                    f"if injectable and sink_found:\n"
+                    f"    print('VULNERABILITY_CONFIRMED(STATIC): SQL injection pattern verified via in-memory SQLite demo (source-asserted, no data-flow to target)')\n"
+                    f"elif content and not sink_found:\n"
+                    f"    print('NO_SINK: 目标源码未发现 SQL sink 关键词，演示性确认不成立')\n"
                     f"elif content:\n"
                     f"    print('NOTE: dynamic exec did not confirm; verify SQL sink reaches user input manually')\n"
                     f"print('=== Verification Complete ===')\n"
@@ -2211,7 +2441,7 @@ class VerificationAgent(BaseAgent):
             'command_injection': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import subprocess, os, re\n"
+                    f"import subprocess, os, re, sys\n"
                     f"print('=== SANDBOX Command Injection Verification (dynamic) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2221,9 +2451,15 @@ class VerificationAgent(BaseAgent):
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
                     f"    for kw in ['subprocess','os.system','os.popen','eval(','exec(','shell=True']:\n"
+                    f"    sink_found = False\n"
+                    f"    for kw in ['subprocess','os.system','os.popen','eval(','exec(','shell=True']:\n"
                     f"        cnt = content.count(kw)\n"
-                    f"        if cnt: print(f'  Dangerous call \"{{kw}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"        if cnt:\n"
+                    f"            sink_found = True\n"
+                    f"            print(f'  Dangerous call \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: shell injection simulation ---')\n"
                     f"user_input = 'hello; id; whoami'\n"
                     f"try:\n"
@@ -2231,8 +2467,10 @@ class VerificationAgent(BaseAgent):
                     f"    out = r.stdout\n"
                     f"    print(f'  shell output: {{out.strip()[:200]}}')\n"
                     f"    uid = re.search(r'uid=\\d+', out)\n"
-                    f"    if uid:\n"
-                    f"        print(f'VULNERABILITY_CONFIRMED: shell injection executed id -> {{uid.group(0)}}')\n"
+                    f"    if uid and sink_found:\n"
+                    f"        print(f'VULNERABILITY_CONFIRMED(STATIC): shell injection demo executed id -> {{uid.group(0)}} (no data-flow to target source)')\n"
+                    f"    elif not sink_found:\n"
+                    f"        print('NO_SINK: 目标源码未发现命令注入 sink 关键词，演示性确认不成立')\n"
                     f"    else:\n"
                     f"        print('NOTE: shell=True with user input is exploitable; verify sink reaches user input')\n"
                     f"except Exception as e:\n"
@@ -2246,7 +2484,7 @@ class VerificationAgent(BaseAgent):
             'xss': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX XSS/SSTI Verification (dynamic) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2266,6 +2504,7 @@ class VerificationAgent(BaseAgent):
                     f"            print(f'  sink {{pat}}: {{len(ms)}} matches')\n"
                     f"else:\n"
                     f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('--- Dynamic verification: Jinja2 SSTI render ---')\n"
                     f"ssti_confirmed = False\n"
                     f"try:\n"
@@ -2281,8 +2520,10 @@ class VerificationAgent(BaseAgent):
                     f"                print(f'  probe {{probe}} -> {{rendered}}')\n"
                     f"        except Exception as e:\n"
                     f"            print(f'  probe {{probe}} error: {{e}}')\n"
-                    f"    if ssti_confirmed:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: SSTI dynamically verified (Jinja2 rendered {{{{7*7}}}}=49)')\n"
+                    f"    if ssti_confirmed and sink_found:\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): SSTI demo verified (Jinja2 rendered {{{{7*7}}}}=49; no data-flow to target source)')\n"
+                    f"    elif not sink_found:\n"
+                    f"        print('NO_SINK: 目标源码未发现 XSS/SSTI sink 关键词，演示性确认不成立')\n"
                     f"    elif sink_found:\n"
                     f"        print('VULNERABILITY_STATIC_ONLY: dangerous XSS/SSTI sink present; verify it reaches user input')\n"
                     f"    else:\n"
@@ -2302,7 +2543,7 @@ class VerificationAgent(BaseAgent):
             'path_traversal': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX Path Traversal Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2310,10 +2551,12 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'os\\.path\\.join', r'\\.\\./', r'open\\\\(', r'pathlib', r'send_file', r'send_from_directory']:\n"
+                    f"    for pat in [r'os\\.path\\.join', r'\\.\\./', r'open\\(', r'pathlib', r'send_file', r'send_from_directory']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Pattern \"{{pat}}\": {{cnt}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"paths = ['/etc/passwd', '../../../etc/passwd', '....//....//etc/passwd']\n"
                     f"for p in paths: print(f'Testing path: {{p}}, exists={{os.path.exists(p)}}')\n"
                     f"print('=== Verification Complete ===')\n"
@@ -2325,7 +2568,7 @@ class VerificationAgent(BaseAgent):
             'ssrf': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re, urllib.request\n"
+                    f"import os, re, sys, urllib.request\n"
                     f"print('=== SANDBOX SSRF Verification (enhanced) ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2334,10 +2577,12 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'requests\\.get', r'httpx', r'urllib', r'aiohttp', r'fetch\\\\(']:\n"
+                    f"    for pat in [r'requests\\.get', r'httpx', r'urllib', r'aiohttp', r'fetch\\(']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  HTTP call \"{{pat}}\": {{cnt}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"# 检查源码是否对用户输入 URL 做过滤/校验\n"
                     f"has_filter = bool(re.search(r'valid|filter|sanitiz|allowlist|blocklist|urlparse', content, re.I))\n"
                     f"print(f'URL filter/validate in source: {{has_filter}}')\n"
@@ -2351,9 +2596,9 @@ class VerificationAgent(BaseAgent):
                     f"except Exception as e:\n"
                     f"    print(f'metadata endpoint: blocked - {{type(e).__name__}}: {{e}}')\n"
                     f"# 判定\n"
-                    f"sink_found = bool(re.search(r'requests\\.get|httpx|urllib|aiohttp|fetch\\\\(', content))\n"
+                    f"sink_found = bool(re.search(r'requests\\.get|httpx|urllib|aiohttp|fetch\\(', content))\n"
                     f"if metadata_hit:\n"
-                    f"    print('VULNERABILITY_CONFIRMED: SSRF dynamically verified (cloud metadata reachable via user-controlled URL)')\n"
+                    f"    print('VULNERABILITY_CONFIRMED(STATIC): SSRF demo - cloud metadata reachable via PoC-initiated request (no data-flow to target source)')\n"
                     f"elif sink_found and not has_filter:\n"
                     f"    # bridge 不可用降级：未联网但源码存在未过滤的 HTTP 调用 sink\n"
                     f"    print('STATIC_CONFIRMED: SSRF sink present without URL filter/validate; degraded 检查 URL 解析逻辑 (bridge unavailable, 未真实联网)')\n"
@@ -2375,6 +2620,19 @@ class VerificationAgent(BaseAgent):
                     f"print('=== SANDBOX Auth Missing Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
+                    f"src = '/workspace/src/{safe_path}'\n"
+                    f"if os.path.exists(src):\n"
+                    f"    with open(src) as f: content = f.read()\n"
+                    f"    print(f'Source: {{len(content)}} chars loaded')\n"
+                    f"    sink_found = False\n"
+                    f"    for kw in ['@app.get','@RequestMapping','@GetMapping','@PostMapping','@PutMapping','@DeleteMapping','login_required','@Secured','@PreAuthorize']:\n"
+                    f"        cnt = content.count(kw)\n"
+                    f"        if cnt:\n"
+                    f"            sink_found = True\n"
+                    f"            print(f'  Endpoint/auth pattern \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"# 容器内 loopback mock：无认证的敏感接口（不受 network_mode 限制）\n"
                     f"sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
                     f"sock.bind(('127.0.0.1', 0))\n"
@@ -2402,8 +2660,10 @@ class VerificationAgent(BaseAgent):
                     f"    resp = urllib.request.urlopen(req, timeout=5)\n"
                     f"    body = resp.read().decode()\n"
                     f"    print(f'no-auth request: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
-                    f"    if resp.getcode() == 200 and 'users' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: 无认证即可访问敏感接口 (missing authentication)')\n"
+                    f"    if resp.getcode() == 200 and 'users' in body and sink_found:\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): 无认证即可访问敏感接口 (loopback mock 演示，与目标源码无数据流因果)')\n"
+                    f"    elif not sink_found:\n"
+                    f"        print('NO_SINK: 目标源码未发现接口定义模式，无认证访问断言不成立')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 无凭证请求被拒绝或无敏感数据')\n"
                     f"except Exception as e:\n"
@@ -2428,6 +2688,19 @@ class VerificationAgent(BaseAgent):
                     f"print('=== SANDBOX Tenant Isolation Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
+                    f"src = '/workspace/src/{safe_path}'\n"
+                    f"if os.path.exists(src):\n"
+                    f"    with open(src) as f: content = f.read()\n"
+                    f"    print(f'Source: {{len(content)}} chars loaded')\n"
+                    f"    sink_found = False\n"
+                    f"    for kw in ['@RequestMapping','@GetMapping','@PostMapping','tenant','X-Tenant','user_id','@Secured']:\n"
+                    f"        cnt = content.count(kw)\n"
+                    f"        if cnt:\n"
+                    f"            sink_found = True\n"
+                    f"            print(f'  Tenant/endpoint pattern \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"# 容器内 loopback mock：多租户数据，不校验租户归属\n"
                     f"sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
                     f"sock.bind(('127.0.0.1', 0))\n"
@@ -2458,8 +2731,10 @@ class VerificationAgent(BaseAgent):
                     f"    resp = urllib.request.urlopen(req, timeout=5)\n"
                     f"    body = resp.read().decode()\n"
                     f"    print(f'tenant B request: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
-                    f"    if resp.getcode() == 200 and 'a-key-123' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: 多租户隔离失效 (B 租户读到 A 租户数据)')\n"
+                    f"    if resp.getcode() == 200 and 'a-key-123' in body and sink_found:\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): 多租户隔离失效 (loopback mock 演示，与目标源码无数据流因果)')\n"
+                    f"    elif not sink_found:\n"
+                    f"        print('NO_SINK: 目标源码未发现租户/接口模式，跨租户断言不成立')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 租户隔离生效，跨租户数据不可读')\n"
                     f"except Exception as e:\n"
@@ -2482,6 +2757,19 @@ class VerificationAgent(BaseAgent):
                     f"print('=== SANDBOX IDOR Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
+                    f"src = '/workspace/src/{safe_path}'\n"
+                    f"if os.path.exists(src):\n"
+                    f"    with open(src) as f: content = f.read()\n"
+                    f"    print(f'Source: {{len(content)}} chars loaded')\n"
+                    f"    sink_found = False\n"
+                    f"    for kw in ['@RequestMapping','@GetMapping','@PostMapping','@PathVariable','user_id','id =','@Secured','@PreAuthorize']:\n"
+                    f"        cnt = content.count(kw)\n"
+                    f"        if cnt:\n"
+                    f"            sink_found = True\n"
+                    f"            print(f'  Resource/endpoint pattern \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"# 容器内 loopback mock：CRUD 接口不校验资源归属\n"
                     f"sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
                     f"sock.bind(('127.0.0.1', 0))\n"
@@ -2512,8 +2800,10 @@ class VerificationAgent(BaseAgent):
                     f"    resp = urllib.request.urlopen(req, timeout=5)\n"
                     f"    body = resp.read().decode()\n"
                     f"    print(f'guest request user/999: HTTP {{resp.getcode()}}, body={{body[:80]!r}}')\n"
-                    f"    if resp.getcode() == 200 and 'user999' in body:\n"
-                    f"        print('VULNERABILITY_CONFIRMED: IDOR 越权可访问他人资源 (guest 读取 user/999)')\n"
+                    f"    if resp.getcode() == 200 and 'user999' in body and sink_found:\n"
+                    f"        print('VULNERABILITY_CONFIRMED(STATIC): IDOR 越权可访问他人资源 (loopback mock 演示，与目标源码无数据流因果)')\n"
+                    f"    elif not sink_found:\n"
+                    f"        print('NO_SINK: 目标源码未发现资源/接口模式，越权断言不成立')\n"
                     f"    else:\n"
                     f"        print('FALSE_POSITIVE: 资源归属校验生效，越权不可读')\n"
                     f"except Exception as e:\n"
@@ -2532,7 +2822,7 @@ class VerificationAgent(BaseAgent):
             'hardcoded_secret': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re\n"
+                    f"import os, re, sys\n"
                     f"print('=== SANDBOX Hardcoded Secret Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2548,7 +2838,9 @@ class VerificationAgent(BaseAgent):
                     f"    for pat in patterns:\n"
                     f"        matches = re.findall(pat, content)\n"
                     f"        if matches: print(f'  Secret pattern found: {{len(matches)}} matches')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"print('=== Verification Complete ===')\n"
                     f"POC_EOF\n"
                     f"python3 /tmp/poc_{index}.py"
@@ -2558,7 +2850,7 @@ class VerificationAgent(BaseAgent):
             'deserialization': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                    f"import os, re, pickle, json\n"
+                    f"import os, re, sys, pickle, json\n"
                     f"print('=== SANDBOX Deserialization Verification ===')\n"
                     f"print('Target: {file_ref}')\n"
                     f"print('Title: {safe_title}')\n"
@@ -2566,10 +2858,12 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'pickle\\.load', r'yaml\\.load', r'json\\.loads', r'marshal\\.load', r'eval\\\\(']:\n"
+                    f"    for pat in [r'pickle\\.load', r'yaml\\.load', r'json\\.loads', r'marshal\\.load', r'eval\\(']:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Unsafe call \"{{pat}}\": {{cnt}} occurrences')\n"
-                    f"else: print(f'Source not found: {{src}}')\n"
+                    f"else:\n"
+                    f"    print(f'Source not found: {{src}}')\n"
+                    f"    sys.exit(1)\n"
                     f"safe_data = json.dumps({{'test': 'data'}})\n"
                     f"print(f'JSON safe: {{json.loads(safe_data)}}')\n"
                     f"print(f'pickle available: True')\n"
@@ -2597,7 +2891,7 @@ class VerificationAgent(BaseAgent):
                 'input': {
                     'command': (
                         f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
-                        f"import os, re\n"
+                        f"import os, re, sys\n"
                         f"print('=== SANDBOX Vulnerability Verification ===')\n"
                         f"print('Target: {file_ref}')\n"
                         f"print('Type: {vuln_type}')\n"
@@ -2606,7 +2900,9 @@ class VerificationAgent(BaseAgent):
                         f"if os.path.exists(src):\n"
                         f"    with open(src) as f: content = f.read()\n"
                         f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                        f"else: print(f'Source not found: {{src}}')\n"
+                        f"else:\n"
+                        f"    print(f'Source not found: {{src}}')\n"
+                        f"    sys.exit(1)\n"
                         f"print('=== Verification Complete ===')\n"
                         f"POC_EOF\n"
                         f"python3 /tmp/poc_{index}.py"
