@@ -121,6 +121,15 @@ def compute_verification_status(
     if llm_verdict == VerificationStatus.FALSE_POSITIVE:
         return VerificationStatus.FALSE_POSITIVE, False, {}
 
+    # 3.5) REQ-VE-2：验证器（PoC）自身崩溃与"未复现"分档。
+    # 全部 attempt 均为 poc_error（Traceback/SyntaxError/re.error 等）→ needs_context
+    # 并注明验证器崩溃，不得冒充 not_reproducible（"没复现"语义只留给 PoC 正常执行）。
+    if real_attempts and all(a.get("poc_error") for a in real_attempts):
+        return VerificationStatus.NEEDS_CONTEXT, False, {
+            "reason": "pre-generated PoC crashed",
+            "poc_error": True,
+        }
+
     # 4) not_reproducible：尝试过但未复现
     if real_attempts:
         return VerificationStatus.NOT_REPRODUCIBLE, False, {
@@ -1572,6 +1581,11 @@ class VerificationAgent(BaseAgent):
         # R3: 伪造证据强制降级为失败，杜绝"Simulated + VULNERABILITY_CONFIRMED"被当铁证
         if fabricated:
             success = False
+        # REQ-VE-2：验证器（PoC）自身崩溃与"未复现"分档——崩溃特征打 poc_error 标记，
+        # 下游状态机据此判 needs_context（notes 注明），不冒充 not_reproducible、不被软证据兜底升级
+        obs_text = str(observation or "")
+        poc_error = any(m in obs_text for m in ("Traceback", "SyntaxError", "re.error", "unterminated"))
+        poc_error_type = "pre-generated PoC crashed" if poc_error else None
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
@@ -1588,6 +1602,8 @@ class VerificationAgent(BaseAgent):
             "finding_id": finding_id,
             "fabricated": fabricated,
             "static_evidence": static_evidence,
+            "poc_error": poc_error,
+            "poc_error_type": poc_error_type,
         }
         self._sandbox_attempts.append(attempt)
         # V6 B4（REQ-VE-4）：双写——按 finding_id 登记运行时证据索引，
@@ -2072,7 +2088,10 @@ class VerificationAgent(BaseAgent):
         # 代码推理链确认（soft evidence）：沙箱环境受限无法动态复现时，
         # 有 dataflow+code_snippet+高置信度+verification_method → static_confirmed。
         # 仅当证据引擎未给出 confirmed/static_confirmed 时才兜底（避免覆盖铁证）。
-        if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE):
+        # REQ-VE-2：验证器崩溃（全 poc_error）的 finding 不得走软证据兜底，
+        # 否则"PoC 崩溃"会被洗成"已确认"（掩盖验证器故障）。
+        if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE) \
+                and not any(a.get("poc_error") for a in attempts):
             VULN_TYPES_SOFT_EVIDENCE = {
                 "xss", "ssrf", "auth_bypass", "csrf", "auth_missing", "tenant_isolation", "idor",
                 "business_logic", "race_condition", "open_redirect",

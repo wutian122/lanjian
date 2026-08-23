@@ -502,3 +502,45 @@ def test_template_regex_patterns_compile():
                 _re.compile(pat)
             except _re.error as e:
                 raise AssertionError(f"{vuln_type} 模板正则 {pat!r} 编译失败: {e}")
+
+
+# ============ 验证完整性 w1（REQ-VE-2）：poc_error 分档 ============
+
+def test_poc_crash_marked_and_needs_context():
+    """PoC 自身崩溃（re.error）→ poc_error 标记 + needs_context，不冒充 not_reproducible。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "# FINDING_ID:f-poc-1\npython3 /tmp/poc_0.py"},
+        "沙箱执行结果\n退出码: 1\n标准输出:\n```\nTraceback (most recent call last):\n"
+        "  File re/_parser.py\nre.error: missing ), unterminated subpattern at position 7\n```",
+    )
+    a = agent._sandbox_attempts[0]
+    assert a.get("poc_error") is True, "崩溃 attempt 必须打 poc_error 标记"
+    finding = _finding(_sandbox_finding_id="f-poc-1")
+    agent._runtime_attempts_by_finding_id = {"f-poc-1": [a]}
+    agent._attach_runtime_sandbox_attempts(finding)
+    normalized = agent._normalize_verification_outcome(finding)
+    assert normalized["verification_status"] == "needs_context", "全部崩溃不得冒充 not_reproducible"
+    assert normalized["is_verified"] is False
+    assert "crashed" in str(normalized.get("verification_note") or ""), "notes 必须注明验证器崩溃"
+
+
+def test_poc_crash_not_promoted_by_soft_evidence():
+    """全 poc_error 的 finding 不得被软证据兜底升级为 static_confirmed（崩溃不被洗成已确认）。"""
+    agent = _make_agent()
+    finding = _finding(
+        _sandbox_finding_id="f-poc-2",
+        dataflow_path="a->b->c",
+        code_snippet="x",
+        ai_confidence=0.95,
+        verification_method="sandbox_exec",
+        vulnerability_type="xss",
+        sandbox_attempts=[{
+            "success": False, "exit_code": 1,
+            "evidence_summary": "re.error: unterminated subpattern",
+            "poc_error": True, "poc_error_type": "pre-generated PoC crashed",
+        }],
+    )
+    normalized = agent._normalize_verification_outcome(finding)
+    assert normalized["verification_status"] == "needs_context"
+    assert normalized["is_verified"] is False
