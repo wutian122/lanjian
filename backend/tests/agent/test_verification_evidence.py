@@ -544,3 +544,18 @@ def test_poc_crash_not_promoted_by_soft_evidence():
     normalized = agent._normalize_verification_outcome(finding)
     assert normalized["verification_status"] == "needs_context"
     assert normalized["is_verified"] is False
+
+
+# ============ 验证完整性 w1（REQ-VP-1）：演示确认挂源码 sink 断言 ============
+
+def test_template_sink_assertion_gating():
+    """6 类模板演示确认必须挂 sink 断言：sink=0 输出 NO_SINK 不确认。"""
+    agent = _make_agent()
+    for vt in ("sql_injection", "command_injection", "xss"):
+        s = agent._gen_sandbox_command(vt, "app.py", 10, "t", 0)["input"]["command"]
+        assert "NO_SINK" in s, f"{vt} 须有 NO_SINK 分支"
+        assert "sink_found" in s, f"{vt} 演示确认必须引用 sink_found"
+    for vt in ("auth_missing", "tenant_isolation", "idor"):
+        s = agent._gen_sandbox_command(vt, "app.py", 10, "t", 0)["input"]["command"]
+        assert "Source not found" in s and "sys.exit(1)" in s, f"{vt} 须读源码断言（源码缺失 exit 1）"
+        assert "NO_SINK" in s, f"{vt} 须有 NO_SINK 分支"
