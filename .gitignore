@@ -75,3 +75,6 @@ test-results/
 *.db
 *.sqlite
 *.sqlite3
+
+# spec-superflow change directories (workflow artifacts, not committed)
+changes/
