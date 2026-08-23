@@ -486,3 +486,19 @@ def test_final_answer_parseable_after_long_session():
     assert len(agent._conversation_history) <= 40, "60 轮后历史上界仍成立"
     m = _re.search(r"Final Answer:\s*(\{.*\})", final_text)
     assert m and m.group(1) == '{"findings": []}', "Final Answer 可正常解析"
+
+
+# ============ 验证完整性 w1（REQ-VE-1）：模板正则可编译 ============
+
+def test_template_regex_patterns_compile():
+    """3 模板生成的 PoC 中所有 re pattern 必须可编译（修复未闭合分组转义 bug）。"""
+    import re as _re
+    agent = _make_agent()
+    for vuln_type in ("ssrf", "path_traversal", "deserialization"):
+        script = agent._gen_sandbox_command(vuln_type, "app.py", 10, "t", 0)["input"]["command"]
+        for m in _re.finditer(r"r'([^']*)'", script):
+            pat = m.group(1)
+            try:
+                _re.compile(pat)
+            except _re.error as e:
+                raise AssertionError(f"{vuln_type} 模板正则 {pat!r} 编译失败: {e}")
