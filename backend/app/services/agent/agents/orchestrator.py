@@ -2623,6 +2623,9 @@ Action Input: {{"参数": "值"}}
         if target_agent == "recon" and not self._agent_results:
             return None
 
+        # T5 (REQ-VC-1): 严重程度排序映射，verification 交接 key_findings 按此对全量排序
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
         # 🔥 优先使用前序 Agent 返回的 handoff
         # Analysis Agent 需要 Recon 的 handoff
         if target_agent == "analysis" and "recon" in self._agent_handoffs:
@@ -2660,7 +2663,12 @@ Action Input: {{"参数": "值"}}
                 to_agent=target_agent,
                 summary=analysis_handoff.summary,
                 work_completed=analysis_handoff.work_completed,
-                key_findings=analysis_handoff.key_findings,
+                # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
+                # 按严重程度排序；analysis_handoff 仍提供 summary/insights 等其余信息
+                key_findings=sorted(
+                    self._all_findings,
+                    key=lambda f: severity_order.get(f.get("severity", "low"), 3),
+                ),
                 insights=analysis_handoff.insights,
                 suggested_actions=analysis_handoff.suggested_actions,
                 attention_points=analysis_handoff.attention_points,
@@ -2748,14 +2756,14 @@ Action Input: {{"参数": "值"}}
                 if findings:
                     work_completed.append(f"发现 {len(findings)} 个潜在漏洞")
 
-                    # 按严重程度排序，优先验证高危漏洞
-                    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+                    # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
+                    # 按严重程度排序，去掉 [:15] 截断
                     sorted_findings = sorted(
-                        findings,
+                        self._all_findings,
                         key=lambda x: severity_order.get(x.get("severity", "low"), 3)
                     )
 
-                    for f in sorted_findings[:15]:
+                    for f in sorted_findings:
                         if isinstance(f, dict):
                             key_findings.append(f)
                             suggested_actions.append({

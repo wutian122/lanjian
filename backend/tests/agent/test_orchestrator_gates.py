@@ -149,7 +149,6 @@ def test_static_confirmed_with_sandbox_evidence_is_valid():
 
 
 # ============ R5: Bug D 全量验证门禁判定修正 ============
-
 def test_bugD_gate_treats_needs_context_as_unverified():
     """R5: needs_context 状态被视为未验证 → unverified_findings 非空（原逻辑被默认值击穿）。"""
     agent = _make_agent()
@@ -196,3 +195,61 @@ def test_record_gate_observation_accumulates():
     assert "覆盖率" in agent._gate_observations[1]["reason"]
     # 每条都带时间戳
     assert all("time" in obs for obs in agent._gate_observations)
+
+
+# ============ T5 (REQ-VC-1): 交接数据源改用 _all_findings 全量 ============
+
+def _make_analysis_handoff(key_findings):
+    from app.services.agent.agents.base import TaskHandoff
+    return TaskHandoff(
+        from_agent="analysis",
+        to_agent="verification",
+        summary="分析完成",
+        work_completed=["完成代码深度分析"],
+        key_findings=key_findings,
+        context_data={},
+    )
+
+
+def test_handoff_verification_priority_branch_uses_all_findings():
+    """T5 (REQ-VC-1): 优先分支——verification 交接 key_findings 改用 _all_findings 全量（含早期轮 finding）。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "early-sqli", "severity": "low", "file_path": "a.py"},
+        {"title": "latest-xss", "severity": "critical", "file_path": "b.py"},
+    ]
+    # analysis_handoff 只携带最新轮 finding（早期轮 finding 丢失正是本 bug 根因）
+    agent._agent_handoffs = {
+        "analysis": _make_analysis_handoff(
+            [{"title": "latest-xss", "severity": "critical", "file_path": "b.py"}]
+        )
+    }
+    agent._agent_results = {}
+
+    handoff = agent._build_handoff_for_agent("verification", "验证漏洞", "context")
+    assert handoff is not None
+    titles = [f["title"] for f in handoff.key_findings]
+    # 全量来源：包含早期轮 finding，且按 severity 排序（critical 在前）
+    assert set(titles) == {"early-sqli", "latest-xss"}
+    assert titles == ["latest-xss", "early-sqli"]
+
+
+def test_handoff_verification_fallback_branch_uses_all_findings():
+    """T5 (REQ-VC-1): 回退分支——无 analysis handoff 时 key_findings 亦用 _all_findings 全量。"""
+    agent = _make_agent()
+    agent._all_findings = [
+        {"title": "early-sqli", "severity": "low", "file_path": "a.py"},
+        {"title": "latest-xss", "severity": "high", "file_path": "b.py"},
+    ]
+    agent._agent_handoffs = {}
+    # analysis 最后一轮结果只报 1 条，早期轮 finding 仅存在于 _all_findings
+    agent._agent_results = {
+        "recon": {"tech_stack": {}, "entry_points": []},
+        "analysis": {"findings": [{"title": "latest-xss", "severity": "high", "file_path": "b.py"}]},
+    }
+
+    handoff = agent._build_handoff_for_agent("verification", "验证漏洞", "context")
+    assert handoff is not None
+    titles = [f["title"] for f in handoff.key_findings]
+    assert set(titles) == {"early-sqli", "latest-xss"}
+    assert titles == ["latest-xss", "early-sqli"]
