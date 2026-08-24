@@ -84,7 +84,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:v6.0.1
+    image: wutian449/lanjian-frontend:v6.0.2
     restart: unless-stopped
     ports:
       - "80:80"
