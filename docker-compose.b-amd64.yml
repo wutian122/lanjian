@@ -44,7 +44,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v6.0.3
+    image: wutian449/lanjian-backend:v6.1.0
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -59,7 +59,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       AGENT_ENABLED: "true"
       SANDBOX_ENABLED: "true"
-      SANDBOX_IMAGE: wutian449/lanjian-sandbox:v5.1.0
+      SANDBOX_IMAGE: wutian449/lanjian-sandbox:v6.1.0
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
@@ -84,7 +84,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:v6.0.2
+    image: wutian449/lanjian-frontend:v6.1.0
     restart: unless-stopped
     ports:
       - "80:80"
@@ -96,7 +96,7 @@ services:
       - lanjian-network
 
   sandbox:
-    image: wutian449/lanjian-sandbox:v5.1.0
+    image: wutian449/lanjian-sandbox:v6.1.0
     restart: "no"
     command: ["sh", "-c", "echo Sandbox image ready"]
 
