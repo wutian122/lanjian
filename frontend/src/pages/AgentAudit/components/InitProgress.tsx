@@ -1,14 +1,24 @@
 import { Loader2, CheckCircle2, Circle } from "lucide-react";
 import type { InitStep } from "../types";
 
-interface InitProgressProps {
-  steps: InitStep[];
+export interface IndexingProgress {
+  phase: string;
+  current: number;
+  total: number;
 }
 
-export function InitProgress({ steps }: InitProgressProps) {
+interface InitProgressProps {
+  steps: InitStep[];
+  indexingProgress?: IndexingProgress | null;
+}
+
+export function InitProgress({ steps, indexingProgress }: InitProgressProps) {
   const completedCount = steps.filter((s) => s.status === "done").length;
   const totalCount = steps.length;
   const progressPercent = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
+  const indexingPct = indexingProgress && indexingProgress.total > 0
+    ? Math.round((indexingProgress.current / indexingProgress.total) * 100)
+    : 0;
 
   return (
     <div className="flex flex-col items-center gap-8 relative z-10">
@@ -32,6 +42,17 @@ export function InitProgress({ steps }: InitProgressProps) {
           <span>{completedCount} / {Math.max(totalCount, 4)}</span>
           <span>{Math.round(progressPercent)}%</span>
         </div>
+        {/* REQ-IP-1: RAG 索引进度实时显示（分块/嵌入） */}
+        {indexingProgress && (
+          <div className="flex items-center gap-2 mt-3 text-xs text-muted-foreground font-mono">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-primary flex-shrink-0" />
+            <span>
+              {"\u6b63\u5728\u7d22\u5f15\uff1a"}
+              {indexingProgress.phase === "chunking" ? "\u5206\u5757" : "\u5d4c\u5165"}{" "}
+              {indexingProgress.current}/{indexingProgress.total} 文件 ({indexingPct}%)
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Steps list */}
