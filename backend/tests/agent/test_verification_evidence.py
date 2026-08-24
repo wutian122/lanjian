@@ -636,3 +636,38 @@ def test_attach_position_fallback_binds_by_location():
     finding = _finding(line_start=113)  # 无 ID
     agent._attach_runtime_sandbox_attempts(finding)
     assert finding.get("sandbox_attempts"), "位置兜底必须绑定（attempts 非空）"
+
+
+# ============ LLM 字段类型防御（REQ-TH-1~4）============
+
+def test_to_int_normalizes_llm_values():
+    """REQ-TH-1：_to_int/_to_float 边界——'113'/'113.0'/113/None/''/'abc' 不抛异常。"""
+    from app.services.agent.strict_finding import _to_int, _to_float
+    assert _to_int("113") == 113
+    assert _to_int("113.0") == 113
+    assert _to_int(113) == 113
+    assert _to_int(None) is None
+    assert _to_int("") is None
+    assert _to_int("abc") is None
+    assert _to_float("0.85") == 0.85
+    assert _to_float(None) is None
+
+
+def test_strict_finding_line_start_str_no_crash():
+    """REQ-TH-3：line_start 为 str 时 is_strict_finding 不崩溃（c9de9d40 回归）。"""
+    from app.services.agent.strict_finding import is_strict_finding
+    f = _finding(line_start="113")
+    assert is_strict_finding(f) is True, "str line_start 归一后不崩溃且通过校验"
+
+
+def test_verification_ai_confidence_str_no_crash():
+    """REQ-TH-4：ai_confidence 为 str 时软证据兜底不崩溃。"""
+    agent = _make_agent()
+    finding = _finding(
+        _sandbox_finding_id="f-t4-1",
+        dataflow_path="a->b", code_snippet="x", ai_confidence="0.9",
+        verification_method="sandbox_exec", vulnerability_type="xss",
+        sandbox_attempts=[],
+    )
+    normalized = agent._normalize_verification_outcome(finding)
+    assert normalized["verification_status"] in ("static_confirmed", "needs_context"), "str ai_confidence 不崩溃"

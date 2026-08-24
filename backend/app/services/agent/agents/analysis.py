@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
 from ..json_parser import AgentJsonParser
+from ..strict_finding import _to_int, _to_float
 from ..knowledge.loader import KnowledgeLoader
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, build_enhanced_prompt
 
@@ -878,12 +879,13 @@ Final Answer:""",
                     "title": finding.get("title", "Unknown Finding"),
                     "description": finding.get("description", ""),
                     "file_path": finding.get("file_path", ""),
-                    "line_start": finding.get("line_start") or finding.get("line", 0),
+                    # REQ-TH-2: LLM 数值字段源头归一化——str line_start/confidence 不得原样透传（生产 c9de9d40 崩溃根源）
+                    "line_start": _to_int(finding.get("line_start") or finding.get("line", 0)) or 0,
                     "code_snippet": finding.get("code_snippet", ""),
                     "source": finding.get("source", ""),
                     "sink": finding.get("sink", ""),
                     "suggestion": finding.get("suggestion", ""),
-                    "confidence": finding.get("confidence", 0.7),
+                    "confidence": _to_float(finding.get("confidence", 0.7)) or 0.7,
                     "needs_verification": finding.get("needs_verification", True),
                 }
                 standardized_findings.append(standardized)

@@ -22,7 +22,7 @@ from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, 
 from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, build_enhanced_prompt
 from app.models.agent_task import VerificationStatus
-from app.services.agent.strict_finding import is_strict_finding
+from app.services.agent.strict_finding import is_strict_finding, _to_int, _to_float
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ def compute_verification_status(
 
     # 1) confirmed：成功执行 + 漏洞触发证据 + 匹配 finding
     for a in real_attempts:
-        if a.get("success") is True and a.get("exit_code") == 0:
+        if a.get("success") is True and _to_int(a.get("exit_code")) == 0:
             if evidence_has_vuln(a) and evidence_matches(a, finding):
                 return VerificationStatus.CONFIRMED, True, {}
 
@@ -159,7 +159,7 @@ def _attempt_matches_finding_default(attempt: dict[str, Any], finding: dict[str,
     """模块级默认匹配（宽松：success + exit_code 0 即可，精确匹配由实例注入）。"""
     if attempt.get("success") is not True:
         return False
-    if attempt.get("exit_code") != 0:
+    if _to_int(attempt.get("exit_code")) != 0:
         return False
     return True
 
@@ -2048,7 +2048,7 @@ class VerificationAgent(BaseAgent):
     def _sandbox_attempt_matches_finding(self, attempt: dict[str, Any], finding: dict[str, Any]) -> bool:
         if attempt.get("success") is not True:
             return False
-        if attempt.get("exit_code") != 0:
+        if _to_int(attempt.get("exit_code")) != 0:
             return False
         # R3 反伪造：伪造证据一律不匹配
         if attempt.get("fabricated"):
@@ -2170,7 +2170,7 @@ class VerificationAgent(BaseAgent):
                 vuln_type in VULN_TYPES_SOFT_EVIDENCE
                 and bool(finding.get("dataflow_path"))
                 and bool(finding.get("code_snippet"))
-                and finding.get("ai_confidence", 0) >= 0.75
+                and (_to_float(finding.get("ai_confidence")) or 0) >= 0.75
                 and bool(finding.get("verification_method"))
             )
             if has_soft_evidence:
