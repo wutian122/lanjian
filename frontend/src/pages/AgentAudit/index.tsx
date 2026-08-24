@@ -73,6 +73,10 @@ function AgentAuditPageContent() {
   const [panelWidth, setPanelWidth] = useLocalStorage<number>("ai-panel-width", 480);
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
+  // REQ-IP-1: RAG 索引进度（分块/嵌入）——初始化界面实时显示
+  const [indexingProgress, setIndexingProgress] = useState<{
+    phase: string; current: number; total: number;
+  } | null>(null);
   const [isResuming, setIsResuming] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [statusVerb, setStatusVerb] = useState(ACTION_VERBS[0]);
@@ -583,6 +587,18 @@ function AgentAuditPageContent() {
         }
         const message = event.message || event.type;
 
+        // REQ-IP-1: 解析 RAG 索引进度（分块/嵌入）→ 初始化界面实时显示
+        // 后端模板：CHUNK_PROGRESS_MSG_TEMPLATE="📝 分块进度: {processed}/{total} 文件 ({pct:.0f}%)"
+        //           EMBED_PROGRESS_MSG_TEMPLATE="🔢 嵌入进度: {processed}/{total} ({pct:.0f}%)"
+        const indexingMatch = message.match(/(分块进度|嵌入进度)[:：]?\s*(\d+)\/(\d+)/);
+        if (indexingMatch) {
+          setIndexingProgress({
+            phase: indexingMatch[1].includes("分块") ? "chunking" : "embedding",
+            current: parseInt(indexingMatch[2], 10),
+            total: parseInt(indexingMatch[3], 10),
+          });
+        }
+
         // 🔥 检测进度类型消息，使用更新而不是添加
         const progressPatterns: { pattern: RegExp; key: string }[] = [
           { pattern: /索引进度[:：]?\s*\d+\/\d+/, key: 'index_progress' },
@@ -806,6 +822,18 @@ function AgentAuditPageContent() {
       clearInterval(verbTimer);
     };
   }, [isRunning]);
+
+  // REQ-IP-2: 初始化界面轮询兜底——RAG 索引期间无 phase_start/init_step 推进时，
+  // 界面保持静止（历史缺陷：看起来"卡死"）。每 30s 轮询 loadTask，status 变
+  // running 后 isInitializing 变 false，自动切主界面；phase_start 事件也会触发
+  // loadTask（正常路径），此处仅兜底极端无事件场景。
+  useEffect(() => {
+    if (!isInitializing || !task) return;
+    const pollTimer = setInterval(() => {
+      loadTask();
+    }, 30000);
+    return () => clearInterval(pollTimer);
+  }, [isInitializing, task, loadTask]);
 
   // Initial load - 🔥 加载任务数据和历史事件
   useEffect(() => {
@@ -1226,7 +1254,7 @@ function AgentAuditPageContent() {
       <div className="h-screen bg-background flex items-center justify-center relative overflow-hidden">
         <div className="absolute inset-0 cyber-grid opacity-30" />
         <div className="absolute inset-0 vignette pointer-events-none" />
-        <InitProgress steps={initSteps} />
+        <InitProgress steps={initSteps} indexingProgress={indexingProgress} />
       </div>
     );
   }
