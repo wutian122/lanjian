@@ -601,3 +601,38 @@ def test_dedup_prefers_evidence_attempt():
     merged = agent._merge_attempts_deduped([weak], [strong])
     assert len(merged) == 1
     assert merged[0]["success"] is True, "同键冲突必须保留证据更强的 attempt（success=True）"
+
+
+# ============ 验证 ID 绑定恢复（REQ-VB-1/2）============
+
+def test_backfill_restores_finding_id_for_llm_output():
+    """REQ-VB-1：LLM Final Answer 的 finding 无 _sandbox_finding_id → backfill 按位置恢复 → ID 绑定成功。"""
+    agent = _make_agent()
+    original = _finding(_sandbox_finding_id="f-orig-1", line_start=113)
+    llm_f = _finding(line_start=113)  # LLM 输出，无内部 ID
+    agent._backfill_original_metadata(llm_f, [original])
+    assert llm_f.get("_sandbox_finding_id") == "f-orig-1", "backfill 必须按位置恢复内部验证 ID"
+    att = {
+        "success": False, "exit_code": 1,
+        "evidence_summary": "ran poc, no vuln marker",
+        "command": "python3 /tmp/poc_0.py", "finding_id": "f-orig-1",
+    }
+    agent._runtime_attempts_by_finding_id = {"f-orig-1": [att]}
+    agent._attach_runtime_sandbox_attempts(llm_f)
+    assert llm_f.get("sandbox_attempts"), "恢复 ID 后绑定必须成功（attempts 非空）"
+
+
+def test_attach_position_fallback_binds_by_location():
+    """REQ-VB-2：ID 不可得（backfill 匹配不到）时，按位置匹配运行时索引兜底绑定。"""
+    agent = _make_agent()
+    agent._runtime_attempts_by_finding_id = {
+        "other-id": [{
+            "success": False, "exit_code": 1,
+            "evidence_summary": "Sandbox result\n退出码: 1\nSource: 4039 chars loaded",
+            "command": "cat > /tmp/poc_0.py << 'POC_EOF'\nprint('Target: console/AppController.java:113')",
+            "finding_id": "other-id",
+        }],
+    }
+    finding = _finding(line_start=113)  # 无 ID
+    agent._attach_runtime_sandbox_attempts(finding)
+    assert finding.get("sandbox_attempts"), "位置兜底必须绑定（attempts 非空）"

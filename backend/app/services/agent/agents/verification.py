@@ -1901,6 +1901,38 @@ class VerificationAgent(BaseAgent):
                 )
                 return
 
+        # REQ-VB-2: ID 不可得时的位置兜底——LLM finding 可能既无 ID 又无法从原清单
+        # 恢复（backfill 匹配失败），此时按 file_path+line_start 匹配运行时索引中的
+        # attempt（target_ref/command 含路径）。兜底保证"确定性执行过的证据不丢"；
+        # 优先精确行号，行号缺失时仅路径匹配。
+        if not finding.get("sandbox_attempts"):
+            index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
+            fp = (finding.get("file_path") or "").strip().lower()
+            ln = finding.get("line_start") or 0
+            position_matched = []
+            if fp:
+                for attempts_by_id in index.values():
+                    for a in attempts_by_id:
+                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                            continue
+                        ref = str(a.get("target_ref") or "").strip().lower()
+                        cmd = str(a.get("command") or "").lower()
+                        hay = f"{ref} {cmd}"
+                        if fp in hay or hay.endswith(fp):
+                            if ln and f":{ln}" in hay:
+                                position_matched.append(a)
+                            elif not ln:
+                                position_matched.append(a)
+            if position_matched:
+                finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                    existing_attempts, position_matched
+                )
+                logger.info(
+                    f"[{self.name}] Position-based sandbox fallback: file={fp}:{ln} "
+                    f"-> {len(position_matched)} attempts"
+                )
+                return
+
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
         if matched_attempts:
@@ -2173,6 +2205,19 @@ class VerificationAgent(BaseAgent):
         llm_fp = (llm_finding.get("file_path") or "").strip().lower()
         llm_type = (llm_finding.get("vulnerability_type") or "").strip().lower()
         llm_title = (llm_finding.get("title") or "").strip().lower()
+
+        # REQ-VB-1: 恢复内部验证 ID——LLM Final Answer 的 finding 是重新序列化对象，
+        # 不会携带 _sandbox_finding_id。按 file_path+line+type 精确匹配原清单恢复，
+        # 让 ID 绑定路径（T4 索引）生效；匹配失败放行后续位置兜底。
+        if not llm_finding.get("_sandbox_finding_id"):
+            for orig in original_findings:
+                if not isinstance(orig, dict):
+                    continue
+                if (str(orig.get("file_path") or "").strip().lower() == llm_fp
+                        and (orig.get("line_start") or 0) == (llm_finding.get("line_start") or 0)
+                        and str(orig.get("vulnerability_type") or "").strip().lower() == llm_type):
+                    llm_finding["_sandbox_finding_id"] = orig.get("_sandbox_finding_id")
+                    break
 
         needs_backfill = (
             not llm_fp or llm_fp in ("unknown", "?", "n/a", "null", "none")
