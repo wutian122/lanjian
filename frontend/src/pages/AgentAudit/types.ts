@@ -16,7 +16,8 @@ export type LogType =
   | 'error'
   | 'user'
   | 'dispatch'
-  | 'progress';
+  | 'progress'
+  | 'sandbox';
 
 export type ToolStatus = 'running' | 'completed' | 'failed';
 
