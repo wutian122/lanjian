@@ -279,7 +279,7 @@ def test_deterministic_run_registers_all_finding_ids():
     async def _fake_exec(tool, cmd_input):
         return "Sandbox result\n退出码: 0\nVULNERABILITY_CONFIRMED: demo"
 
-    async def _fake_emit(kind, msg):
+    async def _fake_emit(kind, msg, **kwargs):
         pass
 
     agent.execute_tool = _fake_exec

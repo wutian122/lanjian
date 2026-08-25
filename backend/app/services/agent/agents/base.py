@@ -1272,6 +1272,23 @@ class BaseAgent(ABC):
             result_preview = str(result.data) if result.data is not None else (result.error if result.error else "")
             await self.emit_tool_result(tool_name, result_preview, duration_ms)
 
+            # REQ-VP-2: sandbox_exec 工具经 execute_tool 包装层发射 sandbox_* 事件，
+            # 使 LLM 调用的沙箱执行对前端可见（AgentTool 本身不持有 emit_event）。
+            if tool_name == "sandbox_exec":
+                await self.emit_event(
+                    "sandbox_exec",
+                    "🐳 sandbox_exec 工具调用",
+                    finding_id=tool_input.get("finding_id") or "",
+                    metadata={"command": str(tool_input.get("command", ""))[:500]},
+                )
+                _sb_exit = (result.metadata or {}).get("exit_code", -1)
+                await self.emit_event(
+                    "sandbox_result",
+                    f"沙箱执行结果 exit={_sb_exit}",
+                    finding_id=tool_input.get("finding_id") or "",
+                    metadata={"exit_code": _sb_exit, "evidence_summary": result_preview[:2000]},
+                )
+
             # 🔥 工具执行后再次检查取消
             if self.is_cancelled:
                 return "⚠️ 任务已取消"

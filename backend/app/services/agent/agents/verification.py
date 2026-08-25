@@ -11,6 +11,7 @@ LLM 是验证的大脑！
 """
 
 import asyncio
+import os
 import json
 import logging
 import re
@@ -56,6 +57,52 @@ def _has_sandbox_failure_marker(observation: str, exit_code) -> bool:
         return True
     exit_bad = exit_code is not None and exit_code != 0
     return exit_bad and any(mk in obs for mk in _SUB_FAILURE_MARKERS)
+
+
+# REQ-VP-1: 按目标文件语言分流的危险 sink 检测 pattern。
+# 预生成 PoC 模板按 vulnerability_type 选模板，但检测 pattern 必须按目标源码语言
+# 选择，否则 Java/PHP/Ruby 反序列化会用 Python sink grep 空转（生产任务实测）。
+_LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
+    "deserialization": {
+        ".java": ["ObjectInputStream", "readObject", "XMLDecoder", "decodeObject"],
+        ".py": [r"pickle\.load", r"yaml\.load", r"marshal\.load", r"eval\("],
+        ".php": ["unserialize"],
+        ".rb": ["Marshal.load", "YAML.load"],
+        "default": [r"pickle\.load", r"yaml\.load", r"json\.loads", r"marshal\.load", r"eval\("],
+    },
+    "ssrf": {
+        ".java": ["HttpURLConnection", "OkHttp", "RestTemplate", "HttpClient", "URLConnection"],
+        ".py": [r"requests\.get", r"httpx", r"urllib", r"aiohttp"],
+        ".js": ["fetch(", "axios"],
+        ".php": ["curl_exec", "file_get_contents"],
+        "default": [r"requests\.get", r"httpx", r"urllib", r"aiohttp", r"fetch\("],
+    },
+    "path_traversal": {
+        ".java": ["new File(", "Paths.get", "getResource(", "FileInputStream"],
+        ".py": [r"os\.path\.join", r"\.\./", r"open\(", r"pathlib"],
+        ".php": [r"file_get_contents", r"readfile", r"include\("],
+        ".rb": ["File.read", "File.open"],
+        "default": [r"os\.path\.join", r"\.\./", r"open\(", r"pathlib", r"send_file", r"send_from_directory"],
+    },
+}
+
+
+def _language_sink_patterns(vuln_type: str, file_path: str) -> list[str]:
+    """REQ-VP-1: 按目标文件扩展名返回该语言的危险 sink 检测 pattern 列表。"""
+    ext = ""
+    if file_path:
+        ext = os.path.splitext(str(file_path))[1].lower()
+    lang_map = _LANGUAGE_SINK_PATTERNS.get(vuln_type, {})
+    if ext in lang_map:
+        return lang_map[ext]
+    return lang_map.get("default", [])
+
+
+def _sandbox_exit_code(result_text: Any) -> int:
+    """从沙箱结果文本提取退出码（"退出码: N"），提取不到返回 -1（REQ-VP-2）。"""
+    m = re.search(r"退出码:\s*(-?\d+)", str(result_text))
+    return int(m.group(1)) if m else -1
+
 
 # R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
 # LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
@@ -1951,6 +1998,32 @@ class VerificationAgent(BaseAgent):
                     f"-> {len(position_matched)} attempts"
                 )
                 return
+            # REQ-VP-4: 第三级兜底——ID 与精确位置均失配（含 line 不匹配）时，
+            # 按 file_path 路径末 2 段后缀 + vuln_type 组合匹配，避免 Tribes 类证据丢失。
+            if fp:
+                fp_suffix = "/".join([s for s in fp.split("/") if s][-2:]) or fp
+                vuln_type = (finding.get("vulnerability_type") or "").lower()
+                vk = [vuln_type.replace("_", "")] if len(vuln_type.replace("_", "")) >= 3 else []
+                for attempts_by_id in index.values():
+                    for a in attempts_by_id:
+                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                            continue
+                        ref = str(a.get("target_ref") or "").strip().lower()
+                        cmd = str(a.get("command") or "").lower()
+                        hay = f"{ref} {cmd}"
+                        if fp_suffix and (fp_suffix in hay or hay.endswith(fp_suffix)):
+                            if not vk or any(k in hay for k in vk):
+                                position_matched.append(a)
+                if position_matched:
+                    finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                        existing_attempts, position_matched
+                    )
+                    logger.info(
+                        f"[{self.name}] Path-suffix sandbox fallback (REQ-VP-4): "
+                        f"suffix={fp_suffix} type={vuln_type} "
+                        f"-> {len(position_matched)} attempts"
+                    )
+                    return
 
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
@@ -2378,12 +2451,20 @@ class VerificationAgent(BaseAgent):
         for sc in sandbox_commands:
             if self.is_cancelled:
                 break
+            cmd_input = sc.get("input") or {}
+            command = cmd_input.get("command", "")
+            if not command:
+                continue
             try:
-                cmd_input = sc.get("input") or {}
-                command = cmd_input.get("command", "")
-                if not command:
-                    continue
                 timeout = cmd_input.get("timeout", 60)
+                finding_id = sc.get("finding_id") or ""
+                # REQ-VP-2: 执行前发射 sandbox_start，前端可见 PoC 命令
+                await self.emit_event(
+                    "sandbox_start",
+                    f"🐳 确定性沙箱执行: {sc.get('label', '')}",
+                    finding_id=finding_id,
+                    metadata={"command": command[:500], "label": sc.get("label", "")},
+                )
                 if sandbox_mgr and sandbox_project_root:
                     result_dict = await sandbox_mgr.execute_with_files(
                         command=command,
@@ -2391,8 +2472,14 @@ class VerificationAgent(BaseAgent):
                         timeout=timeout,
                     )
                     result = self._format_sandbox_result(result_dict)
+                    exit_code = (
+                        result_dict.get("exit_code", -1)
+                        if isinstance(result_dict, dict)
+                        else -1
+                    )
                 else:
                     result = await self.execute_tool("sandbox_exec", cmd_input)
+                    exit_code = _sandbox_exit_code(result)
 
                 # 与 LLM 调用路径一致地记录证据与计数
                 self._sandbox_exec_calls += 1
@@ -2402,14 +2489,28 @@ class VerificationAgent(BaseAgent):
                     finding_idx = self._parse_finding_index_from_command(command)
                     if finding_idx is not None:
                         self._verified_finding_indices.add(finding_idx)
-                self._record_sandbox_attempt(cmd_input, result, finding_id=sc.get("finding_id"))
+                self._record_sandbox_attempt(cmd_input, result, finding_id=finding_id)
                 executed += 1
                 logger.info(
                     f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"
                 )
+                # REQ-VP-2: 执行后发射 sandbox_result
+                await self.emit_event(
+                    "sandbox_result",
+                    f"✅ 沙箱执行完成 exit={exit_code}",
+                    finding_id=finding_id,
+                    metadata={"exit_code": exit_code, "evidence_summary": str(result)[:2000]},
+                )
             except Exception as e:
                 logger.warning(
                     f"[{self.name}] Deterministic sandbox exec failed for {sc.get('label', '')}: {e}"
+                )
+                # REQ-VP-2: 执行异常仍发 sandbox_result 标记失败，不静默吞
+                await self.emit_event(
+                    "sandbox_result",
+                    f"❌ 沙箱执行失败: {str(e)[:300]}",
+                    finding_id=sc.get("finding_id") or "",
+                    metadata={"exit_code": -1, "error": str(e)[:300], "evidence_summary": ""},
                 )
         if executed:
             await self.emit_event(
@@ -2451,6 +2552,11 @@ class VerificationAgent(BaseAgent):
         safe_title = safe_title.replace("POC_EOF", "")
         safe_path = safe_path.replace("POC_EOF", "")
         file_ref = f"{safe_path}:{line}" if line else safe_path
+
+        # REQ-VP-1: 按目标文件语言分流检测 pattern，注入模板的 for pat 循环与 sink 判定
+        sink_patterns = _language_sink_patterns(vuln_type, safe_path)
+        patterns_repr = ", ".join(f"r'{p}'" for p in sink_patterns) if sink_patterns else "r''"
+        sink_regex = "|".join(sink_patterns) if sink_patterns else "noop_never_match"
 
         cmd_templates = {
             'sql_injection': {
@@ -2624,7 +2730,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'os\\.path\\.join', r'\\.\\./', r'open\\(', r'pathlib', r'send_file', r'send_from_directory']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Pattern \"{{pat}}\": {{cnt}} matches')\n"
                     f"else:\n"
@@ -2650,7 +2756,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'requests\\.get', r'httpx', r'urllib', r'aiohttp', r'fetch\\(']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  HTTP call \"{{pat}}\": {{cnt}} matches')\n"
                     f"else:\n"
@@ -2669,7 +2775,7 @@ class VerificationAgent(BaseAgent):
                     f"except Exception as e:\n"
                     f"    print(f'metadata endpoint: blocked - {{type(e).__name__}}: {{e}}')\n"
                     f"# 判定\n"
-                    f"sink_found = bool(re.search(r'requests\\.get|httpx|urllib|aiohttp|fetch\\(', content))\n"
+                    f"sink_found = bool(re.search(r'{sink_regex}', content))\n"
                     f"if metadata_hit:\n"
                     f"    print('VULNERABILITY_CONFIRMED(STATIC): SSRF demo - cloud metadata reachable via PoC-initiated request (no data-flow to target source)')\n"
                     f"elif sink_found and not has_filter:\n"
@@ -2931,7 +3037,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'pickle\\.load', r'yaml\\.load', r'json\\.loads', r'marshal\\.load', r'eval\\(']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Unsafe call \"{{pat}}\": {{cnt}} occurrences')\n"
                     f"else:\n"

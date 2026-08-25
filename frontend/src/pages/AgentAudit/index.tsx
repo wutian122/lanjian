@@ -634,6 +634,28 @@ function AgentAuditPageContent() {
         }
         return;
       }
+
+      // REQ-VP-2: sandbox_* 事件进日志，PoC 命令/exit_code 对用户可见
+      const sandboxEvents = ['sandbox_start', 'sandbox_exec', 'sandbox_result', 'sandbox_error'];
+      if (sandboxEvents.includes(event.type)) {
+        const sandboxMeta = event.metadata as Record<string, unknown> | undefined;
+        const exitCode = sandboxMeta?.exit_code;
+        const command = typeof sandboxMeta?.command === 'string' ? sandboxMeta.command : '';
+        const title =
+          event.type === 'sandbox_result' && exitCode !== undefined
+            ? `${event.message || '沙箱执行结果'} (exit=${String(exitCode)})`
+            : event.message || event.type;
+        dispatch({
+          type: 'ADD_LOG',
+          payload: {
+            type: 'sandbox',
+            title,
+            content: command ? `命令: ${command.slice(0, 500)}` : undefined,
+            agentName: getCurrentAgentName() || undefined,
+          },
+        });
+        return;
+      }
     },
     onThinkingStart: () => {
       const currentId = getCurrentThinkingId();
