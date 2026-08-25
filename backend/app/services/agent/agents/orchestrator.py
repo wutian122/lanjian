@@ -2295,6 +2295,10 @@ Action Input: {{"参数": "值"}}
         if not agent_specs:
             return "错误: 未指定任何 Agent"
 
+        # REQ-TH-6: LLM 输出防御——agents 数组元素偶发为字符串（非对象），跳过非法项。
+        # 生产 27493b18：LLM 输出 malformed agents 数组致 `s.get` 崩溃（'str' object has no attribute 'get'）。
+        agent_specs = [s for s in agent_specs if isinstance(s, dict)]
+
         # 限制并行数量
         MAX_PARALLEL = 3
         if len(agent_specs) > MAX_PARALLEL:
