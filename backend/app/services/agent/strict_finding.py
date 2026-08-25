@@ -40,12 +40,6 @@ DESCRIPTIVE_PATTERNS = (
 
 
 def is_strict_finding(finding: Mapping[str, Any]) -> bool:
-    file_path = str(finding.get("file_path") or "").strip()
-    if not file_path or file_path.lower() in ("unknown", "n/a", "", "?"):
-        return False
-    line_start = _to_int(finding.get("line_start", 0)) or 0
-    if line_start <= 0:
-        return False
     vuln_type = str(finding.get("vulnerability_type") or "").strip()
     if not vuln_type:
         return False
@@ -54,12 +48,17 @@ def is_strict_finding(finding: Mapping[str, Any]) -> bool:
     confidence = finding.get("confidence")
     if confidence is None:
         confidence = finding.get("ai_confidence")
+    conf_value: float | None = None
     if confidence is not None:
         try:
-            if float(confidence) < MIN_CONFIDENCE_THRESHOLD:
-                return False
+            conf_value = float(confidence)
         except (TypeError, ValueError):
+            conf_value = None
+        if conf_value is not None and conf_value < MIN_CONFIDENCE_THRESHOLD:
             return False
+
+    file_path = str(finding.get("file_path") or "").strip()
+    line_start = _to_int(finding.get("line_start", 0)) or 0
 
     title = str(finding.get("title") or "").strip()
     description = str(finding.get("description") or "").strip()
@@ -69,4 +68,13 @@ def is_strict_finding(finding: Mapping[str, Any]) -> bool:
         if pattern in combined:
             return False
 
-    return True
+    # 有精确 file_path + line_start 的常规严格 finding
+    if file_path and file_path.lower() not in ("unknown", "n/a", "?") and line_start > 0:
+        return True
+
+    # REQ-VP-3: 缺精确 file_path/line_start 但 confidence>=0.7 且有 title+description
+    # 的理论风险 finding 保留落库（否则整条消失——nginx 生产实证，is_strict_finding 过滤日志铁证）。
+    if conf_value is not None and conf_value >= MIN_CONFIDENCE_THRESHOLD and title and description:
+        return True
+
+    return False

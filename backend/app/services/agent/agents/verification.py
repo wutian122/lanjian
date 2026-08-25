@@ -98,6 +98,12 @@ def _language_sink_patterns(vuln_type: str, file_path: str) -> list[str]:
     return lang_map.get("default", [])
 
 
+def _sandbox_exit_code(result_text: Any) -> int:
+    """从沙箱结果文本提取退出码（"退出码: N"），提取不到返回 -1（REQ-VP-2）。"""
+    m = re.search(r"退出码:\s*(-?\d+)", str(result_text))
+    return int(m.group(1)) if m else -1
+
+
 # R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
 # LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
 FABRICATION_MARKERS = (
@@ -2419,12 +2425,20 @@ class VerificationAgent(BaseAgent):
         for sc in sandbox_commands:
             if self.is_cancelled:
                 break
+            cmd_input = sc.get("input") or {}
+            command = cmd_input.get("command", "")
+            if not command:
+                continue
             try:
-                cmd_input = sc.get("input") or {}
-                command = cmd_input.get("command", "")
-                if not command:
-                    continue
                 timeout = cmd_input.get("timeout", 60)
+                finding_id = sc.get("finding_id") or ""
+                # REQ-VP-2: 执行前发射 sandbox_start，前端可见 PoC 命令
+                await self.emit_event(
+                    "sandbox_start",
+                    f"🐳 确定性沙箱执行: {sc.get('label', '')}",
+                    finding_id=finding_id,
+                    metadata={"command": command[:500], "label": sc.get("label", "")},
+                )
                 if sandbox_mgr and sandbox_project_root:
                     result_dict = await sandbox_mgr.execute_with_files(
                         command=command,
@@ -2432,8 +2446,14 @@ class VerificationAgent(BaseAgent):
                         timeout=timeout,
                     )
                     result = self._format_sandbox_result(result_dict)
+                    exit_code = (
+                        result_dict.get("exit_code", -1)
+                        if isinstance(result_dict, dict)
+                        else -1
+                    )
                 else:
                     result = await self.execute_tool("sandbox_exec", cmd_input)
+                    exit_code = _sandbox_exit_code(result)
 
                 # 与 LLM 调用路径一致地记录证据与计数
                 self._sandbox_exec_calls += 1
@@ -2443,14 +2463,28 @@ class VerificationAgent(BaseAgent):
                     finding_idx = self._parse_finding_index_from_command(command)
                     if finding_idx is not None:
                         self._verified_finding_indices.add(finding_idx)
-                self._record_sandbox_attempt(cmd_input, result, finding_id=sc.get("finding_id"))
+                self._record_sandbox_attempt(cmd_input, result, finding_id=finding_id)
                 executed += 1
                 logger.info(
                     f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"
                 )
+                # REQ-VP-2: 执行后发射 sandbox_result
+                await self.emit_event(
+                    "sandbox_result",
+                    f"✅ 沙箱执行完成 exit={exit_code}",
+                    finding_id=finding_id,
+                    metadata={"exit_code": exit_code, "evidence_summary": str(result)[:2000]},
+                )
             except Exception as e:
                 logger.warning(
                     f"[{self.name}] Deterministic sandbox exec failed for {sc.get('label', '')}: {e}"
+                )
+                # REQ-VP-2: 执行异常仍发 sandbox_result 标记失败，不静默吞
+                await self.emit_event(
+                    "sandbox_result",
+                    f"❌ 沙箱执行失败: {str(e)[:300]}",
+                    finding_id=sc.get("finding_id") or "",
+                    metadata={"exit_code": -1, "error": str(e)[:300], "evidence_summary": ""},
                 )
         if executed:
             await self.emit_event(
