@@ -413,3 +413,23 @@ def test_merge_back_still_dedupes_by_path_without_fid():
     )
     assert len(agent._all_findings) == 1
     assert agent._all_findings[0]["verification_status"] == "confirmed"
+
+
+# ============ REQ-TH-6: LLM malformed agents 数组防御 ============
+
+async def test_dispatch_agents_parallel_skips_non_dict_specs(monkeypatch):
+    """REQ-TH-6：agents 数组混入字符串元素时并行调度不崩溃（27493b18 回归）。"""
+    from app.services.agent.agents.orchestrator import OrchestratorAgent
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._dispatched_tasks = {}
+    agent._cancelled = False
+
+    async def fake_dispatch(params):
+        return "ok"
+
+    monkeypatch.setattr(agent, "_dispatch_agent", fake_dispatch, raising=False)
+
+    specs = ["malformed-str", {"agent": "analysis", "task": "审计 XSS"}, {"agent": "recon", "task": "侦察"}]
+    result = await agent._dispatch_agents_parallel(specs)
+    assert result is not None, "并行调度必须返回（不崩溃）"

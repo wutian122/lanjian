@@ -45,7 +45,7 @@ from app.models.project import Project
 from app.models.user import User
 from app.services.agent.agents.base import AgentResult
 from app.services.agent.event_manager import EventManager
-from app.services.agent.strict_finding import is_strict_finding
+from app.services.agent.strict_finding import is_strict_finding, _to_int
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.git_ssh_service import GitSSHOperations
 from app.services.llm.service import LLMService
@@ -1849,16 +1849,15 @@ async def _save_findings(
                         continue  # 跳过这个发现
 
             # 🔥 Handle line numbers (support multiple formats)
-            line_start = finding.get("line_start")
-            if line_start is None:
-                line_start = finding.get("line")
+            # REQ-TH-3: 落库前数值归一化——LLM 的 str line_start 直传 Integer 列会 asyncpg 整批 rollback（c9de9d40 同族）
+            line_start = _to_int(finding.get("line_start") or finding.get("line") or 0) or 0
             if not line_start and ":" in finding.get("location", ""):
                 try:
-                    line_start = int(finding.get("location", "").split(":")[1])
+                    line_start = int(str(finding.get("location", "")).split(":")[1])
                 except (ValueError, IndexError):
                     line_start = None
 
-            line_end = finding.get("line_end")
+            line_end = _to_int(finding.get("line_end"))
             if line_end is None:
                 line_end = line_start
 

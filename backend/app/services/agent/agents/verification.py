@@ -22,7 +22,7 @@ from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, 
 from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, build_enhanced_prompt
 from app.models.agent_task import VerificationStatus
-from app.services.agent.strict_finding import is_strict_finding
+from app.services.agent.strict_finding import is_strict_finding, _to_int, _to_float
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ def compute_verification_status(
 
     # 1) confirmed：成功执行 + 漏洞触发证据 + 匹配 finding
     for a in real_attempts:
-        if a.get("success") is True and a.get("exit_code") == 0:
+        if a.get("success") is True and _to_int(a.get("exit_code")) == 0:
             if evidence_has_vuln(a) and evidence_matches(a, finding):
                 return VerificationStatus.CONFIRMED, True, {}
 
@@ -159,7 +159,7 @@ def _attempt_matches_finding_default(attempt: dict[str, Any], finding: dict[str,
     """模块级默认匹配（宽松：success + exit_code 0 即可，精确匹配由实例注入）。"""
     if attempt.get("success") is not True:
         return False
-    if attempt.get("exit_code") != 0:
+    if _to_int(attempt.get("exit_code")) != 0:
         return False
     return True
 
@@ -178,6 +178,9 @@ VERIFICATION_SYSTEM_PROMPT = """你是蓝鉴的漏洞验证 Agent，一个**自�
 ## 🔴 强制规则：必须使用沙箱执行
 **每个漏洞都必须通过 sandbox_exec 在 Docker 沙箱中执行验证。** 这是不可跳过的步骤。
 你不应该仅通过代码阅读或 LLM 分析来判断漏洞——必须在隔离沙箱中实际运行测试代码。
+
+## ⚡ 效率规则（REQ-ER-3）
+优先编写**轻量 PoC**：直接验证目标函数/数据流的判定逻辑，禁止启动完整服务/框架实例（如完整 Tomcat/Spring 容器）——那样会严重超时。用临时文件/内联代码模拟最小执行路径即可。
 
 ## 🔴 反伪造规则（强制，违者判定为验证失败）
 1. **禁止模拟/编造 PoC 输出**。不得输出 "Simulated ..."、伪造的确认标记或虚构的沙箱结果。
@@ -1261,14 +1264,22 @@ class VerificationAgent(BaseAgent):
             
             # 🔥 如果被取消，返回取消结果
             if self.is_cancelled:
+                # REQ-ER-1: 中断收口绑定——超时/取消时确定性执行可能已跑完 PoC 并登记索引，
+                # 不得直接返回未绑定 findings（否则已执行证据随内存丢失 → 零证据 needs_context）。
+                # 生产 tomcat 任务 cade28a4：verification 超时后 ManagerServlet:986 零证据即此路径。
+                try:
+                    cancelled_findings = self._finalize_findings_without_final_answer(findings_to_verify)
+                except Exception as _e:
+                    logger.warning(f"[{self.name}] Cancel-time evidence binding failed: {_e}")
+                    cancelled_findings = findings_to_verify
                 await self.emit_event(
                     "info",
-                    f"🛑 Verification Agent 已取消: {self._iteration} 轮迭代"
+                    f"🛑 Verification Agent 已取消: {self._iteration} 轮迭代（已绑定 {sum(1 for f in cancelled_findings if f.get('sandbox_attempts'))} 条证据）"
                 )
                 return AgentResult(
                     success=False,
                     error="任务已取消",
-                    data={"findings": findings_to_verify},
+                    data={"findings": cancelled_findings},
                     iterations=self._iteration,
                     tool_calls=self._tool_calls,
                     tokens_used=self._total_tokens,
@@ -1403,6 +1414,14 @@ class VerificationAgent(BaseAgent):
             # LLM Final Answer 只覆盖它自己报告的 findings；这里对全部 findings_to_verify
             # 兜底附加 runtime evidence，避免证据因 LLM 漏报而丢失（历史任务 4/5 丢失）。
             self._bind_runtime_evidence_to_all(verified_findings, findings_to_verify)
+
+            # REQ-ER-2: 成功路径最终兜底——R2 之后仍无沙箱证据的 finding 再强制绑定运行时索引
+            # （LLM Final Answer 覆盖不全或归一化缝隙导致 ID/位置匹配失败时兜底）。
+            # 生产 tomcat 任务 cade28a4：ManagerServlet:986 验证执行过但证据未落库。
+            try:
+                self._bind_unbound_runtime_evidence(verified_findings)
+            except Exception as _e:
+                logger.warning(f"[{self.name}] Final evidence binding failed: {_e}")
 
             # 统计
             confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
@@ -1901,6 +1920,38 @@ class VerificationAgent(BaseAgent):
                 )
                 return
 
+        # REQ-VB-2: ID 不可得时的位置兜底——LLM finding 可能既无 ID 又无法从原清单
+        # 恢复（backfill 匹配失败），此时按 file_path+line_start 匹配运行时索引中的
+        # attempt（target_ref/command 含路径）。兜底保证"确定性执行过的证据不丢"；
+        # 优先精确行号，行号缺失时仅路径匹配。
+        if not finding.get("sandbox_attempts"):
+            index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
+            fp = (finding.get("file_path") or "").strip().lower()
+            ln = finding.get("line_start") or 0
+            position_matched = []
+            if fp:
+                for attempts_by_id in index.values():
+                    for a in attempts_by_id:
+                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                            continue
+                        ref = str(a.get("target_ref") or "").strip().lower()
+                        cmd = str(a.get("command") or "").lower()
+                        hay = f"{ref} {cmd}"
+                        if fp in hay or hay.endswith(fp):
+                            if ln and f":{ln}" in hay:
+                                position_matched.append(a)
+                            elif not ln:
+                                position_matched.append(a)
+            if position_matched:
+                finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                    existing_attempts, position_matched
+                )
+                logger.info(
+                    f"[{self.name}] Position-based sandbox fallback: file={fp}:{ln} "
+                    f"-> {len(position_matched)} attempts"
+                )
+                return
+
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
         if matched_attempts:
@@ -1960,6 +2011,15 @@ class VerificationAgent(BaseAgent):
             finding["sandbox_attempts"] = existing_attempts + [weak_a]
             return
 
+    def _bind_unbound_runtime_evidence(self, verified_findings: List[Dict]) -> None:
+        """REQ-ER-2: 成功路径最终兜底绑定——verified_findings 中仍无沙箱证据的 finding，
+        按 ID/位置从运行时索引强制再绑定（_attach_runtime_sandbox_attempts 幂等，去重合并）。
+        """
+        for vf in verified_findings:
+            if vf.get("sandbox_attempts"):
+                continue
+            self._attach_runtime_sandbox_attempts(vf)
+
     def _bind_runtime_evidence_to_all(
         self, verified_findings: List[Dict], findings_to_verify: List[Dict]
     ) -> None:
@@ -2016,7 +2076,7 @@ class VerificationAgent(BaseAgent):
     def _sandbox_attempt_matches_finding(self, attempt: dict[str, Any], finding: dict[str, Any]) -> bool:
         if attempt.get("success") is not True:
             return False
-        if attempt.get("exit_code") != 0:
+        if _to_int(attempt.get("exit_code")) != 0:
             return False
         # R3 反伪造：伪造证据一律不匹配
         if attempt.get("fabricated"):
@@ -2138,7 +2198,7 @@ class VerificationAgent(BaseAgent):
                 vuln_type in VULN_TYPES_SOFT_EVIDENCE
                 and bool(finding.get("dataflow_path"))
                 and bool(finding.get("code_snippet"))
-                and finding.get("ai_confidence", 0) >= 0.75
+                and (_to_float(finding.get("ai_confidence")) or 0) >= 0.75
                 and bool(finding.get("verification_method"))
             )
             if has_soft_evidence:
@@ -2173,6 +2233,19 @@ class VerificationAgent(BaseAgent):
         llm_fp = (llm_finding.get("file_path") or "").strip().lower()
         llm_type = (llm_finding.get("vulnerability_type") or "").strip().lower()
         llm_title = (llm_finding.get("title") or "").strip().lower()
+
+        # REQ-VB-1: 恢复内部验证 ID——LLM Final Answer 的 finding 是重新序列化对象，
+        # 不会携带 _sandbox_finding_id。按 file_path+line+type 精确匹配原清单恢复，
+        # 让 ID 绑定路径（T4 索引）生效；匹配失败放行后续位置兜底。
+        if not llm_finding.get("_sandbox_finding_id"):
+            for orig in original_findings:
+                if not isinstance(orig, dict):
+                    continue
+                if (str(orig.get("file_path") or "").strip().lower() == llm_fp
+                        and (orig.get("line_start") or 0) == (llm_finding.get("line_start") or 0)
+                        and str(orig.get("vulnerability_type") or "").strip().lower() == llm_type):
+                    llm_finding["_sandbox_finding_id"] = orig.get("_sandbox_finding_id")
+                    break
 
         needs_backfill = (
             not llm_fp or llm_fp in ("unknown", "?", "n/a", "null", "none")

@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.0.2-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.1.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -109,7 +109,7 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.0.1`（backend）/ `v6.0.2`（frontend）（生产已禁用 `:latest` 浮动 tag）。`v6.0.1`（backend）/`v6.0.2`（frontend）为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.1.0`（backend/frontend/sandbox）（生产已禁用 `:latest` 浮动 tag）。`v6.1.0`（backend/frontend/sandbox）为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 

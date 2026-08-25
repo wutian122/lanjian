@@ -601,3 +601,94 @@ def test_dedup_prefers_evidence_attempt():
     merged = agent._merge_attempts_deduped([weak], [strong])
     assert len(merged) == 1
     assert merged[0]["success"] is True, "同键冲突必须保留证据更强的 attempt（success=True）"
+
+
+# ============ 验证 ID 绑定恢复（REQ-VB-1/2）============
+
+def test_backfill_restores_finding_id_for_llm_output():
+    """REQ-VB-1：LLM Final Answer 的 finding 无 _sandbox_finding_id → backfill 按位置恢复 → ID 绑定成功。"""
+    agent = _make_agent()
+    original = _finding(_sandbox_finding_id="f-orig-1", line_start=113)
+    llm_f = _finding(line_start=113)  # LLM 输出，无内部 ID
+    agent._backfill_original_metadata(llm_f, [original])
+    assert llm_f.get("_sandbox_finding_id") == "f-orig-1", "backfill 必须按位置恢复内部验证 ID"
+    att = {
+        "success": False, "exit_code": 1,
+        "evidence_summary": "ran poc, no vuln marker",
+        "command": "python3 /tmp/poc_0.py", "finding_id": "f-orig-1",
+    }
+    agent._runtime_attempts_by_finding_id = {"f-orig-1": [att]}
+    agent._attach_runtime_sandbox_attempts(llm_f)
+    assert llm_f.get("sandbox_attempts"), "恢复 ID 后绑定必须成功（attempts 非空）"
+
+
+def test_attach_position_fallback_binds_by_location():
+    """REQ-VB-2：ID 不可得（backfill 匹配不到）时，按位置匹配运行时索引兜底绑定。"""
+    agent = _make_agent()
+    agent._runtime_attempts_by_finding_id = {
+        "other-id": [{
+            "success": False, "exit_code": 1,
+            "evidence_summary": "Sandbox result\n退出码: 1\nSource: 4039 chars loaded",
+            "command": "cat > /tmp/poc_0.py << 'POC_EOF'\nprint('Target: console/AppController.java:113')",
+            "finding_id": "other-id",
+        }],
+    }
+    finding = _finding(line_start=113)  # 无 ID
+    agent._attach_runtime_sandbox_attempts(finding)
+    assert finding.get("sandbox_attempts"), "位置兜底必须绑定（attempts 非空）"
+
+
+# ============ LLM 字段类型防御（REQ-TH-1~4）============
+
+def test_to_int_normalizes_llm_values():
+    """REQ-TH-1：_to_int/_to_float 边界——'113'/'113.0'/113/None/''/'abc' 不抛异常。"""
+    from app.services.agent.strict_finding import _to_int, _to_float
+    assert _to_int("113") == 113
+    assert _to_int("113.0") == 113
+    assert _to_int(113) == 113
+    assert _to_int(None) is None
+    assert _to_int("") is None
+    assert _to_int("abc") is None
+    assert _to_float("0.85") == 0.85
+    assert _to_float(None) is None
+
+
+def test_strict_finding_line_start_str_no_crash():
+    """REQ-TH-3：line_start 为 str 时 is_strict_finding 不崩溃（c9de9d40 回归）。"""
+    from app.services.agent.strict_finding import is_strict_finding
+    f = _finding(line_start="113")
+    assert is_strict_finding(f) is True, "str line_start 归一后不崩溃且通过校验"
+
+
+def test_verification_ai_confidence_str_no_crash():
+    """REQ-TH-4：ai_confidence 为 str 时软证据兜底不崩溃。"""
+    agent = _make_agent()
+    finding = _finding(
+        _sandbox_finding_id="f-t4-1",
+        dataflow_path="a->b", code_snippet="x", ai_confidence="0.9",
+        verification_method="sandbox_exec", vulnerability_type="xss",
+        sandbox_attempts=[],
+    )
+    normalized = agent._normalize_verification_outcome(finding)
+    assert normalized["verification_status"] in ("static_confirmed", "needs_context"), "str ai_confidence 不崩溃"
+
+
+# ============ 验证证据回传链路加固（REQ-ER-1/2/3）============
+
+def test_bind_unbound_runtime_evidence():
+    """REQ-ER-2：R2 后仍无沙箱证据的 finding 被最终兜底绑定（986 案例加固）。"""
+    agent = _make_agent()
+    att = {"success": False, "exit_code": 1,
+           "evidence_summary": "ran poc, no vuln",
+           "command": "python3 /tmp/poc_0.py", "finding_id": "f-er-1"}
+    agent._runtime_attempts_by_finding_id = {"f-er-1": [att]}
+    vf = _finding(_sandbox_finding_id="f-er-1", verification_status="needs_context")
+    agent._bind_unbound_runtime_evidence([vf])
+    assert vf.get("sandbox_attempts"), "无证据 finding 必须被最终兜底绑定（attempts 非空）"
+
+
+def test_verification_prompt_guides_lightweight_poc():
+    """REQ-ER-3：verification 系统提示必须引导轻量 PoC（禁止启动完整服务）。"""
+    from app.services.agent.agents.verification import VERIFICATION_SYSTEM_PROMPT
+    assert "轻量 PoC" in VERIFICATION_SYSTEM_PROMPT
+    assert "禁止启动完整服务" in VERIFICATION_SYSTEM_PROMPT

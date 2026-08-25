@@ -1916,7 +1916,9 @@ Action Input: {{"参数": "值"}}
             agent_timeouts = {
                 "recon": min(300, default_sub_agent_timeout),  # recon 通常较快
                 "analysis": default_sub_agent_timeout,
-                "verification": default_sub_agent_timeout,
+                # REQ-ER-3: verification 验证 PoC（含启动服务/框架）耗时高，独立放宽超时
+                # （生产 cade28a4：LLM 启动完整 Tomcat 验证 1200s 超时中断，丢已执行证据）
+                "verification": max(default_sub_agent_timeout, 1800),
             }
             timeout = agent_timeouts.get(agent_name, default_sub_agent_timeout)
 
@@ -2292,6 +2294,10 @@ Action Input: {{"参数": "值"}}
         """
         if not agent_specs:
             return "错误: 未指定任何 Agent"
+
+        # REQ-TH-6: LLM 输出防御——agents 数组元素偶发为字符串（非对象），跳过非法项。
+        # 生产 27493b18：LLM 输出 malformed agents 数组致 `s.get` 崩溃（'str' object has no attribute 'get'）。
+        agent_specs = [s for s in agent_specs if isinstance(s, dict)]
 
         # 限制并行数量
         MAX_PARALLEL = 3
