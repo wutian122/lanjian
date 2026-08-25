@@ -179,6 +179,9 @@ VERIFICATION_SYSTEM_PROMPT = """你是蓝鉴的漏洞验证 Agent，一个**自�
 **每个漏洞都必须通过 sandbox_exec 在 Docker 沙箱中执行验证。** 这是不可跳过的步骤。
 你不应该仅通过代码阅读或 LLM 分析来判断漏洞——必须在隔离沙箱中实际运行测试代码。
 
+## ⚡ 效率规则（REQ-ER-3）
+优先编写**轻量 PoC**：直接验证目标函数/数据流的判定逻辑，禁止启动完整服务/框架实例（如完整 Tomcat/Spring 容器）——那样会严重超时。用临时文件/内联代码模拟最小执行路径即可。
+
 ## 🔴 反伪造规则（强制，违者判定为验证失败）
 1. **禁止模拟/编造 PoC 输出**。不得输出 "Simulated ..."、伪造的确认标记或虚构的沙箱结果。
 2. 若沙箱中**无法读取到目标源码**（如 Source file not found），必须在 Final Answer 中为该 finding 标注 `sandbox_skip_reason` 如实说明原因，**不得**声称漏洞已确认。
@@ -1261,14 +1264,22 @@ class VerificationAgent(BaseAgent):
             
             # 🔥 如果被取消，返回取消结果
             if self.is_cancelled:
+                # REQ-ER-1: 中断收口绑定——超时/取消时确定性执行可能已跑完 PoC 并登记索引，
+                # 不得直接返回未绑定 findings（否则已执行证据随内存丢失 → 零证据 needs_context）。
+                # 生产 tomcat 任务 cade28a4：verification 超时后 ManagerServlet:986 零证据即此路径。
+                try:
+                    cancelled_findings = self._finalize_findings_without_final_answer(findings_to_verify)
+                except Exception as _e:
+                    logger.warning(f"[{self.name}] Cancel-time evidence binding failed: {_e}")
+                    cancelled_findings = findings_to_verify
                 await self.emit_event(
                     "info",
-                    f"🛑 Verification Agent 已取消: {self._iteration} 轮迭代"
+                    f"🛑 Verification Agent 已取消: {self._iteration} 轮迭代（已绑定 {sum(1 for f in cancelled_findings if f.get('sandbox_attempts'))} 条证据）"
                 )
                 return AgentResult(
                     success=False,
                     error="任务已取消",
-                    data={"findings": findings_to_verify},
+                    data={"findings": cancelled_findings},
                     iterations=self._iteration,
                     tool_calls=self._tool_calls,
                     tokens_used=self._total_tokens,
@@ -1403,6 +1414,14 @@ class VerificationAgent(BaseAgent):
             # LLM Final Answer 只覆盖它自己报告的 findings；这里对全部 findings_to_verify
             # 兜底附加 runtime evidence，避免证据因 LLM 漏报而丢失（历史任务 4/5 丢失）。
             self._bind_runtime_evidence_to_all(verified_findings, findings_to_verify)
+
+            # REQ-ER-2: 成功路径最终兜底——R2 之后仍无沙箱证据的 finding 再强制绑定运行时索引
+            # （LLM Final Answer 覆盖不全或归一化缝隙导致 ID/位置匹配失败时兜底）。
+            # 生产 tomcat 任务 cade28a4：ManagerServlet:986 验证执行过但证据未落库。
+            try:
+                self._bind_unbound_runtime_evidence(verified_findings)
+            except Exception as _e:
+                logger.warning(f"[{self.name}] Final evidence binding failed: {_e}")
 
             # 统计
             confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
@@ -1991,6 +2010,15 @@ class VerificationAgent(BaseAgent):
             weak_a["weak_evidence"] = True
             finding["sandbox_attempts"] = existing_attempts + [weak_a]
             return
+
+    def _bind_unbound_runtime_evidence(self, verified_findings: List[Dict]) -> None:
+        """REQ-ER-2: 成功路径最终兜底绑定——verified_findings 中仍无沙箱证据的 finding，
+        按 ID/位置从运行时索引强制再绑定（_attach_runtime_sandbox_attempts 幂等，去重合并）。
+        """
+        for vf in verified_findings:
+            if vf.get("sandbox_attempts"):
+                continue
+            self._attach_runtime_sandbox_attempts(vf)
 
     def _bind_runtime_evidence_to_all(
         self, verified_findings: List[Dict], findings_to_verify: List[Dict]

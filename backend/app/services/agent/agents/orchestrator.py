@@ -1916,7 +1916,9 @@ Action Input: {{"参数": "值"}}
             agent_timeouts = {
                 "recon": min(300, default_sub_agent_timeout),  # recon 通常较快
                 "analysis": default_sub_agent_timeout,
-                "verification": default_sub_agent_timeout,
+                # REQ-ER-3: verification 验证 PoC（含启动服务/框架）耗时高，独立放宽超时
+                # （生产 cade28a4：LLM 启动完整 Tomcat 验证 1200s 超时中断，丢已执行证据）
+                "verification": max(default_sub_agent_timeout, 1800),
             }
             timeout = agent_timeouts.get(agent_name, default_sub_agent_timeout)
 
