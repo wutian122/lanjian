@@ -1998,6 +1998,32 @@ class VerificationAgent(BaseAgent):
                     f"-> {len(position_matched)} attempts"
                 )
                 return
+            # REQ-VP-4: 第三级兜底——ID 与精确位置均失配（含 line 不匹配）时，
+            # 按 file_path 路径末 2 段后缀 + vuln_type 组合匹配，避免 Tribes 类证据丢失。
+            if fp:
+                fp_suffix = "/".join([s for s in fp.split("/") if s][-2:]) or fp
+                vuln_type = (finding.get("vulnerability_type") or "").lower()
+                vk = [vuln_type.replace("_", "")] if len(vuln_type.replace("_", "")) >= 3 else []
+                for attempts_by_id in index.values():
+                    for a in attempts_by_id:
+                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                            continue
+                        ref = str(a.get("target_ref") or "").strip().lower()
+                        cmd = str(a.get("command") or "").lower()
+                        hay = f"{ref} {cmd}"
+                        if fp_suffix and (fp_suffix in hay or hay.endswith(fp_suffix)):
+                            if not vk or any(k in hay for k in vk):
+                                position_matched.append(a)
+                if position_matched:
+                    finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                        existing_attempts, position_matched
+                    )
+                    logger.info(
+                        f"[{self.name}] Path-suffix sandbox fallback (REQ-VP-4): "
+                        f"suffix={fp_suffix} type={vuln_type} "
+                        f"-> {len(position_matched)} attempts"
+                    )
+                    return
 
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
