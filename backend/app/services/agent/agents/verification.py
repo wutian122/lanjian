@@ -11,6 +11,7 @@ LLM 是验证的大脑！
 """
 
 import asyncio
+import os
 import json
 import logging
 import re
@@ -56,6 +57,46 @@ def _has_sandbox_failure_marker(observation: str, exit_code) -> bool:
         return True
     exit_bad = exit_code is not None and exit_code != 0
     return exit_bad and any(mk in obs for mk in _SUB_FAILURE_MARKERS)
+
+
+# REQ-VP-1: 按目标文件语言分流的危险 sink 检测 pattern。
+# 预生成 PoC 模板按 vulnerability_type 选模板，但检测 pattern 必须按目标源码语言
+# 选择，否则 Java/PHP/Ruby 反序列化会用 Python sink grep 空转（生产任务实测）。
+_LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
+    "deserialization": {
+        ".java": ["ObjectInputStream", "readObject", "XMLDecoder", "decodeObject"],
+        ".py": [r"pickle\.load", r"yaml\.load", r"marshal\.load", r"eval\("],
+        ".php": ["unserialize"],
+        ".rb": ["Marshal.load", "YAML.load"],
+        "default": [r"pickle\.load", r"yaml\.load", r"json\.loads", r"marshal\.load", r"eval\("],
+    },
+    "ssrf": {
+        ".java": ["HttpURLConnection", "OkHttp", "RestTemplate", "HttpClient", "URLConnection"],
+        ".py": [r"requests\.get", r"httpx", r"urllib", r"aiohttp"],
+        ".js": ["fetch(", "axios"],
+        ".php": ["curl_exec", "file_get_contents"],
+        "default": [r"requests\.get", r"httpx", r"urllib", r"aiohttp", r"fetch\("],
+    },
+    "path_traversal": {
+        ".java": ["new File(", "Paths.get", "getResource(", "FileInputStream"],
+        ".py": [r"os\.path\.join", r"\.\./", r"open\(", r"pathlib"],
+        ".php": [r"file_get_contents", r"readfile", r"include\("],
+        ".rb": ["File.read", "File.open"],
+        "default": [r"os\.path\.join", r"\.\./", r"open\(", r"pathlib", r"send_file", r"send_from_directory"],
+    },
+}
+
+
+def _language_sink_patterns(vuln_type: str, file_path: str) -> list[str]:
+    """REQ-VP-1: 按目标文件扩展名返回该语言的危险 sink 检测 pattern 列表。"""
+    ext = ""
+    if file_path:
+        ext = os.path.splitext(str(file_path))[1].lower()
+    lang_map = _LANGUAGE_SINK_PATTERNS.get(vuln_type, {})
+    if ext in lang_map:
+        return lang_map[ext]
+    return lang_map.get("default", [])
+
 
 # R3 反伪造：源码缺失/模拟输出却声称确认 → 该 attempt 不得作为有效证据
 # LLM 在沙箱读不到源码或偷懒时会输出 "Simulated ..." + 假确认标记
@@ -2452,6 +2493,11 @@ class VerificationAgent(BaseAgent):
         safe_path = safe_path.replace("POC_EOF", "")
         file_ref = f"{safe_path}:{line}" if line else safe_path
 
+        # REQ-VP-1: 按目标文件语言分流检测 pattern，注入模板的 for pat 循环与 sink 判定
+        sink_patterns = _language_sink_patterns(vuln_type, safe_path)
+        patterns_repr = ", ".join(f"r'{p}'" for p in sink_patterns) if sink_patterns else "r''"
+        sink_regex = "|".join(sink_patterns) if sink_patterns else "noop_never_match"
+
         cmd_templates = {
             'sql_injection': {
                 'command': (
@@ -2624,7 +2670,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'os\\.path\\.join', r'\\.\\./', r'open\\(', r'pathlib', r'send_file', r'send_from_directory']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Pattern \"{{pat}}\": {{cnt}} matches')\n"
                     f"else:\n"
@@ -2650,7 +2696,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'requests\\.get', r'httpx', r'urllib', r'aiohttp', r'fetch\\(']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  HTTP call \"{{pat}}\": {{cnt}} matches')\n"
                     f"else:\n"
@@ -2669,7 +2715,7 @@ class VerificationAgent(BaseAgent):
                     f"except Exception as e:\n"
                     f"    print(f'metadata endpoint: blocked - {{type(e).__name__}}: {{e}}')\n"
                     f"# 判定\n"
-                    f"sink_found = bool(re.search(r'requests\\.get|httpx|urllib|aiohttp|fetch\\(', content))\n"
+                    f"sink_found = bool(re.search(r'{sink_regex}', content))\n"
                     f"if metadata_hit:\n"
                     f"    print('VULNERABILITY_CONFIRMED(STATIC): SSRF demo - cloud metadata reachable via PoC-initiated request (no data-flow to target source)')\n"
                     f"elif sink_found and not has_filter:\n"
@@ -2931,7 +2977,7 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for pat in [r'pickle\\.load', r'yaml\\.load', r'json\\.loads', r'marshal\\.load', r'eval\\(']:\n"
+                    f"    for pat in [{patterns_repr}]:\n"
                     f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt: print(f'  Unsafe call \"{{pat}}\": {{cnt}} occurrences')\n"
                     f"else:\n"
