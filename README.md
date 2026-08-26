@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.2.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.2.1-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -20,6 +20,7 @@
 - **验证证据链根治**（v6.0.0）：失败沙箱尝试如实绑定（未复现 → not_reproducible，不再误报 needs_context）；失败标记按退出码与输出段收窄判定（exit 0 + 铁证不再被 incidental 子串误杀）；LLM 空 Final Answer 时按 finding_id 回填运行时证据；确定性沙箱执行直写证据索引；verification 会话有界（单条截断 + 历史压缩）；模板 PoC 源码断言 + 演示性证据降档 static_confirmed
 - **验证完整性修复**（v6.0.1）：待验清单全量送验（不再按数量截断/不再漏掉多轮 analysis 早期发现）；verification 交接用全量发现（含轮次耗尽与验证门禁双路径程序化补验，杜绝全量零证据收尾）；验证器（预生成模板 PoC）正则转义修复 + 崩溃分档（`poc_error` → needs_context 注明，不冒充未复现）；模板演示确认挂源码 sink 断言（无对应 sink 不确认，收敛假阳性）；static_confirmed 必须有沙箱证据才计入验证门禁；证据摘要保尾 + 去重证据优先
 - **验证引擎 PoC 质量修复**（v6.2.0）：预生成 PoC 检测 pattern 按目标文件语言分流（Java 反序列化识别 ObjectInputStream/readObject，不再用 Python pattern grep 空转误判未复现）；确定性沙箱执行发射 sandbox_start/sandbox_result 事件（前端可见 PoC 命令与退出码）；理论风险 finding（缺精确定位但 confidence≥0.7 且有描述）保留落库不再整条消失；运行时沙箱证据三级兜底绑定（路径后缀+漏洞类型组合，修复 Tribes 类证据丢失）
+- **验证模板覆盖补全**（v6.2.1）：修复 command_injection 模板缩进 bug（PoC 不再崩溃）；扩展 xxe/other 等类型语言 sink 检测（WebDAV XXE/WebSocket CSWSH 不再空转）；default 模板输出 STATIC_CONFIRMED/NO_SINK 判定；poc_error 识别 IndentationError（崩溃正确分档 needs_context）
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
