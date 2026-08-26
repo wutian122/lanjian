@@ -84,6 +84,22 @@ _LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
         ".rb": ["File.read", "File.open"],
         "default": [r"os\.path\.join", r"\.\./", r"open\(", r"pathlib", r"send_file", r"send_from_directory"],
     },
+    "command_injection": {
+        ".java": ["Runtime.getRuntime().exec", "ProcessBuilder", "exec(", "getRuntime"],
+        ".py": ["subprocess", "os.system", "os.popen", "shell=True", "eval(", "exec("],
+        ".php": ["system(", "shell_exec", "exec(", "passthru"],
+        "default": ["subprocess", "os.system", "os.popen", "eval(", "exec("],
+    },
+    "xxe": {
+        ".java": ["DocumentBuilderFactory", "SAXParserFactory", "XMLReader", "SAXParser", "TransformerFactory"],
+        ".py": [r"xml\.etree", "lxml", "defusedxml", r"ElementTree\.parse"],
+        "default": ["DocumentBuilderFactory", "SAXParserFactory", r"xml\.etree", "lxml"],
+    },
+    "other": {
+        ".java": ["DocumentBuilderFactory", "SAXParserFactory", "getOrigin", "XMLReader", "ObjectInputStream"],
+        ".py": [r"xml\.etree", "lxml", "pickle", "yaml"],
+        "default": ["DocumentBuilderFactory", "XMLReader", "getOrigin", "ObjectInputStream"],
+    },
 }
 
 
@@ -1651,7 +1667,7 @@ class VerificationAgent(BaseAgent):
         # REQ-VE-2：验证器（PoC）自身崩溃与"未复现"分档——崩溃特征打 poc_error 标记，
         # 下游状态机据此判 needs_context（notes 注明），不冒充 not_reproducible、不被软证据兜底升级
         obs_text = str(observation or "")
-        poc_error = any(m in obs_text for m in ("Traceback", "SyntaxError", "re.error", "unterminated"))
+        poc_error = any(m in obs_text for m in ("Traceback", "SyntaxError", "re.error", "unterminated", "IndentationError", "TabError"))
         poc_error_type = "pre-generated PoC crashed" if poc_error else None
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
@@ -2555,6 +2571,9 @@ class VerificationAgent(BaseAgent):
 
         # REQ-VP-1: 按目标文件语言分流检测 pattern，注入模板的 for pat 循环与 sink 判定
         sink_patterns = _language_sink_patterns(vuln_type, safe_path)
+        if not sink_patterns:
+            # REQ-VC-3: 未覆盖类型走 other 通用 sink，保证 default 模板不空转
+            sink_patterns = _language_sink_patterns("other", safe_path)
         patterns_repr = ", ".join(f"r'{p}'" for p in sink_patterns) if sink_patterns else "r''"
         sink_regex = "|".join(sink_patterns) if sink_patterns else "noop_never_match"
 
@@ -2629,13 +2648,12 @@ class VerificationAgent(BaseAgent):
                     f"if os.path.exists(src):\n"
                     f"    with open(src) as f: content = f.read()\n"
                     f"    print(f'Source: {{len(content)}} chars loaded')\n"
-                    f"    for kw in ['subprocess','os.system','os.popen','eval(','exec(','shell=True']:\n"
                     f"    sink_found = False\n"
-                    f"    for kw in ['subprocess','os.system','os.popen','eval(','exec(','shell=True']:\n"
-                    f"        cnt = content.count(kw)\n"
+                    f"    for pat in [{patterns_repr}]:\n"
+                    f"        cnt = len(re.findall(pat, content))\n"
                     f"        if cnt:\n"
                     f"            sink_found = True\n"
-                    f"            print(f'  Dangerous call \"{{kw}}\": {{cnt}} occurrences')\n"
+                    f"            print(f'  Dangerous call \"{{pat}}\": {{cnt}} occurrences')\n"
                     f"else:\n"
                     f"    print(f'Source not found: {{src}}')\n"
                     f"    sys.exit(1)\n"
@@ -3079,6 +3097,16 @@ class VerificationAgent(BaseAgent):
                         f"if os.path.exists(src):\n"
                         f"    with open(src) as f: content = f.read()\n"
                         f"    print(f'Source: {{len(content)}} chars loaded')\n"
+                        f"    sink_found = False\n"
+                        f"    for pat in [{patterns_repr}]:\n"
+                        f"        cnt = len(re.findall(pat, content, re.I))\n"
+                        f"        if cnt:\n"
+                        f"            sink_found = True\n"
+                        f"            print(f'  Pattern \"{{pat}}\": {{cnt}} matches')\n"
+                        f"    if sink_found:\n"
+                        f"        print('STATIC_CONFIRMED: 源码存在可疑 sink pattern，需结合数据流人工复核')\n"
+                        f"    else:\n"
+                        f"        print('NO_SINK: 目标源码未发现匹配的 sink pattern')\n"
                         f"else:\n"
                         f"    print(f'Source not found: {{src}}')\n"
                         f"    sys.exit(1)\n"
