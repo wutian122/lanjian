@@ -34,7 +34,7 @@ services:
       - lanjian-network
 
   db-migrate:
-    image: wutian449/lanjian-backend:v6.2.0
+    image: wutian449/lanjian-backend:v6.2.1
     restart: "no"
     env_file:
       - ./backend/.env
@@ -52,7 +52,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v6.2.0
+    image: wutian449/lanjian-backend:v6.2.1
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -101,7 +101,7 @@ services:
       - lanjian-network
 
   frontend:
-    image: wutian449/lanjian-frontend:v6.2.0
+    image: wutian449/lanjian-frontend:v6.2.1
     restart: unless-stopped
     ports:
       - "80:80"
