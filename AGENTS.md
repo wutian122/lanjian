@@ -71,6 +71,7 @@ docker compose logs -f backend                  # 日志
 - 两台均跑 5 容器：`db`（postgres:15-alpine）、`redis`（redis:7-alpine）、`backend`、`frontend`、沙箱（`restart: no` 保持 Exited，仅作 docker.sock 动态起 PoC 容器的基底）。
 - 镜像来自 Docker Hub 组织 `wutian449`（lanjian-backend / lanjian-frontend / lanjian-sandbox），`v5.4.0`（backend/frontend）与 `v5.1.0`（sandbox）均为多架构（amd64 + arm64）；生产已锁 `v5.4.0` / `v5.1.0`，禁止 `:latest` 浮动。
 - **2026-08-19 只读实测**：两台 5 容器全部 `v5.1.0`、db/redis healthy、sandbox 按设计 Exited(0)；生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）；A 机另有 buildx buildkit 常驻容器（本地构建用）。
+- **2026-08-26 v6.2.1 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v6.2.1`，**sandbox 保持 `v6.1.0`**。内容为验证模板覆盖修复（command_injection 模板缩进 bug/xxe-other 语言 sink 检测/default 模板判定/poc_error 识别 IndentationError）。
 - **2026-08-25 v6.2.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v6.2.0`，**sandbox 保持 `v6.1.0`**（本次无沙箱变更）。内容为验证引擎 PoC 质量修复（R1 PoC pattern 按目标文件语言分流 / R2 SANDBOX_* 事件接线前端可见 / R3 理论风险 finding 保留落库 / R4 运行时证据三级兜底绑定）。
 - **2026-08-25 v6.1.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v6.1.0`，**sandbox 首次从 `v5.1.0` 升级到 `v6.1.0`**。内容为 LLM 类型防御根治（REQ-TH-1~4）+ malformed agents 数组防御（REQ-TH-6）+ 验证证据回传链路加固（REQ-ER-1~3）。
 - **2026-08-20 v5.3.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v5.3.0`，**sandbox 仍锁 `v5.1.0`**（本次未重建沙箱镜像）。本次为**每台服务器本地重新构建镜像**（非重打 tag）：基础镜像走国内 registry 镜像源 `docker.m.daocloud.io` + `docker.1ms.run`；backend Dockerfile 改为 `pip install uv`（阿里云 PyPI）替代 `COPY --from=docker.io/astral/uv`。生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）。
@@ -105,7 +106,7 @@ docker compose logs -f backend                  # 日志
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
 - RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离；项目资源访问统一走 `assert_can_access_project`（2026-08 安全加固已补上 members.py 遗漏的断言；前端用户管理已对 admin 开放，与后端下辖管理 RBAC 对齐）。
 - 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`（容器 read_only + cap_drop ALL + 默认 network none + 60s 超时；SANDBOX_IMAGE 代码默认 `:latest`，生产靠 compose 锁 v5.1.0 覆盖）。
-- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 6.2.0；动依赖先 `uv lock` 再全量测试。
+- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 6.2.1；动依赖先 `uv lock` 再全量测试。
 - **SSE 只服务 Agent 审计页**：前端 useResilientStream 用 fetch+ReadableStream（非 EventSource，需 Bearer header），心跳 45s/长操作 180s、Last-Event-ID + after_sequence 续传、最多重连 5 次；普通审计任务是 setInterval 轮询（2s->60s 分级），无 SSE。
 - **前端版本号在构建期硬编码进 JS bundle**（package.json version 经 vite 注入），运行时不可配；升版本必须重构建前端镜像。
 
