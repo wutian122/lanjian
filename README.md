@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.2.1-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.2.4-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -21,6 +21,9 @@
 - **验证完整性修复**（v6.0.1）：待验清单全量送验（不再按数量截断/不再漏掉多轮 analysis 早期发现）；verification 交接用全量发现（含轮次耗尽与验证门禁双路径程序化补验，杜绝全量零证据收尾）；验证器（预生成模板 PoC）正则转义修复 + 崩溃分档（`poc_error` → needs_context 注明，不冒充未复现）；模板演示确认挂源码 sink 断言（无对应 sink 不确认，收敛假阳性）；static_confirmed 必须有沙箱证据才计入验证门禁；证据摘要保尾 + 去重证据优先
 - **验证引擎 PoC 质量修复**（v6.2.0）：预生成 PoC 检测 pattern 按目标文件语言分流（Java 反序列化识别 ObjectInputStream/readObject，不再用 Python pattern grep 空转误判未复现）；确定性沙箱执行发射 sandbox_start/sandbox_result 事件（前端可见 PoC 命令与退出码）；理论风险 finding（缺精确定位但 confidence≥0.7 且有描述）保留落库不再整条消失；运行时沙箱证据三级兜底绑定（路径后缀+漏洞类型组合，修复 Tribes 类证据丢失）
 - **验证模板覆盖补全**（v6.2.1）：修复 command_injection 模板缩进 bug（PoC 不再崩溃）；扩展 xxe/other 等类型语言 sink 检测（WebDAV XXE/WebSocket CSWSH 不再空转）；default 模板输出 STATIC_CONFIRMED/NO_SINK 判定；poc_error 识别 IndentationError（崩溃正确分档 needs_context）
+- **验证过程四缺陷修复**（v6.2.2）：空 file_path 崩溃防御；铁证匹配丢弃修复；证据绑定 ID 回填；SSRF 死循环修复
+- **语言 sink pattern 正则转义**（v6.2.3）：path_traversal/command_injection 模板未转义括号致 re.error 崩溃修复 + 防回归测试
+- **任务临时目录清理**（v6.2.4）：agent 审计任务进入终态后自动清理 `/tmp/lanjian/<task_id>` 临时源码目录（此前 46 个历史目录累积 13G 塞满 tmpfs 致任务 No space 失败、db/redis 误报 unhealthy）；重验 finding（reverify）在目录已清理时 ZIP 项目自动重新解压源码、仓库项目返回明确提示；删除任务同步清理临时目录
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -111,7 +114,7 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.2.0`（backend/frontend）与 `v6.1.0`（sandbox，本次无变更）（生产已禁用 `:latest` 浮动 tag）。`v6.2.0`（backend/frontend）与 `v6.1.0`（sandbox）均为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.2.4`（backend）、`v6.2.3`（frontend，本次无改动）与 `v6.1.0`（sandbox，本次无变更）（生产已禁用 `:latest` 浮动 tag）。`v6.2.4`（backend）、`v6.2.3`（frontend）与 `v6.1.0`（sandbox）均为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
