@@ -167,3 +167,36 @@ def test_ssrf_capped_blocks_repeated_exec():
     # 空 capped 集合不拦截
     agent2 = _agent()
     assert asyncio.run(agent2._block_network_capped({"command": "python3 x.py"})) is None
+
+
+def test_language_sink_patterns_are_valid_regex():
+    """回归锁定：所有 sink pattern 必须是合法正则。
+
+    生产实证（任务 04da8310）：v6.2.1 引入的 path_traversal .java pattern
+    "new File(" 含未转义括号，PoC re.findall 抛 re.error → exit 1 崩溃。
+    """
+    import re as _re
+
+    from app.services.agent.agents.verification import _LANGUAGE_SINK_PATTERNS
+
+    for vuln_type, lang_map in _LANGUAGE_SINK_PATTERNS.items():
+        for ext, pats in lang_map.items():
+            for p in pats:
+                try:
+                    _re.compile(p)
+                except _re.error as e:  # pragma: no cover - 失败时给出定位
+                    pytest.fail(f"非法正则 {vuln_type}/{ext}: {p!r} ({e})")
+
+
+def test_all_sink_patterns_are_valid_regex():
+    """生产实证 v6.2.2 回归任务 04da8310：'new File(' 等含未转义括号的 pattern 在
+    PoC 的 re.findall 里抛 re.error → exit 1 崩溃。所有语言 sink pattern 必须可编译。"""
+    import re
+
+    from app.services.agent.agents.verification import _LANGUAGE_SINK_PATTERNS
+
+    for vuln_type, langs in _LANGUAGE_SINK_PATTERNS.items():
+        for lang, pats in langs.items():
+            for p in pats:
+                assert re.compile(p) is not None or True
+                re.compile(p)
