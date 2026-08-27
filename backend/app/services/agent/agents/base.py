@@ -1188,6 +1188,13 @@ class BaseAgent(ABC):
 
         try:
             self._tool_calls += 1
+            # REQ-CM-4: sandbox_exec 网络受限死循环防护（执行前拦截，Verification 特有）
+            if tool_name == "sandbox_exec":
+                cap_block = getattr(self, "_block_network_capped", None)
+                if cap_block is not None:
+                    blocked = await cap_block(tool_input)
+                    if blocked:
+                        return blocked
             await self.emit_tool_call(tool_name, tool_input)
 
             import time
