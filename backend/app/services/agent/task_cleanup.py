@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 from typing import Any, Dict
 
 from sqlalchemy import delete, select
@@ -15,6 +17,13 @@ async def cleanup_agent_task_resources(db: AsyncSession, task: AgentTask) -> Dic
     cleaned_findings = await _delete_rows(db, AgentFinding, AgentFinding.task_id == task.id)
     cleaned_checkpoints = await _delete_rows(db, AgentCheckpoint, AgentCheckpoint.task_id == task.id)
     cleaned_tree_nodes = await _delete_rows(db, AgentTreeNode, AgentTreeNode.task_id == task.id)
+
+    # REQ-CLEAN-3: 删除任务时同步清理临时源码目录（幂等，容忍目录已不存在）
+    cleaned_files: list[str] = []
+    tmp_dir = f"/tmp/lanjian/{task.id}"
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        cleaned_files.append(tmp_dir)
 
     cleaned_indexes: list[str] = []
     warnings: list[str] = []
@@ -69,7 +78,7 @@ async def cleanup_agent_task_resources(db: AsyncSession, task: AgentTask) -> Dic
         "cleanedFindings": cleaned_findings,
         "cleanedCheckpoints": cleaned_checkpoints,
         "cleanedTreeNodes": cleaned_tree_nodes,
-        "cleanedFiles": [],
+        "cleanedFiles": cleaned_files,
         "cleanedIndexes": cleaned_indexes,
         "warnings": warnings,
     }

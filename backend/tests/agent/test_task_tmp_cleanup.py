@@ -99,10 +99,14 @@ class TestTaskCleanupRemovesDir:
         db = AsyncMock()
         db.execute = AsyncMock(return_value=_FakeResult())
         db.delete = AsyncMock()
+        db.add = MagicMock()  # session.add 是同步调用，不能 mock 成 AsyncMock
         db.commit = AsyncMock()
 
         removed: list[str] = []
+        expected = f"/tmp/lanjian/{task.id}"
         monkeypatch.setattr(shutil_mod, "rmtree", lambda p, **kw: removed.append(p))
+        # 测试机是 Windows（无 /tmp），模拟生产机目录存在，让 isdir 检查通过
+        monkeypatch.setattr(tc.os.path, "isdir", lambda p: p == expected)
 
         result = await tc.cleanup_agent_task_resources(db, task)
 

@@ -2849,8 +2849,18 @@ async def reverify_finding(
     if not manager.is_available:
         raise HTTPException(status_code=503, detail="沙箱环境不可用")
 
-    # 项目源码目录（任务执行期解压/克隆位置）；已被清理时为空挂载，PoC 独立运行
+    # 项目源码目录（任务执行期解压/克隆位置）；已被收尾清理时重新准备源码
     host_project_dir = "/tmp/lanjian/" + str(task_id)
+    # REQ-CLEAN-2: 任务收尾会清理临时目录；目录缺失时 ZIP 项目重新解压恢复挂载，
+    # 仓库项目（需凭证重克隆）要求重新执行审计任务。
+    if not os.path.isdir(host_project_dir):
+        if project.source_type == "zip":
+            await _get_project_root(project, task_id)
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail="项目源码已被清理，请重新执行审计任务后再验证",
+            )
     result = await manager.execute_poc(
         poc_code=finding.poc_code,
         host_project_dir=host_project_dir,

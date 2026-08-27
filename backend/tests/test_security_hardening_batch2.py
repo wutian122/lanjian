@@ -96,7 +96,9 @@ async def test_reverify_finding_rejects_without_poc():
         return _finding("f1", has_poc=False, poc_code=None)
 
     db.get.side_effect = fake_get
-    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()):
+    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
+        "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
+    ):
         with pytest.raises(Exception) as e:
             await reverify_finding(
                 task_id="t1", finding_id="f1", db=db,
@@ -121,7 +123,9 @@ async def test_reverify_finding_runs_poc_and_updates_status():
     db.get.side_effect = fake_get
 
     fake_result = {"success": True, "exit_code": 0, "stdout": "OK", "stderr": ""}
-    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()):
+    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
+        "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
+    ):
         with patch("app.services.agent.tools.sandbox_tool.SandboxManager") as SM:
             SM.return_value.initialize = AsyncMock()
             SM.return_value.is_available = True
@@ -155,7 +159,9 @@ async def test_reverify_finding_marks_not_reproducible_on_failure():
     db.get.side_effect = fake_get
 
     fake_result = {"success": False, "exit_code": 1, "stdout": "", "stderr": "boom"}
-    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()):
+    with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
+        "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
+    ):
         with patch("app.services.agent.tools.sandbox_tool.SandboxManager") as SM:
             SM.return_value.initialize = AsyncMock()
             SM.return_value.is_available = True
