@@ -1968,6 +1968,20 @@ class VerificationAgent(BaseAgent):
         # V6 B4（REQ-VE-4）：优先消费 finding_id 索引（确定性执行直写，反解失败也齐全），
         # 索引缺失时回退扁平列表过滤；合并前按语义键去重防止双计。
         finding_id = finding.get("_sandbox_finding_id")
+        if not finding_id:
+            # REQ-CM-3: LLM 归一化丢失 ID 时，按 file_path 从原清单回填确定性执行的 ID
+            # （nginx hardcoded_secret 实证：finding_metadata 仅 discovery_source，证据绑定丢失）
+            fp_raw = (finding.get("file_path") or "").strip().lower()
+            if fp_raw:
+                for cand in getattr(self, "_all_findings", []) or []:
+                    if not isinstance(cand, dict):
+                        continue
+                    if (
+                        (cand.get("file_path") or "").strip().lower() == fp_raw
+                        and cand.get("_sandbox_finding_id")
+                    ):
+                        finding_id = cand["_sandbox_finding_id"]
+                        break
         if finding_id:
             index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
             id_matched = index.get(str(finding_id)) or [
@@ -2226,7 +2240,7 @@ class VerificationAgent(BaseAgent):
             or target_file.endswith(f"/{file_path}")
             or file_path.endswith(f"/{target_file}")
         )
-        same_line = target_line == str(line_start) if line_start else True
+        same_line = (target_line == str(line_start)) if (line_start and target_line) else True
         if same_file and same_line:
             return True
 
@@ -2239,6 +2253,10 @@ class VerificationAgent(BaseAgent):
             title_keywords = [w for w in title.split() if len(w) > 2]
             if (vuln_type and vuln_type in evidence_lower) or \
                any(kw in evidence_lower for kw in title_keywords[:4]):
+                return True
+            # REQ-CM-2: file_path base name 兜底（evidence 只含文件名时仍匹配）
+            file_name_b = file_path.replace("\\", "/").split("/")[-1]
+            if file_name_b and file_name_b.lower() in evidence_lower:
                 return True
         return False
 
@@ -2507,6 +2525,14 @@ class VerificationAgent(BaseAgent):
                         self._verified_finding_indices.add(finding_idx)
                 self._record_sandbox_attempt(cmd_input, result, finding_id=finding_id)
                 executed += 1
+                # REQ-CM-4: ssrf 网络受限，确定性 sink 检测完成后登记 capped 路径，
+                # 阻止 LLM 循环对同一文件重复执行（nginx 7b76b3a8 实证 106 次死循环）
+                if sc.get("vuln_type") == "ssrf" and sc.get("file_path"):
+                    caps = getattr(self, "_network_capped_paths", None)
+                    if caps is None:
+                        caps = set()
+                        self._network_capped_paths = caps
+                    caps.add(str(sc.get("file_path")))
                 logger.info(
                     f"[{self.name}] Deterministic sandbox executed ({executed}/{len(sandbox_commands)}): {sc.get('label', '')}"
                 )
@@ -2534,6 +2560,26 @@ class VerificationAgent(BaseAgent):
                 f"✅ 确定性沙箱执行完成: {executed} 条预生成 PoC 已运行"
             )
 
+    async def _block_network_capped(self, tool_input: Dict) -> Optional[str]:
+        """REQ-CM-4: 网络受限（ssrf）finding 的沙箱尝试重复防护。
+
+        确定性 PoC 已完成 sink 检测并登记 capped 路径；LLM 此后用相同文件执行
+        sandbox_exec 时返回受限说明，阻止死循环（nginx 106 次实证）。
+        """
+        capped = getattr(self, "_network_capped_paths", None)
+        if not capped:
+            return None
+        cmd = str((tool_input or {}).get("command") or "")
+        if not cmd:
+            return None
+        for path in capped:
+            if path and path in cmd:
+                return (
+                    "⚠️ 该 SSRF 漏洞的沙箱网络受限（network=none），确定性 PoC 已完成 "
+                    "sink 检测，不再重复执行。请直接给出验证结论。"
+                )
+        return None
+
     def _build_sandbox_commands(self, findings: List[Dict]) -> List[Dict]:
         """为每个发现自动生成 sandbox_exec 命令，确保 LLM 有可直接执行的沙箱指令"""
         from uuid import uuid4
@@ -2554,6 +2600,8 @@ class VerificationAgent(BaseAgent):
                 original_command = cmd.get("command", "")
                 cmd["command"] = "# FINDING_ID:" + finding_id + "\n" + original_command
                 cmd["finding_id"] = finding_id
+                cmd["vuln_type"] = vuln_type
+                cmd["file_path"] = file_path
                 commands.append(cmd)
         return commands
 
@@ -2567,6 +2615,10 @@ class VerificationAgent(BaseAgent):
         safe_title = re.sub(r"[\r\n]", "", title.replace("'", "").replace('"', ''))[:60]
         safe_title = safe_title.replace("POC_EOF", "")
         safe_path = safe_path.replace("POC_EOF", "")
+        if not safe_path or not safe_path.strip("/").strip():
+            # REQ-CM-1: 空 file_path 无法定位源码，跳过 PoC 生成，避免 open 目录崩溃
+            # （tomact 289d88e3 实证 IsADirectoryError: '/workspace/src/'）。
+            return None
         file_ref = f"{safe_path}:{line}" if line else safe_path
 
         # REQ-VP-1: 按目标文件语言分流检测 pattern，注入模板的 for pat 循环与 sink 判定
