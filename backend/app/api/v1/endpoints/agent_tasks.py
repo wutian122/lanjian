@@ -1105,6 +1105,10 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             # C1: 只清理本任务的注册表作用域（包括所有子 Agent），不影响并发任务
             agent_registry.clear_task(task_id)
 
+            # REQ-CLEAN-1: 清理任务的临时源码目录，防止 tmpfs 累积塞满
+            # （ignore_errors=True 幂等容忍目录已不存在，不阻断任务收尾）
+            shutil.rmtree(f"/tmp/lanjian/{task_id}", ignore_errors=True)
+
             logger.debug(f"Task {task_id} cleaned up")
 
 
