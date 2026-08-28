@@ -178,7 +178,7 @@ export const api = {
       full_scan: !task.scan_config?.file_paths || task.scan_config.file_paths.length === 0,
       exclude_patterns: task.exclude_patterns || [],
       branch_name: task.branch_name || "main",
-      // B2: Í¸´«¹æÔò¼¯ÓëÌáÊ¾´ÊÄ£°å£¨´ËÇ°ÖĞ¼ä²ã¶ªÆúÕâÁ½¸ö×Ö¶Î£¬½çÃæ²ßÂÔ¶Ô²Ö¿âÉ¨Ãè²»ÉúĞ§£©
+      // B2: Í¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¾ï¿½ï¿½Ä£ï¿½å£¨ï¿½ï¿½Ç°ï¿½Ğ¼ï¿½ã¶ªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¶Î£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¶Ô²Ö¿ï¿½É¨ï¿½è²»ï¿½ï¿½Ğ§ï¿½ï¿½
       rule_set_id: task.scan_config?.rule_set_id,
       prompt_template_id: task.scan_config?.prompt_template_id,
     };
@@ -273,6 +273,7 @@ export const api = {
     active_projects: number;
     total_tasks: number;
     completed_tasks: number;
+    running_tasks: number; // #6 ä¿®å¤ï¼šåç«¯å·²èšåˆ agent_tasksï¼Œä»ªè¡¨ç›˜"è¿è¡Œä¸­ä»»åŠ¡"æ”¹ç”¨æ­¤å­—æ®µ
     total_issues: number;
     resolved_issues: number;
     avg_quality_score: number;
@@ -286,6 +287,7 @@ export const api = {
         active_projects: 0,
         total_tasks: 0,
         completed_tasks: 0,
+        running_tasks: 0,
         total_issues: 0,
         resolved_issues: 0,
         avg_quality_score: 0
@@ -349,7 +351,7 @@ export const api = {
     await apiClient.delete('/config/me');
   },
 
-  // ==================== É³Ïä¹ÜÀí API ====================
+  // ==================== É³ï¿½ï¿½ï¿½ï¿½ï¿½ API ====================
   async testSandboxNetwork(url: string): Promise<{
     success: boolean; status_code: number; latency_ms: number; message: string;
   }> {
@@ -398,7 +400,7 @@ export const api = {
     return res.data;
   },
 
-  // ==================== æ•°æ®åº“ç®¡ç†ç›¸å…³æ–¹æ³?====================
+  // ==================== æ•°æ®åº“ç®¡ç†ç›¸å…³æ–¹ï¿½?====================
 
   async exportDatabase(): Promise<{
     export_date: string;
@@ -444,7 +446,7 @@ export const api = {
     return res.data;
   },
 
-  // ==================== æ•°æ®åº“ç»Ÿè®¡å’Œå¥åº·æ£€æŸ?====================
+  // ==================== æ•°æ®åº“ç»Ÿè®¡å’Œå¥åº·æ£€ï¿½?====================
 
   async getDatabaseStats(): Promise<{
     total_projects: number;

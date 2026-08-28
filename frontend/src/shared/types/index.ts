@@ -195,6 +195,7 @@ export interface ProjectStats {
   active_projects: number;
   total_tasks: number;
   completed_tasks: number;
+  running_tasks: number; // #6 修复：后端聚合 agent_tasks 后的运行中任务数
   total_issues: number;
   resolved_issues: number;
   avg_quality_score: number;

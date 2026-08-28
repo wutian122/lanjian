@@ -19,6 +19,7 @@ from app.models.project import Project, ProjectMember
 from app.models.audit import AuditTask, AuditIssue
 from app.models.analysis import InstantAnalysis
 from app.models.user_config import UserConfig
+from app.models.agent_task import AgentTask, AgentTaskStatus
 
 router = APIRouter()
 
@@ -513,6 +514,33 @@ async def get_database_stats(
         pending_tasks = len([t for t in tasks if t.status == "pending"])
         running_tasks = len([t for t in tasks if t.status == "running"])
         failed_tasks = len([t for t in tasks if t.status == "failed"])
+
+        # 2b. Agent 审计任务统计（#6 修复：聚合两套任务体系，仪表盘口径与
+        # /audit-tasks 页一致——E2E 实证 agent 任务运行中时"运行中任务"显示 0）
+        agent_tasks_result = await db.execute(
+            select(AgentTask)
+            .join(Project, AgentTask.project_id == Project.id)
+            .where(Project.owner_id == current_user.id)
+        )
+        agent_tasks = agent_tasks_result.scalars().all()
+        _AGENT_RUNNING = {
+            AgentTaskStatus.RUNNING,
+            AgentTaskStatus.PLANNING,
+            AgentTaskStatus.INDEXING,
+            AgentTaskStatus.ANALYZING,
+            AgentTaskStatus.VERIFYING,
+            AgentTaskStatus.REPORTING,
+        }
+        _AGENT_COMPLETED = {
+            AgentTaskStatus.COMPLETED,
+            AgentTaskStatus.COMPLETED_WITH_GAPS,
+        }
+        _AGENT_PENDING = {AgentTaskStatus.PENDING, AgentTaskStatus.INITIALIZING}
+        total_tasks += len(agent_tasks)
+        completed_tasks += len([t for t in agent_tasks if t.status in _AGENT_COMPLETED])
+        pending_tasks += len([t for t in agent_tasks if t.status in _AGENT_PENDING])
+        running_tasks += len([t for t in agent_tasks if t.status in _AGENT_RUNNING])
+        failed_tasks += len([t for t in agent_tasks if t.status == AgentTaskStatus.FAILED])
         
         # 3. 问题统计
         task_ids = [task.id for task in tasks]

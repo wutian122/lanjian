@@ -101,7 +101,11 @@ class TestGradedDropRuntime:
 
     @pytest.mark.asyncio
     async def test_thinking_token_dropped_when_full(self):
-        """队列满时 thinking_token 被丢弃且计数递增，add_event 不抛异常"""
+        """队列满时 thinking_token 被丢弃且计数递增，add_event 不抛异常。
+
+        #1 修复后：连续 token 在聚合窗口内（增量小）只发射第一条——
+        第一条撞满队列被丢弃计数，其余被聚合跳过（不计数、不阻塞）。
+        """
         from app.services.agent.event_manager import EventManager
 
         # 小容量队列便于测试
@@ -117,23 +121,28 @@ class TestGradedDropRuntime:
             q.put_nowait({"filler": True})
         assert q.full()
 
-        # 再发 5 个 thinking_token：应被全部丢弃，不阻塞不抛错
+        # 再发 5 个 thinking_token：不阻塞不抛错；第 1 条撞满丢弃，其余聚合跳过
         for i in range(5):
             await asyncio.wait_for(
                 mgr.add_event(task_id, "thinking_token", sequence=i),
                 timeout=1.0,
             )
 
-        # 5 个都被丢弃
-        assert mgr.dropped_thinking_tokens.get(task_id, 0) == 5, (
-            f"预期丢弃 5 个 thinking_token，实际 {mgr.dropped_thinking_tokens.get(task_id, 0)}"
+        # 第 1 条被丢弃计数，后续 4 条被时间窗聚合（不计数）
+        assert mgr.dropped_thinking_tokens.get(task_id, 0) == 1, (
+            f"预期丢弃 1 个 thinking_token（其余聚合），实际 {mgr.dropped_thinking_tokens.get(task_id, 0)}"
         )
         # 队列大小未变（仍是 3）
         assert q.qsize() == 3
 
     @pytest.mark.asyncio
-    async def test_important_event_gives_up_after_timeout(self):
-        """重要事件（非终态非丢弃）在队列满时等待后放弃"""
+    async def test_important_event_skips_immediately_when_full(self):
+        """重要事件（非终态非丢弃）在队列满时**非阻塞**跳过（#1 修复）。
+
+        旧实现 await wait_for(put, 5s) 在 orchestrator 主协程同步等待，
+        E2E 实证 1493 条事件各等满 5s ≈ 124 分钟纯阻塞。新实现 put_nowait
+        立即返回（事件已落 DB，重连时回补）。
+        """
         from app.services.agent.event_manager import EventManager
 
         mgr = EventManager(db_session_factory=None)
@@ -144,16 +153,14 @@ class TestGradedDropRuntime:
             q.put_nowait({"filler": True})
         assert q.full()
 
-        # 缩短超时便于测试
-        mgr.IMPORTANT_PUT_TIMEOUT_SECONDS = 0.5
-
         start = asyncio.get_event_loop().time()
         await mgr.add_event(task_id, "tool_call", sequence=1)
         elapsed = asyncio.get_event_loop().time() - start
 
-        # 大约等待 0.5 秒后放弃（允许 0.4-1.0 秒容差）
-        assert 0.4 < elapsed < 1.5, f"预期 ~0.5s 后放弃，实际 {elapsed:.2f}s"
-        # 队列未变
+        # 非阻塞：瞬时返回（远小于旧实现的 0.5s 超时）
+        assert elapsed < 0.4, f"预期非阻塞瞬时返回，实际 {elapsed:.2f}s"
+        # 跳过计数 +1，队列未变
+        assert mgr.dropped_important_events.get(task_id, 0) == 1
         assert q.qsize() == 2
 
     @pytest.mark.asyncio

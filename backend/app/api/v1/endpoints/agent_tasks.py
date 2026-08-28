@@ -1838,19 +1838,20 @@ async def _save_findings(
             file_path = _extract_finding_file_path(finding)
 
             # 🔥 v2.1: 文件路径验证 - 过滤幻觉发现
+            # #4-5 修复：改用统一解析器（沙箱前缀剥离/src 层级/basename 兜底），
+            # 解析成功把归一化路径写回 file_path（后续 reverify/展示可解析）。
             if project_root and file_path:
-                # 清理路径（移除可能的行号）
-                clean_path = file_path.split(":")[0].strip() if ":" in file_path else file_path.strip()
-                full_path = os.path.join(project_root, clean_path)
+                from app.services.agent.utils.finding_path import resolve_project_file
 
-                if not os.path.isfile(full_path):
-                    # 尝试作为绝对路径
-                    if not (os.path.isabs(clean_path) and os.path.isfile(clean_path)):
-                        logger.warning(
-                            f"[SaveFindings] 🚫 跳过幻觉发现: 文件不存在 '{file_path}' "
-                            f"(title: {finding.get('title', 'N/A')[:50]})"
-                        )
-                        continue  # 跳过这个发现
+                resolved = resolve_project_file(project_root, file_path)
+                if resolved is None:
+                    logger.warning(
+                        f"[SaveFindings] 🚫 跳过幻觉发现: 文件不存在 '{file_path}' "
+                        f"(title: {finding.get('title', 'N/A')[:50]})"
+                    )
+                    continue  # 跳过这个发现
+                finding["file_path"] = resolved
+                file_path = resolved
 
             # 🔥 Handle line numbers (support multiple formats)
             # REQ-TH-3: 落库前数值归一化——LLM 的 str line_start 直传 Integer 列会 asyncpg 整批 rollback（c9de9d40 同族）
@@ -2837,8 +2838,33 @@ async def reverify_finding(
     finding = await db.get(AgentFinding, finding_id)
     if not finding or finding.task_id != task_id:
         raise HTTPException(status_code=404, detail="finding not found")
-    if not finding.has_poc or not finding.poc_code:
-        raise HTTPException(status_code=400, detail="该 finding 没有可重跑的 PoC")
+
+    # #2 修复：poc_code 是 LLM 自由文本（HTTP 型 payload 常为 URL），不可直接当
+    # Python 执行。优先重放审计期最后一次成功 attempt 的真实命令（确定性 PoC 脚本）；
+    # 无历史成功记录时，poc_code 必须能解析为 Python 才允许执行，否则 400 不改状态。
+    import ast as _ast
+
+    history_attempts = list(finding.sandbox_attempts or [])
+    replay_command = None
+    for _a in reversed(history_attempts):
+        if isinstance(_a, dict) and _a.get("success") and _a.get("command"):
+            replay_command = str(_a["command"])
+            break
+
+    poc_code = (finding.poc_code or "").strip()
+    if not replay_command:
+        try:
+            _ast.parse(poc_code)
+            poc_parsable = bool(poc_code)
+        except SyntaxError:
+            poc_parsable = False
+        if not (finding.has_poc and poc_parsable):
+            raise HTTPException(
+                status_code=400,
+                detail="该 finding 没有可重跑的 PoC 脚本（poc_code 不可执行且无沙箱成功记录），验证状态保持不变",
+            )
+
+    executable_poc = replay_command or poc_code
 
     from app.core.config import settings
     from app.services.agent.tools.sandbox_tool import SandboxConfig, SandboxManager
@@ -2862,35 +2888,55 @@ async def reverify_finding(
                 detail="项目源码已被清理，请重新执行审计任务后再验证",
             )
     result = await manager.execute_poc(
-        poc_code=finding.poc_code,
+        poc_code=executable_poc,
         host_project_dir=host_project_dir,
         timeout=60,
     )
 
     success = bool(result.get("success"))
+    exit_code = result.get("exit_code")
+    stdout = result.get("stdout") or ""
+    stderr = result.get("stderr") or ""
+    combined_output = f"{stdout}\n{stderr}"
+    # REQ-VE-2 分档：PoC 自身崩溃特征（与 verification._record_sandbox_attempt 同标准），
+    # 崩溃不得冒充"未复现"——判定交给确定性证据引擎。
+    poc_error = any(
+        m in combined_output
+        for m in ("Traceback", "SyntaxError", "re.error", "unterminated", "IndentationError", "TabError")
+    )
     now = datetime.now(UTC)
     attempts = list(finding.sandbox_attempts or [])
     attempts.append({
         "tool": "poc-rerun",
         "success": success,
-        "exit_code": result.get("exit_code"),
-        "evidence_summary": (result.get("stdout") or result.get("stderr") or "")[:500],
+        "exit_code": exit_code,
+        "command": executable_poc,
+        "evidence_summary": combined_output[:500],
+        "poc_error": poc_error,
         "reason": "manual-rerun",
     })
     finding.sandbox_attempts = attempts
     finding.verification_result = {
         "method": "poc-rerun",
         "success": success,
-        "exit_code": result.get("exit_code"),
-        "stdout": (result.get("stdout") or "")[:2000],
-        "stderr": (result.get("stderr") or "")[:2000],
+        "exit_code": exit_code,
+        "stdout": stdout[:2000],
+        "stderr": stderr[:2000],
         "executed_at": serialize_cst(now),
     }
-    from app.models.agent_task import VerificationStatus
-    finding.verification_status = (
-        VerificationStatus.CONFIRMED if success else VerificationStatus.NOT_REPRODUCIBLE
+    # #2 修复：状态由确定性证据引擎推导（复用 compute_verification_status 纯函数），
+    # 不再二元 success→CONFIRMED else NOT_REPRODUCIBLE：
+    # - rerun 成功且带漏洞触发证据 → confirmed
+    # - PoC 自身崩溃 → needs_context（不误降级）
+    # - 历史 confirmed 铁证不被单次"未复现"推翻
+    from app.services.agent.agents.verification import compute_verification_status
+
+    finding_view = {"verdict": str(getattr(finding, "verification_status", "") or "")}
+    new_status, new_is_verified, _notes = compute_verification_status(
+        finding_view, attempts
     )
-    finding.is_verified = True
+    finding.verification_status = new_status
+    finding.is_verified = new_is_verified
     finding.verified_at = now
     await db.commit()
 
@@ -2899,7 +2945,7 @@ async def reverify_finding(
         "finding_id": finding_id,
         "success": success,
         "verification_status": finding.verification_status,
-        "exit_code": result.get("exit_code"),
+        "exit_code": exit_code,
     }
 
 
@@ -2984,6 +3030,24 @@ async def delete_agent_task(
     ]
     if task.status in active_statuses:
         raise HTTPException(status_code=400, detail="运行中的 Agent 任务不能直接删除，请先取消任务")
+
+    # #7 修复：DB 状态已终态但后台 asyncio 协程可能仍在收尾（E2E FK violation 实证：
+    # 任务删除后仍有 verification 轮次写事件 → agent_events.task_id 外键违规）。
+    # 删除前取消并等待活跃协程退出，再执行级联清理。
+    orchestrator = _running_orchestrators.get(task_id)
+    if orchestrator is not None:
+        try:
+            orchestrator.cancel()
+        except Exception:
+            logger.warning(f"[DeleteAgentTask] orchestrator.cancel failed for {task_id}", exc_info=True)
+    running_task = _running_asyncio_tasks.get(task_id)
+    if running_task is not None and not running_task.done():
+        running_task.cancel()
+        try:
+            await asyncio.wait_for(running_task, timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            # 取消成功或 5s 内未退出均不阻断删除流程（收尾协程有自身异常兜底）
+            pass
 
     return await cleanup_agent_task_resources(db, task)
 

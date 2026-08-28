@@ -6,6 +6,7 @@ Agent 事件管理器
 import asyncio
 import json
 import logging
+import time
 from typing import Optional, Dict, Any, List, AsyncGenerator, Callable
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -261,12 +262,18 @@ class EventManager:
 
     # Wave 2 §3.3 事件队列有界化配置
     QUEUE_MAX_SIZE = 10000  # 单任务队列上限（覆盖 ~15 分钟正常任务事件量）
-    IMPORTANT_PUT_TIMEOUT_SECONDS = 5.0  # 重要事件入队最长等待时间
+    IMPORTANT_PUT_TIMEOUT_SECONDS = 5.0  # 重要事件入队最长等待时间（历史值，现非阻塞）
     # Wave 2 Review Finding 1: 终态事件超时保护（30s）
     # 消费者永久离线时避免 Orchestrator 永久挂死；事件已落 DB，重连时回补可送达
     TERMINAL_PUT_TIMEOUT_SECONDS = 30.0
     TERMINAL_EVENT_TYPES = frozenset({"task_complete", "task_error", "task_cancel"})
     DROPPABLE_EVENT_TYPES = frozenset({"thinking_token"})  # 可安全丢弃的事件
+
+    # #1 修复（E2E 实证 1493 条重要事件各等满 5s ≈ 124 分钟纯阻塞）：
+    # thinking_token 时间窗聚合——每 token 一条事件对前端无感知（前端跳过渲染），
+    # 聚合可减少 90%+ 队列写入，从源头缓解饱和。
+    THINKING_TOKEN_COALESCE_WINDOW = 0.15  # 秒
+    THINKING_TOKEN_COALESCE_MIN_CHARS = 64  # accumulated 字符增量阈值
 
     # Wave 2 §3.4 心跳配置
     HEARTBEAT_INTERVAL = 10  # 秒；前端 45s 心跳窗口 4.5x 余量
@@ -279,6 +286,10 @@ class EventManager:
         self._terminal_tasks: set = set()  # 已终态的 task_id 集合
         # Wave 2 §3.3 分级丢弃计数器：追踪被丢弃的 thinking_token 数量
         self.dropped_thinking_tokens: Dict[str, int] = {}
+        # #1 修复：重要事件队列满时非阻塞跳过的计数器（原实现同步等 5s）
+        self.dropped_important_events: Dict[str, int] = {}
+        # #1 修复：thinking_token 聚合状态 task_id -> (last_emit_ts, last_accumulated)
+        self._thinking_token_buf: Dict[str, tuple] = {}
     
     async def add_event(
         self,
@@ -324,15 +335,31 @@ class EventManager:
             except Exception as e:
                 logger.error(f"Failed to save event to database: {e}")
         
-        # Wave 2 §3.3 分级入队策略：
-        # - 可丢弃事件（thinking_token）: put_nowait，QueueFull 直接丢弃并计数
-        # - 终态事件（task_complete/task_error/task_cancel）: 无条件 await 直到成功
-        # - 其他重要事件: await wait_for(put, 5s)，超时后放弃入队但已落 DB（DB 回补兜底）
+        # Wave 2 §3.3 分级入队策略（#1 修复后）：
+        # - 可丢弃事件（thinking_token）: 时间窗聚合后 put_nowait，QueueFull 直接丢弃并计数
+        # - 终态事件（task_complete/task_error/task_cancel）: await 阻塞（30s 保护），MUST 送达
+        # - 其他重要事件: put_nowait 非阻塞——事件已先落 DB，队列满跳过（DB 回补兜底），
+        #   生产端（orchestrator 主协程）不再因消费者慢/缺席被 5s 同步等待拖垮
         if task_id in self._event_queues:
             q = self._event_queues[task_id]
 
             if event_type in self.DROPPABLE_EVENT_TYPES:
-                # 可丢弃事件：立即入队，满则丢弃（thinking_token 只是 UX 增强）
+                # 可丢弃事件：时间窗聚合（前端不渲染逐 token，thinking_end 兜底全文）
+                metadata = event_data.get("metadata") or {}
+                accumulated = str(metadata.get("accumulated") or "")
+                now = time.monotonic()
+                last = self._thinking_token_buf.get(task_id)
+                if last is not None:
+                    last_ts, last_len = last
+                    within_window = now - last_ts < self.THINKING_TOKEN_COALESCE_WINDOW
+                    small_growth = (
+                        len(accumulated) - last_len
+                    ) < self.THINKING_TOKEN_COALESCE_MIN_CHARS
+                    if within_window and small_growth:
+                        # 聚合窗口内且增量小：丢弃中间 token（不计数，属正常聚合）
+                        return event_id
+                self._thinking_token_buf[task_id] = (now, len(accumulated))
+                # 立即入队，满则丢弃（thinking_token 只是 UX 增强）
                 try:
                     q.put_nowait(event_data)
                 except asyncio.QueueFull:
@@ -365,20 +392,22 @@ class EventManager:
                         f"consumer offline. Event persisted in DB, will be delivered on next SSE reconnect."
                     )
             else:
-                # 重要事件：最多等 5s。超时则放弃入队（DB 已落，重连时 DB 回补可拿到）
+                # 重要事件：非阻塞入队（DB 已落，重连时 DB 回补可拿到；不再同步等 5s）
                 try:
-                    await asyncio.wait_for(
-                        q.put(event_data), timeout=self.IMPORTANT_PUT_TIMEOUT_SECONDS
-                    )
+                    q.put_nowait(event_data)
                     if event_type in {"thinking_start", "thinking_end", "dispatch",
                                       "tool_call", "tool_result", "llm_action"}:
                         logger.info(
                             f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {q.qsize()}"
                         )
-                except asyncio.TimeoutError:
+                except asyncio.QueueFull:
+                    self.dropped_important_events[task_id] = (
+                        self.dropped_important_events.get(task_id, 0) + 1
+                    )
                     logger.warning(
-                        f"[EventQueue] Timed out (5s) waiting to enqueue {event_type} for task {task_id} "
-                        f"(size={q.qsize()}/{q.maxsize}); event dropped from queue but persisted in DB"
+                        f"[EventQueue] Queue full (size={q.qsize()}/{q.maxsize}), skipped {event_type} "
+                        f"for task {task_id} (non-blocking); event persisted in DB, "
+                        f"delivered on next SSE reconnect"
                     )
 
         # 调用回调

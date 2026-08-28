@@ -108,7 +108,11 @@ async def test_reverify_finding_rejects_without_poc():
 
 
 async def test_reverify_finding_runs_poc_and_updates_status():
-    """有 PoC 时在沙箱重放并更新 finding 验证状态。"""
+    """有 PoC 时在沙箱重放并更新 finding 验证状态。
+
+    #2 修复：状态由确定性证据引擎推导——success 且输出含漏洞触发证据才 confirmed，
+    不再"exit 0 即 confirmed"（旧语义是 #2 误降级缺陷的同源问题）。
+    """
     from app.api.v1.endpoints.agent_tasks import reverify_finding
     from app.models.agent_task import VerificationStatus
 
@@ -122,7 +126,7 @@ async def test_reverify_finding_runs_poc_and_updates_status():
 
     db.get.side_effect = fake_get
 
-    fake_result = {"success": True, "exit_code": 0, "stdout": "OK", "stderr": ""}
+    fake_result = {"success": True, "exit_code": 0, "stdout": "VULNERABILITY_CONFIRMED: poc executed", "stderr": ""}
     with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
         "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
     ):

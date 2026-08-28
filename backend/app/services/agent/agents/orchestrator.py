@@ -2351,7 +2351,13 @@ Action Input: {{"参数": "值"}}
 
     def _validate_file_path(self, file_path: str) -> bool:
         """
-        🔥 v2.1: 验证文件路径是否真实存在
+        验证文件路径是否真实存在。
+
+        #4-5 修复（E2E 实证）：改用统一解析器 resolve_project_file——旧实现仅
+        ``os.path.join(project_root, clean_path)`` 单点拼接，ZIP 样本文件位于
+        src/ 子目录时把裸文件名/沙箱前缀路径误判为幻觉（15 声明仅 5 落库）。
+        新解析器剥离 /workspace 前缀、追加 src/ 层级、basename 限深度兜底，
+        **只有实际在项目树中找到文件才通过**——幻觉过滤能力不回退。
 
         Args:
             file_path: 相对或绝对文件路径（可能包含行号，如 "app.py:36"）
@@ -2368,19 +2374,9 @@ Action Input: {{"参数": "值"}}
             # 没有项目根目录时，无法验证，返回 True 以避免误判
             return True
 
-        # 清理路径（移除可能的行号）
-        clean_path = file_path.split(":")[0].strip() if ":" in file_path else file_path.strip()
+        from app.services.agent.utils.finding_path import resolve_project_file
 
-        # 尝试相对路径
-        full_path = os.path.join(project_root, clean_path)
-        if os.path.isfile(full_path):
-            return True
-
-        # 尝试绝对路径
-        if os.path.isabs(clean_path) and os.path.isfile(clean_path):
-            return True
-
-        return False
+        return resolve_project_file(project_root, file_path) is not None
 
     def _merge_or_append_finding(self, normalized_new: dict[str, Any]) -> None:
         """T7 (REQ-VC-3): 将标准化后的 finding merge 回 _all_findings。
@@ -2570,13 +2566,22 @@ Action Input: {{"参数": "值"}}
                 normalized["description"] += f"\n\nImpact: {normalized['impact']}"
 
         # 🔥 v2.1: 验证文件路径存在性
+        # #4-5 修复：解析成功后把归一化路径写回，后续验证绑定/落库/展示统一口径
         file_path = normalized.get("file_path", "")
-        if file_path and not self._validate_file_path(file_path):
-            logger.warning(
-                f"[Orchestrator] 🚫 过滤幻觉发现: 文件不存在 '{file_path}' "
-                f"(title: {normalized.get('title', 'N/A')[:50]})"
-            )
-            return None  # 返回 None 表示发现无效
+        if file_path:
+            project_root = self._runtime_context.get("project_root", "")
+            if project_root:
+                from app.services.agent.utils.finding_path import resolve_project_file
+
+                resolved = resolve_project_file(project_root, file_path)
+                if resolved is None:
+                    logger.warning(
+                        f"[Orchestrator] 🚫 过滤幻觉发现: 文件不存在 '{file_path}' "
+                        f"(title: {normalized.get('title', 'N/A')[:50]})"
+                    )
+                    return None  # 返回 None 表示发现无效
+                if resolved != file_path:
+                    normalized["file_path"] = resolved
 
         # ✅ FIX: Confidence 阈值过滤 (阈值=0.7)
         confidence = normalized.get("confidence", 0)

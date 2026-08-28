@@ -126,9 +126,15 @@ verification agent SHALL 注册 `sandbox_browser` 工具，封装 playwright 在
 
 `SandboxManager.execute_tool_command` SHALL 将项目目录挂载到 `/workspace/src`（与 `execute_with_files` 一致），working_dir 设为 `/tmp`。`execute_python` SHALL 将 PoC 脚本写入 `/tmp/__poc.py`（tmpfs 可写）。`_command_needs_project_mount` SHALL 优先判断命令（含 heredoc 写入的脚本内容）是否含 `/workspace/` 路径引用：含则返回 True（需挂载项目以读取文件），否则对 heredoc（`<<`）写入命令返回 False（不挂载）。
 
-#### Scenario: execute_tool_command 挂载到 /workspace/src
+所有执行路径的项目源码挂载 MUST 为只读（`"mode": "ro"`）——包括 `execute_tool_command`（外部工具/Semgrep、LLM sandbox_exec 路径）与 `execute_with_files`（确定性 PoC/模板 PoC 路径）。工具缓存与临时写入走 `/tmp`（tmpfs）或 `/workspace/poc`（临时目录 rw）。2026-08-28 E2E docker inspect 实证 `execute_tool_command` 曾以 rw 挂载源码，违反最小权限。
+
+#### Scenario: execute_tool_command 挂载到 /workspace/src 且只读
 - **WHEN** SandboxTool 调用 execute_tool_command 执行含项目文件引用的命令
-- **THEN** 项目目录挂载到容器 /workspace/src，PoC 脚本通过 /workspace/src/{file_path} 能找到项目文件
+- **THEN** 项目目录以**只读**挂载到容器 /workspace/src（mode="ro"），PoC 脚本通过 /workspace/src/{file_path} 能读到项目文件但无法修改源码
+
+#### Scenario: 全部路径源码挂载只读
+- **WHEN** 任一沙箱执行路径（execute_tool_command / execute_with_files）创建容器
+- **THEN** docker inspect 显示 /workspace/src 挂载 ro=true，可写需求仅存在于 /workspace/poc 或 /tmp（tmpfs）
 
 #### Scenario: 含 /workspace/ 的命令仍挂载项目
 - **WHEN** 命令含 `/workspace/src/xxx.py` 路径引用

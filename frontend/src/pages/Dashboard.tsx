@@ -441,7 +441,9 @@ export default function Dashboard() {
               <div className="flex items-center justify-between">
                 <span className="text-sm text-muted-foreground">运行中任务</span>
                 <span className="text-sm font-semibold text-blue-600">
-                  {recentTasks.filter(t => t.status === 'running').length}
+                  {/* #6 修复：改取 stats 聚合字段（后端已聚合 agent_tasks），
+                      原 recentTasks 只含传统 /tasks/ 维度，agent 任务运行中时显示 0 */}
+                  {stats?.running_tasks || 0}
                 </span>
               </div>
               <div className="flex items-center justify-between">

@@ -314,7 +314,11 @@ class SandboxManager:
                 "user": self.config.user,
                 "read_only": self.config.read_only,
                 "volumes": {
-                    host_workdir: {"bind": "/workspace/src", "mode": "rw"},  # 根因1: 统一挂载到 /workspace/src（与 execute_with_files 一致），PoC 脚本的 /workspace/src/{file_path} 可找到文件
+                    # 根因1: 统一挂载到 /workspace/src（与 execute_with_files 一致）
+                    # #3 修复: mode 改 ro——外部工具（Semgrep 等）与 LLM sandbox_exec
+                    # 只需读源码；只读加固必须覆盖全部路径（E2E docker inspect 实证
+                    # 该路径曾 rw 漏网，违反最小权限）。工具缓存写入走 /tmp（tmpfs）。
+                    host_workdir: {"bind": "/workspace/src", "mode": "ro"},
                 },
                 "tmpfs": {
                     "/home/sandbox": "rw,size=512m,mode=1777",

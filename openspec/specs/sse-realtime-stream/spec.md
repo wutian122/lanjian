@@ -66,19 +66,23 @@ TBD - created by archiving change fix-sse-realtime-stream. Update Purpose after 
 
 `EventManager._event_queues[task_id]` MUST 是 `asyncio.Queue(maxsize=10000)`。生产者 `add_event` 在队列满时 SHALL 按事件类型分级处理：
 
-- **可丢弃**（`thinking_token`）：`queue.put_nowait`，`QueueFull` 时丢弃并累加 `dropped_thinking_tokens` 计数器（每 100 条打一条 WARNING 日志）
-- **重要**（其他非终态事件如 `tool_call`, `tool_result`, `finding_new`）：`await asyncio.wait_for(queue.put(evt), 5.0)`；超时后放弃入队但仍落 DB（DB 回补兜底），打 WARNING 日志
-- **终态**（`task_complete`, `task_error`, `task_cancel`）：无条件 `await queue.put(evt)`，MUST 直到成功
+- **可丢弃**（`thinking_token`）：先按时间窗聚合（150ms 窗口或 accumulated 增量 ≥64 字符才发射一条，`thinking_end` 兜底全文），再 `queue.put_nowait`；`QueueFull` 时丢弃并累加 `dropped_thinking_tokens` 计数器（每 100 条打一条 WARNING 日志）
+- **重要**（其他非终态事件如 `tool_call`, `tool_result`, `finding_new`）：`queue.put_nowait` 非阻塞；`QueueFull` 时跳过入队并累加 `dropped_important_events` 计数器、打 WARNING 日志，事件仍已落 DB（DB 回补兜底）。生产者 MUST NOT 因队列满而同步等待（2026-08-28 E2E 实证：旧实现 1493 条事件各等满 5s ≈ 124 分钟纯阻塞）
+- **终态**（`task_complete`, `task_error`, `task_cancel`）：`await queue.put(evt)` 阻塞入队，MUST 直到成功（30s 超时保护，防止消费者永久离线挂死 orchestrator）
 
 事件 MUST 在入队前完成 DB 落库（`thinking_token` 除外），确保 DB 回补路径永远有兜底数据。
+
+#### Scenario: thinking_token 按时间窗聚合
+- **WHEN** orchestrator 在 150ms 窗口内连续发出多条 `thinking_token` 且 accumulated 增量 <64 字符
+- **THEN** 仅第一条入队，其余被聚合跳过（不入队、不计数）；前端最终由 `thinking_end` 事件获得完整文本
 
 #### Scenario: thinking_token 在队列满时被丢弃
 - **WHEN** 队列已满 10000 条，orchestrator 继续发出 `thinking_token`
 - **THEN** 事件不入队，`dropped_thinking_tokens` 计数递增；每 100 条丢弃打一条 WARNING 日志
 
-#### Scenario: tool_result 在队列满时等待 5 秒后放弃
+#### Scenario: tool_result 在队列满时非阻塞跳过
 - **WHEN** 队列已满，orchestrator 发出 `tool_result`
-- **THEN** 生产者 `await asyncio.wait_for(queue.put, 5)`；若 5 秒内消费者仍未消费，放弃入队但事件已落 DB（DB 回补时能拉到）
+- **THEN** 生产者立即返回（不等待），事件跳过入队但已落 DB（DB 回补时能拉到）；`dropped_important_events` 计数递增并打 WARNING 日志
 
 #### Scenario: 终态事件强制入队
 - **WHEN** 队列已满，任务完成 orchestrator 发出 `task_complete`
