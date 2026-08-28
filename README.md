@@ -114,7 +114,7 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.2.4`（backend）、`v6.2.3`（frontend，本次无改动）与 `v6.1.0`（sandbox，本次无变更）（生产已禁用 `:latest` 浮动 tag）。`v6.2.4`（backend）、`v6.2.3`（frontend）与 `v6.1.0`（sandbox）均为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本到 `v6.2.4`（backend/frontend）与 `v6.1.0`（sandbox，本次无变更）（生产已禁用 `:latest` 浮动 tag）。`v6.2.4`（backend/frontend）与 `v6.1.0`（sandbox）均为 **多架构镜像**（`linux/amd64` + `linux/arm64`），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
