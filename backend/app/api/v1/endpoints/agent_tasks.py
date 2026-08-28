@@ -2900,7 +2900,8 @@ async def reverify_finding(
     combined_output = f"{stdout}\n{stderr}"
     # REQ-VE-2 分档：PoC 自身崩溃特征（与 verification._record_sandbox_attempt 同标准），
     # 崩溃不得冒充"未复现"——判定交给确定性证据引擎。
-    poc_error = any(
+    # Code Review Finding: exit_code != 0 本身就是崩溃信号（优先于字符串特征）
+    poc_error = (exit_code != 0) or any(
         m in combined_output
         for m in ("Traceback", "SyntaxError", "re.error", "unterminated", "IndentationError", "TabError")
     )

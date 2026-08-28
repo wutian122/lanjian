@@ -148,7 +148,11 @@ async def test_reverify_finding_runs_poc_and_updates_status():
 
 
 async def test_reverify_finding_marks_not_reproducible_on_failure():
-    """PoC 执行失败 → NOT_REPRODUCIBLE。"""
+    """PoC 执行失败 → 状态由证据引擎推导（#2 修复后语义）。
+
+    PoC 自身崩溃（exit_code=1）→ poc_error → NEEDS_CONTEXT（PoC 有问题，非漏洞不可复现）。
+    若要验证'漏洞确实不可复现'场景，需 PoC 正常执行但输出无漏洞触发证据。
+    """
     from app.api.v1.endpoints.agent_tasks import reverify_finding
     from app.models.agent_task import VerificationStatus
 
@@ -176,4 +180,5 @@ async def test_reverify_finding_marks_not_reproducible_on_failure():
             )
 
     assert resp["success"] is False
-    assert finding.verification_status == VerificationStatus.NOT_REPRODUCIBLE
+    # #2 修复：PoC 崩溃 → NEEDS_CONTEXT（PoC 错误），不再误判 NOT_REPRODUCIBLE
+    assert finding.verification_status == VerificationStatus.NEEDS_CONTEXT

@@ -502,9 +502,13 @@ class EventManager:
         return self._event_queues[task_id]
     
     def remove_queue(self, task_id: str):
-        """移除事件队列"""
+        """移除事件队列（清理全部任务级状态）"""
         if task_id in self._event_queues:
             del self._event_queues[task_id]
+        # Code Review Finding #7: 清理 thinking_token 聚合缓冲区（防止内存泄漏）
+        self._thinking_token_buf.pop(task_id, None)
+        self.dropped_thinking_tokens.pop(task_id, None)
+        self.dropped_important_events.pop(task_id, None)
     
     def add_callback(self, task_id: str, callback: Callable):
         """添加事件回调"""
