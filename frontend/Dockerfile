@@ -19,7 +19,7 @@ ENV NO_PROXY="*"
 
 # 閰嶇疆鍥藉唴 npm 闀滃儚婧?
 RUN npm config set registry https://registry.npmmirror.com && \
-    npm install -g pnpm && \
+    npm install -g pnpm@9 && \
     pnpm config set registry https://registry.npmmirror.com
 
 # 澶嶅埗渚濊禆鏂囦欢
