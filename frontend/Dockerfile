@@ -26,8 +26,9 @@ RUN npm config set registry https://registry.npmmirror.com && \
 COPY package.json pnpm-lock.yaml ./
 
 # 澧炲姞缃戠粶瓒呮椂璁剧疆鍜屽苟鍙戞暟闄愬埗锛岄槻姝?ARM 鏋舵瀯鏋勫缓鍗℃
-RUN pnpm config set network-timeout 300000 && \
-    pnpm config set fetch-retries 5 && \
+RUN printf 'network-timeout=300000
+fetch-retries=5
+' > .npmrc && 
     pnpm install --no-frozen-lockfile --network-concurrency 1
 
 # 澶嶅埗婧愪唬鐮?
