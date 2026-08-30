@@ -9,12 +9,14 @@ orchestrator 内部无时间预算（agent_timeout 是死配置）。本测试�
 5. mark_deadline_hit 置标志并传播取消。
 """
 
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.core.config import settings
 from app.services.agent.agents.orchestrator import OrchestratorAgent
 from app.services.agent.agents.recon import ReconAgent
 
@@ -242,3 +244,168 @@ async def test_forced_summary_ignores_non_list_findings(monkeypatch):
 
     merged = await agent._run_forced_summary(list(existing))
     assert merged == existing
+
+
+# ---------- w4 (T4/T5): watchdog / 发现保全 / 诚实终态 ----------
+
+def test_finalize_budget_metadata_task_timeout_wins(monkeypatch):
+    """deadline 命中 → task_timeout 最高优先，覆盖已有 bypass。"""
+    orch = _make_agent(monkeypatch)
+    orch._coverage_bypassed = True
+    orch._coverage_bypass_info = {"reason": "token_budget_exhausted"}
+    orch.mark_deadline_hit()
+
+    orch._finalize_budget_metadata()
+    assert orch._coverage_bypassed is True
+    assert orch._coverage_bypass_info["reason"] == "task_timeout"
+    for field in ("covered_count", "total_dimensions", "gaps", "block_count"):
+        assert field in orch._coverage_bypass_info
+
+
+def test_finalize_budget_metadata_dispatch_exhausted(monkeypatch):
+    """0 发现 + 存在调度失败 → dispatch_budget_exhausted（诚实终态）。"""
+    orch = _make_agent(monkeypatch)
+    orch._dispatch_failures = 2
+
+    orch._finalize_budget_metadata()
+    assert orch._coverage_bypassed is True
+    info = orch._coverage_bypass_info
+    assert info["reason"] == "dispatch_budget_exhausted"
+    for field in ("covered_count", "total_dimensions", "gaps", "block_count"):
+        assert field in info
+
+
+def test_finalize_budget_metadata_clean_when_findings_exist(monkeypatch):
+    """有发现（即使有调度失败）→ 不虚报缺口，走正常验证路径。"""
+    orch = _make_agent(monkeypatch)
+    orch._dispatch_failures = 3
+    orch._all_findings = [{"title": "x"}]
+
+    orch._finalize_budget_metadata()
+    assert orch._coverage_bypassed is False
+
+
+def test_finalize_budget_metadata_noop_when_clean(monkeypatch):
+    """无 deadline、无失败、无既有 bypass → 不置位。"""
+    orch = _make_agent(monkeypatch)
+    orch._finalize_budget_metadata()
+    assert orch._coverage_bypassed is False
+
+
+def test_failed_subagent_findings_merged(monkeypatch):
+    """失败子 Agent（success=False）data 中的已有发现仍合并入 _all_findings。"""
+    from app.services.agent.agents.base import AgentResult
+
+    orch = _make_agent(monkeypatch)
+    fake = AgentResult(
+        success=False,
+        error="任务已取消",
+        data={"findings": [{
+            "vulnerability_type": "sql_injection", "severity": "high",
+            "title": "SQLi", "file_path": "app/x.py", "line_start": 5,
+            "confidence": 0.9,
+        }]},
+    )
+    merged = orch._merge_failed_result_findings("analysis", fake)
+    assert merged == 1
+    assert len(orch._all_findings) == 1
+    assert orch._all_findings[0]["vulnerability_type"] == "sql_injection"
+
+
+def test_failed_subagent_without_findings_noop(monkeypatch):
+    """失败子 Agent 无 findings 时不产生合并。"""
+    from app.services.agent.agents.base import AgentResult
+
+    orch = _make_agent(monkeypatch)
+    fake = AgentResult(success=False, error="任务已取消", data={"findings": []})
+    assert orch._merge_failed_result_findings("analysis", fake) == 0
+    assert orch._all_findings == []
+
+
+@pytest.mark.asyncio
+async def test_budget_watchdog_graceful_wrap(monkeypatch):
+    """watchdog 到点 → mark_deadline_hit；任务宽限内完成 → 注入 task_timeout bypass。"""
+    from app.api.v1.endpoints.agent_tasks import _run_orchestrator_with_budget_watchdog
+    from app.services.agent.agents.base import AgentResult
+
+    monkeypatch.setattr(settings, "TIME_BUDGET_GRACE_SECONDS", 1)
+    orch = SimpleNamespace(
+        mark_deadline_hit=MagicMock(),
+        _all_findings=[], _iteration=0, _tool_calls=0,
+        _total_tokens=0, _sub_agent_total_tokens=0,
+    )
+    emitter = SimpleNamespace(emit_warning=AsyncMock())
+
+    async def slow_run():
+        await asyncio.sleep(0.4)
+        return AgentResult(success=True, data={"findings": []}, metadata={})
+
+    run_task = asyncio.create_task(slow_run())
+    result, hit = await _run_orchestrator_with_budget_watchdog(
+        orch, run_task, task_timeout=0.2, event_emitter=emitter, task_id="t-wd-1", task_started_at=time.time()
+    )
+
+    assert hit is True
+    orch.mark_deadline_hit.assert_called_once()
+    assert result.metadata["coverage_bypassed"] is True
+    assert result.metadata["coverage_info"]["reason"] == "task_timeout"
+    emitter.emit_warning.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_budget_watchdog_hard_cancel_fallback(monkeypatch):
+    """宽限耗尽仍不返回 → hard-cancel 兜底（保存已有发现，task_timeout metadata）。"""
+    from app.api.v1.endpoints.agent_tasks import _run_orchestrator_with_budget_watchdog
+    from app.services.agent.agents.base import AgentResult
+
+    monkeypatch.setattr(settings, "TIME_BUDGET_GRACE_SECONDS", 1)
+    orch = SimpleNamespace(
+        mark_deadline_hit=MagicMock(),
+        _all_findings=[{"title": "keep-me"}], _iteration=2, _tool_calls=1,
+        _total_tokens=10, _sub_agent_total_tokens=0,
+    )
+    emitter = SimpleNamespace(emit_warning=AsyncMock())
+
+    async def hanging_run():
+        await asyncio.sleep(30)
+        return AgentResult(success=True, data={"findings": []}, metadata={})
+
+    run_task = asyncio.create_task(hanging_run())
+    result, hit = await _run_orchestrator_with_budget_watchdog(
+        orch, run_task, task_timeout=0.2, event_emitter=emitter, task_id="t-wd-2", task_started_at=time.time()
+    )
+
+    assert hit is True
+    assert result.success is True
+    assert result.metadata["coverage_bypassed"] is True
+    assert result.metadata["coverage_info"]["reason"] == "task_timeout"
+    assert result.data["findings"] == [{"title": "keep-me"}]
+    emitter.emit_warning.assert_awaited()  # 兜底路径必须发 warning
+    assert run_task.cancelled() or run_task.done()
+
+
+@pytest.mark.asyncio
+async def test_budget_watchdog_noop_within_budget(monkeypatch):
+    """预算内完成 → 无注入、无 deadline 标记（现状行为不变）。"""
+    from app.api.v1.endpoints.agent_tasks import _run_orchestrator_with_budget_watchdog
+    from app.services.agent.agents.base import AgentResult
+
+    orch = SimpleNamespace(
+        mark_deadline_hit=MagicMock(),
+        _all_findings=[], _iteration=0, _tool_calls=0,
+        _total_tokens=0, _sub_agent_total_tokens=0,
+    )
+    emitter = SimpleNamespace(emit_warning=AsyncMock())
+
+    async def fast_run():
+        return AgentResult(success=True, data={"findings": []}, metadata={})
+
+    run_task = asyncio.create_task(fast_run())
+    result, hit = await _run_orchestrator_with_budget_watchdog(
+        orch, run_task, task_timeout=10, event_emitter=emitter, task_id="t-wd-3", task_started_at=time.time()
+    )
+
+    assert hit is False
+    orch.mark_deadline_hit.assert_not_called()
+    assert "coverage_bypassed" not in (result.metadata or {})
+    emitter.emit_warning.assert_not_awaited()

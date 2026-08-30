@@ -480,6 +480,113 @@ async def _re_audit_task(task_id: str, finding_ids: list[str]):
                 task.last_error_code = "re_audit_failed"
                 await db.commit()
 
+
+async def _run_orchestrator_with_budget_watchdog(
+    orchestrator,
+    run_task: asyncio.Task,
+    task_timeout: int,
+    event_emitter,
+    task_id: str,
+    task_started_at: float,
+) -> tuple[AgentResult, bool]:
+    """任务超时 watchdog 化（fix-audit-time-budget-2026-08，方案 A1）。
+
+    - 到 task_timeout 先 mark_deadline_hit()（置 deadline 标志并传播取消），给
+      TIME_BUDGET_GRACE_SECONDS 宽限让 orchestrator 优雅收口（保全已发现与产出）；
+    - wait_for 上限放宽为 task_timeout + grace：Py3.12 wait_for 语义下内层协程
+      吞掉取消并正常返回时 TimeoutError 丢失（原 916-936 兜底成死代码），故由
+      deadline 标志在正常返回路径注入 task_timeout bypass metadata；
+    - 宽限耗尽仍不返回 → hard-cancel 兜底（保存已有发现，completed_with_gaps）。
+
+    返回 (result, deadline_hit_flag)。
+    """
+    import time
+
+    from app.core.config import settings
+
+    grace = int(getattr(settings, "TIME_BUDGET_GRACE_SECONDS", 45))
+    deadline_hit = {"flag": False}
+
+    async def _budget_timeout_watchdog() -> None:
+        await asyncio.sleep(task_timeout)
+        deadline_hit["flag"] = True
+        try:
+            orchestrator.mark_deadline_hit()
+        except Exception:
+            logger.warning(
+                f"[AgentTask] watchdog mark_deadline_hit failed for {task_id}",
+                exc_info=True,
+            )
+
+    watchdog_task = asyncio.create_task(_budget_timeout_watchdog())
+    try:
+        result = await asyncio.wait_for(run_task, timeout=task_timeout + grace)
+    except TimeoutError:
+        logger.warning(
+            f"[AgentTask] Task {task_id} exceeded budget+grace "
+            f"({task_timeout}+{grace}s), hard-cancelling and marking as COMPLETED_WITH_GAPS"
+        )
+        run_task.cancel()
+        try:
+            await run_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        # Wave 1 §2.2 修复：此处必须用 emit_warning（emit_event 会抛 AttributeError）
+        await event_emitter.emit_warning(
+            f"任务超时（{task_timeout}秒+{grace}秒宽限），已强制结束并保存已有发现"
+        )
+        result = AgentResult(
+            success=True,
+            data={"findings": getattr(orchestrator, "_all_findings", [])},
+            iterations=getattr(orchestrator, "_iteration", 0),
+            tool_calls=getattr(orchestrator, "_tool_calls", 0),
+            tokens_used=getattr(orchestrator, "_total_tokens", 0)
+            + getattr(orchestrator, "_sub_agent_total_tokens", 0),
+            duration_ms=int((time.time() - task_started_at) * 1000),
+            metadata={
+                "coverage_bypassed": True,
+                "coverage_info": {
+                    "reason": "task_timeout",
+                    "covered_count": 0,
+                    "total_dimensions": 10,
+                    "gaps": [],
+                    "block_count": 0,
+                    "timeout_seconds": task_timeout,
+                },
+            },
+        )
+    finally:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if deadline_hit["flag"] and isinstance(getattr(result, "metadata", None), dict):
+        # 优先级链收口：task_timeout 为最高 reason。已置 bypass（如 finalize 先于
+        # watchdog 到点写入的 dispatch_budget_exhausted）时覆盖 reason、保留 5 字段。
+        if result.metadata.get("coverage_bypassed"):
+            info = result.metadata.get("coverage_info") or {}
+            info.update({"reason": "task_timeout", "timeout_seconds": task_timeout})
+            for _field in ("covered_count", "total_dimensions", "gaps", "block_count"):
+                info.setdefault(_field, 0)
+            result.metadata["coverage_info"] = info
+        else:
+            result.metadata["coverage_bypassed"] = True
+            result.metadata["coverage_info"] = {
+                "reason": "task_timeout",
+                "covered_count": 0,
+                "total_dimensions": 10,
+                "gaps": [],
+                "block_count": 0,
+                "timeout_seconds": task_timeout,
+            }
+        await event_emitter.emit_warning(
+            f"⏰ 任务时间预算耗尽（{task_timeout}秒），已优雅收口并保存已有发现"
+        )
+    return result, deadline_hit["flag"]
+
+
 async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = None):
     """
     在后台执行 Agent 任务 - 使用动态 Agent 树架构
@@ -867,6 +974,8 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 "project_root": project_root,
                 "task_id": task_id,
                 "audit_memory": audit_memory,
+                # fix-audit-time-budget-2026-08: 任务时间预算传入 orchestrator（内部 deadline 同源）
+                "task_timeout_seconds": (task.timeout_seconds or 1800),
             }
             if resume_state and isinstance(resume_state, dict):
                 input_data["resume_checkpoint"] = resume_state
@@ -910,30 +1019,17 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
 
             try:
                 # Fix: 总体超时保护，防止任务无限运行
+                # fix-audit-time-budget-2026-08 (A1): watchdog 化——到点先优雅收口（宽限），
+                # 宽限耗尽才 hard-cancel；详见 _run_orchestrator_with_budget_watchdog
                 task_timeout = task.timeout_seconds or 1800
-                try:
-                    result = await asyncio.wait_for(run_task, timeout=task_timeout)
-                except TimeoutError:
-                    logger.warning(f"[AgentTask] Task {task_id} timed out after {task_timeout}s, cancelling and marking as COMPLETED_WITH_GAPS")
-                    run_task.cancel()
-                    try:
-                        await run_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    # Wave 1 §2.2 修复：AgentEventEmitter 无 emit_event 方法，此处应为 emit_warning。
-                    # 原实现 event_emitter.emit_event('warning', ...) 会抛 AttributeError，
-                    # 被外层 except Exception 吞掉，任务被误判为 FAILED 且不发终态事件。
-                    await event_emitter.emit_warning(f"任务超时（{task_timeout}秒），已强制结束并保存已有发现")
-                    # 构造超时结果，保存已有发现
-                    result = AgentResult(
-                        success=True,
-                        data={"findings": getattr(orchestrator, '_all_findings', [])},
-                        iterations=getattr(orchestrator, '_iteration', 0),
-                        tool_calls=getattr(orchestrator, '_tool_calls', 0),
-                        tokens_used=getattr(orchestrator, '_total_tokens', 0) + getattr(orchestrator, '_sub_agent_total_tokens', 0),
-                        duration_ms=int((time.time() - start_time) * 1000),
-                        metadata={"coverage_bypassed": True, "coverage_info": {"reason": "task_timeout", "timeout_seconds": task_timeout}},
-                    )
+                result, _deadline_hit = await _run_orchestrator_with_budget_watchdog(
+                    orchestrator,
+                    run_task,
+                    task_timeout,
+                    event_emitter,
+                    task_id,
+                    task_started_at=start_time,
+                )
             except AgentExecutionPaused as e:
                 task.status = AgentTaskStatus.PAUSED
                 task.paused = True

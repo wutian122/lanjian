@@ -247,6 +247,7 @@ class OrchestratorAgent(BaseAgent):
         # 🔥 fix-audit-time-budget-2026-08: 任务时间预算治理
         self._deadline: float | None = None
         self._deadline_hit: bool = False
+        self._dispatch_failures: int = 0
 
         # 🔥 保存各个 Agent 的完整结果，用于传递给后续 Agent
         self._agent_results: dict[str, dict[str, Any]] = {}  # agent_name -> full result data
@@ -630,6 +631,58 @@ class OrchestratorAgent(BaseAgent):
             block_count=getattr(self, "_hard_coverage_block_count", 0),
         )
 
+    def _finalize_budget_metadata(self) -> None:
+        """收口统一预算 metadata（fix-audit-time-budget-2026-08）。
+
+        优先级：task_timeout（watchdog 到点）> 已置 bypass（token/覆盖率门禁/
+        task_deadline_exhausted 先写先赢）> dispatch_budget_exhausted（0 发现且
+        存在调度失败）。
+        """
+        if self._deadline_hit:
+            self._coverage_bypassed = True
+            self._coverage_bypass_info = self._build_coverage_bypass_info(
+                reason="task_timeout",
+                covered_count=0,
+                total_dimensions=10,
+                gaps=[],
+                block_count=getattr(self, "_hard_coverage_block_count", 0),
+            )
+            return
+        if self._coverage_bypassed:
+            return
+        if not self._all_findings and self._dispatch_failures > 0:
+            self._coverage_bypassed = True
+            self._coverage_bypass_info = self._build_coverage_bypass_info(
+                reason="dispatch_budget_exhausted",
+                covered_count=0,
+                total_dimensions=10,
+                gaps=[],
+                block_count=getattr(self, "_hard_coverage_block_count", 0),
+            )
+
+    def _merge_failed_result_findings(self, agent_name: str, result: AgentResult) -> int:
+        """失败子 Agent（success=False）data 中已声明的发现保全（spec R6）。
+
+        一次调度超时/取消后实例锁存会返回失败结果，若其 data.findings 非空
+        （如取消前已产出），仍归一化合并入 _all_findings，不随失败丢弃。
+        返回合并条数。
+        """
+        merged = 0
+        if not isinstance(result.data, dict):
+            return 0
+        for finding in result.data.get("findings", []) or []:
+            if not isinstance(finding, dict):
+                continue
+            normalized = self._normalize_finding(finding)
+            if normalized is not None:
+                self._merge_or_append_finding(normalized)
+                merged += 1
+        if merged:
+            logger.info(
+                f"[Orchestrator] Preserved {merged} findings from failed {agent_name} result"
+            )
+        return merged
+
     def _build_coverage_bypass_info(
         self,
         reason: str,
@@ -669,6 +722,7 @@ class OrchestratorAgent(BaseAgent):
 
         # 🔥 fix-audit-time-budget-2026-08: 任务时间预算（与外部 wait_for 时钟同源）
         self._deadline_hit = False
+        self._dispatch_failures = 0
         self._init_task_deadline(input_data)
 
         project_info = input_data.get("project_info", {})
@@ -1376,6 +1430,40 @@ Action Input: {{"参数": "值"}}
 
             # 🔥 如果被取消，返回取消结果
             if self.is_cancelled:
+                # 🔥 fix-audit-time-budget-2026-08: deadline 命中（watchdog）→ 预算耗尽优雅
+                # 收口：返回 success 结果 + task_timeout bypass，保全已发现与已声明产出；
+                # 真正的用户取消仍由 agent_tasks.is_task_cancelled 终态否决权兜底
+                self._finalize_budget_metadata()
+                if self._deadline_hit:
+                    logger.warning(
+                        f"[{self.name}] Task budget exhausted, graceful wrap-up: "
+                        f"{len(self._all_findings)} findings, {self._dispatch_failures} dispatch failures"
+                    )
+                    return AgentResult(
+                        success=True,
+                        data={
+                            "findings": self._all_findings,
+                            "summary": final_result or self._generate_default_summary(),
+                            "observations": list(self._gate_observations),
+                            "steps": [
+                                {
+                                    "thought": s.thought,
+                                    "action": s.action,
+                                    "action_input": s.action_input,
+                                    "observation": s.observation[:500] if s.observation else None,
+                                }
+                                for s in self._steps
+                            ],
+                        },
+                        iterations=self._iteration + self._sub_agent_total_iterations,
+                        tool_calls=self._tool_calls + self._sub_agent_total_tool_calls,
+                        tokens_used=self._total_tokens + self._sub_agent_total_tokens,
+                        duration_ms=duration_ms,
+                        metadata={
+                            "coverage_bypassed": self._coverage_bypassed,
+                            "coverage_info": self._coverage_bypass_info,
+                        },
+                    )
                 await self.emit_event(
                     "info",
                     f"🛑 Orchestrator 已取消: {len(self._all_findings)} 个发现, {self._iteration} 轮决策"
@@ -1450,6 +1538,9 @@ Action Input: {{"参数": "值"}}
             _total_tools = self._tool_calls + self._sub_agent_total_tool_calls
             _total_tokens = self._total_tokens + self._sub_agent_total_tokens
             logger.info(f"[Orchestrator] Total stats: iter={_total_iter} (orch={self._iteration}+sub={self._sub_agent_total_iterations}), tools={_total_tools}, tokens={_total_tokens}")
+
+            # 🔥 fix-audit-time-budget-2026-08: 收口统一预算 metadata（reason 优先级链）
+            self._finalize_budget_metadata()
 
 
             # 🔥 覆盖率兜底检查：20轮耗尽时安全阀可能未触发，需在此兜底
@@ -2083,6 +2174,7 @@ Action Input: {{"参数": "值"}}
                     timeout=timeout
                 )
             except TimeoutError:
+                self._dispatch_failures += 1
                 logger.warning(f"[{self.name}] Sub-agent {agent_name} timed out after {timeout}s")
                 # R7: 中断收口——补发 dispatch_complete/phase_complete，保证事件流完整
                 await self.emit_event(
@@ -2099,6 +2191,7 @@ Action Input: {{"参数": "值"}}
                 )
                 return f"## {agent_name} Agent 执行超时\n\n子 Agent 执行超过 {timeout} 秒，已强制终止。请尝试更具体的任务或使用其他 Agent。"
             except asyncio.CancelledError:
+                self._dispatch_failures += 1
                 logger.info(f"[{self.name}] Sub-agent {agent_name} was cancelled")
                 # R7: 中断收口
                 await self.emit_event(
@@ -2391,9 +2484,15 @@ Action Input: {{"参数": "值"}}
 
                 return observation
             else:
-                return f"## {agent_name} Agent 执行失败\n\n错误: {result.error}"
+                # 🔥 fix-audit-time-budget-2026-08: 失败子 Agent 已声明的发现保全（spec R6）
+                # 失败结果同样计入 _dispatch_failures（R7 诚实终态的计数口径）
+                self._dispatch_failures += 1
+                merged_count = self._merge_failed_result_findings(agent_name, result)
+                note = f"\n\n（该 Agent 已声明的 {merged_count} 个发现已保留）" if merged_count else ""
+                return f"## {agent_name} Agent 执行失败\n\n错误: {result.error}{note}"
 
         except Exception as e:
+            self._dispatch_failures += 1
             logger.error(f"Sub-agent dispatch failed: {e}", exc_info=True)
             return f"## 调度失败\n\n错误: {str(e)}"
 

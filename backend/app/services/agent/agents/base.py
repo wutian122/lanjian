@@ -556,7 +556,7 @@ class BaseAgent(ABC):
         （既有 cancel() 会清 _cancel_callback），_user_cancelled 锁存仍在。
         只清 _cancelled（超时/内部锁存），永远不动 _user_cancelled。
         """
-        if self._cancel_callback and self._cancel_callback():
+        if getattr(self, "_cancel_callback", None) and self._cancel_callback():
             logger.info(f"[{self.name}] reset_dispatch_cancel skipped: user cancel active")
             return
         self._cancelled = False
@@ -572,11 +572,11 @@ class BaseAgent(ABC):
 
     @property
     def is_soft_stopped(self) -> bool:
-        return self._soft_stop
+        return getattr(self, "_soft_stop", False)
 
     def consume_soft_stop(self) -> bool:
         """一次性消费软停止信号；返回本次是否处于软停止状态。"""
-        if not self._soft_stop:
+        if not getattr(self, "_soft_stop", False):
             return False
         self._soft_stop = False
         self._soft_stop_consumed = True
@@ -596,11 +596,15 @@ class BaseAgent(ABC):
 
     @property
     def is_cancelled(self) -> bool:
-        """检查是否已取消（内部锁存 + 用户取消锁存 + 外部回调）"""
-        if self._user_cancelled or self._cancelled:
+        """检查是否已取消（内部锁存 + 用户取消锁存 + 外部回调）。
+
+        防御式读取：手工构造（未走完整 __init__）的实例同样适用。
+        """
+        if getattr(self, "_user_cancelled", False) or getattr(self, "_cancelled", False):
             return True
         # 检查外部回调：命中视为用户取消，独立锁存（reset_dispatch_cancel 不得清除）
-        if self._cancel_callback and self._cancel_callback():
+        callback = getattr(self, "_cancel_callback", None)
+        if callback and callback():
             self._user_cancelled = True
             self._cancelled = True
             logger.info(f"[{self.name}] Detected cancellation from callback")
