@@ -149,3 +149,96 @@ async def test_loop_deadline_break_sets_bypass_metadata(monkeypatch):
     assert info["reason"] == "task_deadline_exhausted"
     for field in ("covered_count", "total_dimensions", "gaps", "block_count"):
         assert field in info
+
+
+# ---------- w3 (T3): analysis 软终止交卷 ----------
+
+_SUMMARY_OUTPUT = """```json
+{"findings": [{"vulnerability_type": "sql_injection", "severity": "high", "title": "SQL 注入", "file_path": "a.java", "line_start": 10}], "summary": "s"}
+```"""
+
+
+def _make_analysis_agent(monkeypatch):
+    from app.services.agent.agents.analysis import AnalysisAgent
+
+    agent = AnalysisAgent(llm_service=SimpleNamespace(), tools={})
+    monkeypatch.setattr(agent, "emit_thinking", AsyncMock())
+    monkeypatch.setattr(agent, "emit_event", AsyncMock())
+    monkeypatch.setattr(agent, "emit_llm_decision", AsyncMock())
+    monkeypatch.setattr(agent, "emit_llm_thought", AsyncMock())
+    monkeypatch.setattr(agent, "emit_finding", AsyncMock())
+    monkeypatch.setattr(agent, "_check_token_budget_exceeded", lambda: False)
+    agent.config.max_iterations = 3
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_analysis_soft_stop_breaks_loop_and_submits(monkeypatch):
+    """软停止在循环头被消费：立即退出探索并强制总结交卷（不跑满剩余轮次）。"""
+    agent = _make_analysis_agent(monkeypatch)
+    agent.request_soft_stop()
+    # 循环头 break 后的第一次 LLM 调用即强制总结；后续条目仅在未消费时才会用到
+    stream_mock = AsyncMock(return_value=("Thought: 还需要更多信息", 0))
+    stream_mock.side_effect = [(_SUMMARY_OUTPUT, 0)] + [("Thought: 还需要更多信息", 0)] * 3
+    monkeypatch.setattr(agent, "stream_llm_call", stream_mock)
+
+    result = await agent.run({"project_info": {}, "config": {}})
+
+    assert stream_mock.await_count == 1  # 循环头 break + 1 次强制总结
+    assert result.success is True
+    findings = result.data["findings"]
+    assert len(findings) == 1
+    assert findings[0]["vulnerability_type"] == "sql_injection"
+
+
+@pytest.mark.asyncio
+async def test_analysis_cancel_wins_over_soft_stop(monkeypatch):
+    """软停止与用户取消并存时取消语义胜出：不强制总结、不虚报。"""
+    agent = _make_analysis_agent(monkeypatch)
+    agent.request_soft_stop()
+    agent.set_cancel_callback(lambda: True)
+    stream_mock = AsyncMock(return_value=(_SUMMARY_OUTPUT, 0))
+    monkeypatch.setattr(agent, "stream_llm_call", stream_mock)
+
+    result = await agent.run({"project_info": {}, "config": {}})
+
+    assert result.success is False
+    assert "取消" in (result.error or "")
+    stream_mock.assert_not_awaited()  # 取消路径不做强制总结
+
+
+@pytest.mark.asyncio
+async def test_forced_summary_merges_into_existing_findings(monkeypatch):
+    """强制总结合并语义：已有发现时扩展（orchestrator 层去重），空时替换。"""
+    agent = _make_analysis_agent(monkeypatch)
+    existing = [
+        {
+            "vulnerability_type": "xss",
+            "severity": "medium",
+            "title": "XSS",
+            "file_path": "b.js",
+            "line_start": 1,
+        }
+    ]
+    monkeypatch.setattr(agent, "stream_llm_call", AsyncMock(return_value=(_SUMMARY_OUTPUT, 0)))
+
+    merged = await agent._run_forced_summary(list(existing))
+    assert len(merged) == 2  # 已有 XSS + 总结补报的 SQL 注入
+    assert merged[0]["vulnerability_type"] == "xss"
+
+    replaced = await agent._run_forced_summary([])
+    assert len(replaced) == 1
+    assert replaced[0]["vulnerability_type"] == "sql_injection"
+
+
+@pytest.mark.asyncio
+async def test_forced_summary_ignores_non_list_findings(monkeypatch):
+    """防御分支：parsed findings 非 list 时保持原值不崩。"""
+    agent = _make_analysis_agent(monkeypatch)
+    existing = [{"vulnerability_type": "xss", "title": "XSS"}]
+    monkeypatch.setattr(
+        agent, "stream_llm_call", AsyncMock(return_value=('{"findings": "oops"}', 0))
+    )
+
+    merged = await agent._run_forced_summary(list(existing))
+    assert merged == existing

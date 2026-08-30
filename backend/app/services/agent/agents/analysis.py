@@ -405,6 +405,70 @@ class AnalysisAgent(BaseAgent):
     
 
     
+    async def _run_forced_summary(self, all_findings: list) -> list:
+        """强制总结：轮次耗尽或软停止交卷时，让 LLM 立即输出 Final Answer 汇总发现。
+
+        合并语义（fix-audit-time-budget-2026-08）：已有发现时扩展（跨文件去重由
+        orchestrator 层 _merge_or_append_finding 负责），空列表时替换。
+        注：当前 run() 数据流下软停止交卷时 all_findings 恒为空（is_final 必伴随
+        break，其后循环头不再执行），extend 分支主要作为防御与后续扩展点。
+        """
+        await self.emit_thinking("📝 分析阶段结束，正在生成漏洞总结...")
+
+        # 添加强制总结的提示
+        self._conversation_history.append({
+            "role": "user",
+            "content": """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
+
+即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
+
+请按以下 JSON 格式输出：
+```json
+{
+    "findings": [
+        {
+            "vulnerability_type": "sql_injection|xss|command_injection|path_traversal|ssrf|hardcoded_secret|other",
+            "severity": "critical|high|medium|low",
+            "title": "漏洞标题",
+            "description": "详细描述",
+            "file_path": "文件路径",
+            "line_start": 行号,
+            "code_snippet": "相关代码片段",
+            "suggestion": "修复建议"
+        }
+    ],
+    "summary": "分析总结"
+}
+```
+
+Final Answer:""",
+        })
+
+        try:
+            summary_output, _ = await self.stream_llm_call(
+                self._conversation_history,
+                # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+            )
+
+            if summary_output and summary_output.strip():
+                # 解析总结输出
+                import re
+                summary_text = summary_output.strip()
+                summary_text = re.sub(r'```json\s*', '', summary_text)
+                summary_text = re.sub(r'```\s*', '', summary_text)
+                parsed_result = AgentJsonParser.parse(
+                    summary_text,
+                    default={"findings": [], "summary": ""}
+                )
+                if "findings" in parsed_result and isinstance(parsed_result["findings"], list):
+                    if all_findings:
+                        all_findings.extend(parsed_result["findings"])
+                    else:
+                        all_findings = parsed_result["findings"]
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to generate summary: {e}")
+        return all_findings
+
     async def run(self, input_data: Dict[str, Any]) -> AgentResult:
         """
         执行漏洞分析 - LLM 全程参与！
@@ -596,6 +660,11 @@ class AnalysisAgent(BaseAgent):
         
         try:
             for iteration in range(self.config.max_iterations):
+                # 🔥 fix-audit-time-budget-2026-08: 软停止（时间预算将尽交卷）先于取消检查；
+                # 若同时取消，后续结果构造阶段取消语义胜出（is_cancelled 分支，不虚报）
+                if self.consume_soft_stop():
+                    await self.emit_thinking("⏰ 任务时间预算将尽，停止探索并立即总结交卷")
+                    break
                 if self.is_cancelled:
                     break
                 # P1: token 预算门禁
@@ -775,59 +844,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                         "content": "请继续分析。你输出了 Thought 但没有输出 Action。请**立即**选择一个工具执行，或者如果分析完成，输出 Final Answer 汇总所有发现。",
                     })
             
-            # 🔥 如果循环结束但没有发现，强制 LLM 总结
-            if not all_findings and not self.is_cancelled and not error_message:
-                await self.emit_thinking("📝 分析阶段结束，正在生成漏洞总结...")
-                
-                # 添加强制总结的提示
-                self._conversation_history.append({
-                    "role": "user",
-                    "content": """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
-
-即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
-
-请按以下 JSON 格式输出：
-```json
-{
-    "findings": [
-        {
-            "vulnerability_type": "sql_injection|xss|command_injection|path_traversal|ssrf|hardcoded_secret|other",
-            "severity": "critical|high|medium|low",
-            "title": "漏洞标题",
-            "description": "详细描述",
-            "file_path": "文件路径",
-            "line_start": 行号,
-            "code_snippet": "相关代码片段",
-            "suggestion": "修复建议"
-        }
-    ],
-    "summary": "分析总结"
-}
-```
-
-Final Answer:""",
-                })
-                
-                try:
-                    summary_output, _ = await self.stream_llm_call(
-                        self._conversation_history,
-                        # 🔥 不传递 temperature 和 max_tokens，使用用户配置
-                    )
-                    
-                    if summary_output and summary_output.strip():
-                        # 解析总结输出
-                        import re
-                        summary_text = summary_output.strip()
-                        summary_text = re.sub(r'```json\s*', '', summary_text)
-                        summary_text = re.sub(r'```\s*', '', summary_text)
-                        parsed_result = AgentJsonParser.parse(
-                            summary_text,
-                            default={"findings": [], "summary": ""}
-                        )
-                        if "findings" in parsed_result:
-                            all_findings = parsed_result["findings"]
-                except Exception as e:
-                    logger.warning(f"[{self.name}] Failed to generate summary: {e}")
+            # 🔥 循环结束（轮次耗尽或软停止交卷）后的总结：零发现必总结；
+            # 软停止退出也补全总结（当前数据流下软停止时通常零发现，合并逻辑防御未来扩展）
+            needs_summary = (not all_findings) or self._soft_stop_consumed
+            if needs_summary and not self.is_cancelled and not error_message:
+                all_findings = await self._run_forced_summary(all_findings)
             
             # 处理结果
             duration_ms = int((time.time() - start_time) * 1000)
