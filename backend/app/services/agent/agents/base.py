@@ -321,6 +321,10 @@ class BaseAgent(ABC):
         self._tool_calls = 0
         self._cancelled = False
         self._cancel_callback = None  # external cancel callback (set via set_cancel_callback)
+        self._user_cancelled = False  # 用户取消独立锁存（回调命中时置位，reset_dispatch_cancel 不得清除）
+        # 时间预算软停止（与取消语义分离，见 fix-audit-time-budget-2026-08）
+        self._soft_stop = False
+        self._soft_stop_consumed = False
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -543,6 +547,41 @@ class BaseAgent(ABC):
         """设置外部取消检查回调"""
         self._cancel_callback = callback
 
+    def reset_dispatch_cancel(self) -> None:
+        """清除仅由调度超时/内部清理造成的取消锁存。
+
+        子 Agent 实例跨 dispatch 复用；调度超时清理会调用 cancel() 单向锁存，
+        不复位则同类型 Agent 的补发调度全部瞬间"任务已取消"。
+        用户取消不得被洗掉：复判回调为真直接保留；回调即使事后被清空
+        （既有 cancel() 会清 _cancel_callback），_user_cancelled 锁存仍在。
+        只清 _cancelled（超时/内部锁存），永远不动 _user_cancelled。
+        """
+        if self._cancel_callback and self._cancel_callback():
+            logger.info(f"[{self.name}] reset_dispatch_cancel skipped: user cancel active")
+            return
+        self._cancelled = False
+
+    def request_soft_stop(self) -> None:
+        """请求软停止：任务时间预算将尽时交卷，与取消语义分离。
+
+        置位不改变 is_cancelled、不阻断 LLM 调用与工具执行。
+        _soft_stop_consumed 置位后保持 True（跨 dispatch 表达"曾软停止过"，
+        供 analysis 强制总结条件判定），重新 request 仅重武装 _soft_stop。
+        """
+        self._soft_stop = True
+
+    @property
+    def is_soft_stopped(self) -> bool:
+        return self._soft_stop
+
+    def consume_soft_stop(self) -> bool:
+        """一次性消费软停止信号；返回本次是否处于软停止状态。"""
+        if not self._soft_stop:
+            return False
+        self._soft_stop = False
+        self._soft_stop_consumed = True
+        return True
+
     def _get_llm_rate_limiter(self):
         """获取 LLM 限流器。
 
@@ -557,11 +596,12 @@ class BaseAgent(ABC):
 
     @property
     def is_cancelled(self) -> bool:
-        """检查是否已取消（包含内部标志和外部回调）"""
-        if self._cancelled:
+        """检查是否已取消（内部锁存 + 用户取消锁存 + 外部回调）"""
+        if self._user_cancelled or self._cancelled:
             return True
-        # 检查外部回调
+        # 检查外部回调：命中视为用户取消，独立锁存（reset_dispatch_cancel 不得清除）
         if self._cancel_callback and self._cancel_callback():
+            self._user_cancelled = True
             self._cancelled = True
             logger.info(f"[{self.name}] Detected cancellation from callback")
             return True
