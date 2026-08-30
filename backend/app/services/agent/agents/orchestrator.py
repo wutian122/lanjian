@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -242,6 +243,10 @@ class OrchestratorAgent(BaseAgent):
 
         # 🔥 跟踪已调度的 Agent 任务，避免重复调度
         self._dispatched_tasks: dict[str, int] = {}  # agent_name -> dispatch_count
+
+        # 🔥 fix-audit-time-budget-2026-08: 任务时间预算治理
+        self._deadline: float | None = None
+        self._deadline_hit: bool = False
 
         # 🔥 保存各个 Agent 的完整结果，用于传递给后续 Agent
         self._agent_results: dict[str, dict[str, Any]] = {}  # agent_name -> full result data
@@ -537,6 +542,94 @@ class OrchestratorAgent(BaseAgent):
                 agent.cancel()
                 logger.info(f"[{self.name}] Cancelled sub-agent: {name}")
 
+    # 🔥 fix-audit-time-budget-2026-08: 任务时间预算治理
+    def _resolve_task_timeout(self, input_data: dict[str, Any]) -> float:
+        """任务时间预算（秒）：input_data.task_timeout_seconds > agent_timeout 配置 > 1800。"""
+        raw = input_data.get("task_timeout_seconds")
+        try:
+            if raw is not None and float(raw) > 0:
+                return float(raw)
+        except (TypeError, ValueError):
+            pass
+        from app.core.config import settings
+
+        return float(
+            self._timeout_config.get("agent_timeout")
+            or getattr(settings, "AGENT_TIMEOUT_SECONDS", 1800)
+            or 1800
+        )
+
+    def _init_task_deadline(self, input_data: dict[str, Any]) -> None:
+        """记录任务时间预算 deadline：从 run() 入口起算，与外部 wait_for 时钟一致。
+
+        resume 重建 orchestrator 后自然重置，不存在跨次预算残留。
+        """
+        self._deadline = time.time() + self._resolve_task_timeout(input_data)
+
+    def _remaining_seconds(self) -> float:
+        if self._deadline is None:
+            return float("inf")
+        return self._deadline - time.time()
+
+    def _resolve_dispatch_timeout(self, agent_name: str) -> int:
+        """子 Agent 调度超时 = min(类型上限, 剩余任务预算)。
+
+        类型上限沿用既有语义：recon=min(300, sub_agent_timeout)、
+        analysis=sub_agent_timeout、verification=max(sub_agent_timeout, 1800)。
+        """
+        default_sub_agent_timeout = self._timeout_config.get("sub_agent_timeout", 600)
+        agent_timeouts = {
+            "recon": min(300, default_sub_agent_timeout),  # recon 通常较快
+            "analysis": default_sub_agent_timeout,
+            # REQ-ER-3: verification 验证 PoC（含启动服务/框架）耗时高，独立放宽超时
+            # （生产 cade28a4：LLM 启动完整 Tomcat 验证 1200s 超时中断，丢已执行证据）
+            "verification": max(default_sub_agent_timeout, 1800),
+        }
+        cap = agent_timeouts.get(agent_name, default_sub_agent_timeout)
+        remaining = self._remaining_seconds()
+        if remaining >= cap:
+            return int(cap)  # 预算充足（含 deadline 未初始化的 inf）时等于类型上限
+        return max(1, int(remaining))
+
+    def _budget_refusal(self) -> str | None:
+        """剩余预算低于 MIN_DISPATCH 时拒发新调度，返回给主循环的观察文本。"""
+        from app.core.config import settings
+
+        min_dispatch = int(getattr(settings, "TIME_BUDGET_MIN_DISPATCH_SECONDS", 30))
+        if self._remaining_seconds() <= min_dispatch:
+            return "⏰ 任务时间预算将尽，不再发起新的子 Agent 调度，请立即总结收口"
+        return None
+
+    def _maybe_request_soft_stop(self, agent: BaseAgent, agent_name: str) -> bool:
+        """剩余预算低于软停止阈值时，对 in-flight analysis 幂等请求软停止。"""
+        if agent_name != "analysis" or agent.is_soft_stopped:
+            return False
+        from app.core.config import settings
+
+        soft_stop_seconds = int(getattr(settings, "TIME_BUDGET_SOFT_STOP_SECONDS", 180))
+        if self._remaining_seconds() < soft_stop_seconds:
+            agent.request_soft_stop()
+            return True
+        return False
+
+    def mark_deadline_hit(self) -> None:
+        """标记任务时间预算到点并传播取消（由 agent_tasks 超时 watchdog 调用）。"""
+        self._deadline_hit = True
+        self.cancel()
+
+    def _apply_deadline_bypass(self, reason: str) -> None:
+        """按预算治理语义设置覆盖率安全阀 metadata（复用 5 字段唯一构造点）。"""
+        if self._coverage_bypassed:
+            return
+        self._coverage_bypassed = True
+        self._coverage_bypass_info = self._build_coverage_bypass_info(
+            reason=reason,
+            covered_count=0,
+            total_dimensions=10,
+            gaps=[],
+            block_count=getattr(self, "_hard_coverage_block_count", 0),
+        )
+
     def _build_coverage_bypass_info(
         self,
         reason: str,
@@ -573,6 +666,10 @@ class OrchestratorAgent(BaseAgent):
         """
         import time
         start_time = time.time()
+
+        # 🔥 fix-audit-time-budget-2026-08: 任务时间预算（与外部 wait_for 时钟同源）
+        self._deadline_hit = False
+        self._init_task_deadline(input_data)
 
         project_info = input_data.get("project_info", {})
         config = input_data.get("config", {})
@@ -704,6 +801,17 @@ class OrchestratorAgent(BaseAgent):
                         gaps=[],
                         block_count=0,
                         extra={"tokens_used": _total, "budget": _budget},
+                    )
+                    break
+
+                # 🔥 fix-audit-time-budget-2026-08: 主循环时间预算硬阈值——到点优雅收口
+                from app.core.config import settings
+
+                hard_floor = int(getattr(settings, "TIME_BUDGET_HARD_FLOOR_SECONDS", 60))
+                if self._remaining_seconds() <= hard_floor:
+                    self._apply_deadline_bypass("task_deadline_exhausted")
+                    await self.emit_event(
+                        "warning", "⏰ 任务时间预算耗尽，停止发起新的编排轮次并收口"
                     )
                     break
 
@@ -1909,18 +2017,17 @@ Action Input: {{"参数": "值"}}
             if self.is_cancelled:
                 return f"## {agent_name} Agent 执行取消\n\n任务已被用户取消"
 
+            # 🔥 fix-audit-time-budget-2026-08: 预算将尽拒发新调度；复位调度超时锁存
+            # （reset 内部复判外部取消回调，用户取消锁存不会被洗掉）
+            budget_refusal = self._budget_refusal()
+            if budget_refusal:
+                await self.emit_event("info", budget_refusal)
+                return f"## {agent_name} Agent 未调度\n\n{budget_refusal}"
+            agent.reset_dispatch_cancel()
+
             # 🔥 执行子 Agent - 支持取消和超时
-            # 使用用户配置的子Agent超时时间
-            default_sub_agent_timeout = self._timeout_config.get('sub_agent_timeout', 600)
-            # 设置子 Agent 超时（根据 Agent 类型，recon稍短）
-            agent_timeouts = {
-                "recon": min(300, default_sub_agent_timeout),  # recon 通常较快
-                "analysis": default_sub_agent_timeout,
-                # REQ-ER-3: verification 验证 PoC（含启动服务/框架）耗时高，独立放宽超时
-                # （生产 cade28a4：LLM 启动完整 Tomcat 验证 1200s 超时中断，丢已执行证据）
-                "verification": max(default_sub_agent_timeout, 1800),
-            }
-            timeout = agent_timeouts.get(agent_name, default_sub_agent_timeout)
+            # 调度超时 = min(类型上限, 剩余任务预算)，见 _resolve_dispatch_timeout
+            timeout = self._resolve_dispatch_timeout(agent_name)
 
             async def run_with_cancel_check() -> AgentResult:
                 """包装子 Agent 执行，定期检查取消状态"""
@@ -1938,6 +2045,13 @@ Action Input: {{"参数": "值"}}
                             except asyncio.CancelledError:
                                 pass
                             raise asyncio.CancelledError("任务已取消")
+
+                        # 🔥 fix-audit-time-budget-2026-08: 剩余预算不足时请求 analysis 软停止交卷
+                        if self._maybe_request_soft_stop(agent, agent_name):
+                            await self.emit_event(
+                                "info",
+                                "⏳ 任务时间预算将尽，请求 Analysis Agent 立即总结交卷",
+                            )
 
                         # Use asyncio.wait to poll without cancelling the task
                         done, pending = await asyncio.wait(

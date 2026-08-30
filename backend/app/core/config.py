@@ -107,8 +107,14 @@ class Settings(BaseSettings):
     LLM_FIRST_TOKEN_TIMEOUT: int = 180  # 首Token超时时间（秒），推理模型需要更长时间  # 绛夊緟棣栦釜Token鐨勮秴鏃舵椂闂?
     LLM_STREAM_TIMEOUT: int = 120  # 娴佸紡杈撳嚭涓袱涓猅oken涔嬮棿鐨勮秴鏃舵椂闂?
     SUB_AGENT_TIMEOUT_SECONDS: int = 1200  # 瀛怉gent瓒呮椂鏃堕棿锛?0鍒嗛挓锛?
-    TOOL_TIMEOUT_SECONDS: int = 60  # 宸ュ叿鎵ц榛樿瓒呮椂鏃堕棿
-    
+    TOOL_TIMEOUT_SECONDS: int = 60  # 宸ュ叿鎵ц榛樿瓒呮椂鏃堕棿
+
+    # fix-audit-time-budget-2026-08: 任务时间预算治理阈值（秒）
+    TIME_BUDGET_HARD_FLOOR_SECONDS: int = 60   # 主循环剩余预算硬阈值：低于即停止发起新轮次并收口
+    TIME_BUDGET_SOFT_STOP_SECONDS: int = 180   # 软停止阈值：低于即请求 in-flight analysis 立即交卷
+    TIME_BUDGET_MIN_DISPATCH_SECONDS: int = 30  # 剩余低于该值不再发起新的子 Agent 调度
+    TIME_BUDGET_GRACE_SECONDS: int = 45  # watchdog 触发后给编排器优雅收口的宽限
+
     # 鍚凩LM鎻愪緵鍟嗙殑API Key閰嶇疆锛堝吋瀹瑰崟鐙厤缃級
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: Optional[str] = None
