@@ -277,6 +277,32 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_findings: list[dict[str, Any]] = []
         self._full_verification_dispatched: bool = False
         # T6 (REQ-VC-2): R4 放行前程序化补验的一次性标志（防重复调度）
+
+        # 🔥 v3.0: 审计追踪文件系统
+        self.trace_manager = None
+        if get_agent_config().audit_trace_enabled and task_id:
+            from app.services.agent.audit_trace import AuditTraceManager
+            self.trace_manager = AuditTraceManager(
+                task_id=task_id,
+                project_name="unknown",  # 将在 run() 中更新
+                base_dir=get_agent_config().audit_trace_dir
+            )
+            logger.info(f"[{self.name}] 审计追踪已启用")
+
+        # 🔥 v3.0: 智能上下文管理器
+        self.context_manager = None
+        if get_agent_config().context_compression_enabled:
+            from app.services.agent.context_manager import ContextManager, ContextWindow
+            self.context_manager = ContextManager(
+                llm_service=llm_service,
+                trace_manager=self.trace_manager,
+                window_config=ContextWindow(
+                    max_messages=get_agent_config().context_max_messages,
+                    compression_threshold=get_agent_config().context_compression_threshold,
+                    keep_recent=get_agent_config().context_keep_recent,
+                )
+            )
+            logger.info(f"[{self.name}] 智能上下文管理已启用")
         self._force_verification_dispatched: bool = False
         # R4: 连续被"无沙箱证据"门禁拒绝 finish 的次数；达上限后停止强制重派
         self._finish_gate_rejections: int = 0
@@ -736,6 +762,10 @@ class OrchestratorAgent(BaseAgent):
             "task_id": input_data.get("task_id"),
         }
 
+        # 🔥 v3.0: 更新追踪管理器的项目名称
+        if self.trace_manager:
+            self.trace_manager.project_name = project_info.get("name", "unknown")
+
         # 🧠 历史审计记忆（同项目往次已确认漏洞线索）
         self._audit_memory: list[dict[str, Any]] = input_data.get("audit_memory") or []
 
@@ -894,10 +924,21 @@ class OrchestratorAgent(BaseAgent):
                 # 🔥 LLM 调用入口检查暂停请求，避免长调用阻塞手动暂停
                 await self._maybe_pause()
 
+                # 🔥 v3.0: 智能上下文压缩（在 LLM 调用前）
+                if self.context_manager:
+                    try:
+                        self._conversation_history = await self.context_manager.compress_if_needed(
+                            self._conversation_history
+                        )
+                    except Exception as e:
+                        logger.error(f"[{self.name}] 上下文压缩失败: {e}")
+
                 # 调用 LLM 进行思考和决策（流式输出）
                 try:
                     llm_output, tokens_this_round = await self.stream_llm_call(
                         self._conversation_history,
+                        # 🔥 v3.0: 使用 Orchestrator 专用 temperature
+                        temperature=get_agent_config().llm_temperature_orchestrator,
                         # 🔥 frequency_penalty/presence_penalty 通过 LLMConfig -> litellm_adapter.stream_complete 生效
                     )
                 except asyncio.CancelledError:
@@ -1013,35 +1054,63 @@ Action Input: {{"参数": "值"}}
                 step = self._parse_llm_response(llm_output)
 
                 if not step:
-                    # LLM 输出格式不正确，提示重试（放宽阈值，减少误杀）
+                    # 🔥 v3.0: LLM 输出格式不正确，智能重试策略
                     format_retry_count = getattr(self, '_format_retry_count', 0) + 1
                     self._format_retry_count = format_retry_count
-                    if format_retry_count >= 5:
-                        logger.error(f"[{self.name}] Too many format errors, pausing")
+
+                    # 🔥 方案3：阈值从 5 提高到 10
+                    if format_retry_count >= 10:
+                        logger.error(f"[{self.name}] Too many format errors ({format_retry_count}), pausing")
                         await self._pause_for_recoverable_error(
                             reason="format_error",
                             error_code="format_error",
-                            user_message="连续格式错误，任务已暂停。请调整模型或提示词后点击继续。",
+                            user_message=f"连续 {format_retry_count} 次格式错误，任务已暂停。建议调整模型配置（Temperature 建议 0.3-0.5）或切换更强大的模型后点击继续。",
                         )
-                    if format_retry_count >= 3:
-                        # 第三次失败时先尝试 LLM 重触发生成，而非直接计数
-                        logger.warning(f"[{self.name}] Format error #{format_retry_count}, requesting LLM retry")
-                        await self.emit_event("warning", f"格式错误（第{format_retry_count}次），尝试重新生成...")
+
+                    # 🔥 方案4：优化错误提示词策略
+                    if format_retry_count <= 2:
+                        # 第 1-2 次：静默重试，不添加提示（避免污染上下文）
+                        logger.info(f"[{self.name}] Format error #{format_retry_count}, silent retry")
+                        await self.emit_event("info", f"格式解析失败（第{format_retry_count}次），静默重试...")
+                        continue
+                    elif format_retry_count <= 5:
+                        # 第 3-5 次：添加简短友好的提示 + 示例
+                        logger.warning(f"[{self.name}] Format error #{format_retry_count}, adding helpful hint")
+                        await self.emit_event("warning", f"格式错误（第{format_retry_count}次），添加示例提示...")
                         self._conversation_history.append({
                             "role": "user",
-                            "content": "之前的格式仍然不正确。请重新思考并严格按照格式输出：只包含 Thought、Action、Action Input 三个字段，Action Input 必须是有效的 JSON。不要包含其他内容。",
+                            "content": """请按照以下格式输出你的决策：
+
+Thought: [你的思考过程]
+Action: [动作名称，如 dispatch_agent、finish、summarize]
+Action Input: [有效的JSON对象]
+
+示例：
+Thought: 我需要调度 verification Agent 来验证发现的漏洞
+Action: dispatch_agent
+Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context": "共1个漏洞需要验证"}"""
                         })
                         continue
-                    await self.emit_llm_decision("格式错误", "需要重新输出")
-                    self._conversation_history.append({
-                        "role": "assistant",
-                        "content": llm_output,
-                    })
-                    self._conversation_history.append({
-                        "role": "user",
-                        "content": "请按照规定格式输出：Thought + Action + Action Input",
-                    })
-                    continue
+                    else:
+                        # 第 6+ 次：详细说明 + 当前状态提示
+                        logger.warning(f"[{self.name}] Format error #{format_retry_count}, detailed guidance")
+                        await self.emit_event("warning", f"格式错误（第{format_retry_count}次），提供详细指导...")
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": f"""格式解析失败了 {format_retry_count} 次。请严格按照以下要求输出：
+
+1. **必须包含三个字段**：Thought、Action、Action Input
+2. **Action 只能是单个单词**：dispatch_agent、finish、summarize（不要使用空格或特殊符号）
+3. **Action Input 必须是有效的 JSON 对象**：使用双引号，正确闭合大括号
+
+当前任务状态：
+- 已调度的 Agent: {list(self._dispatched_tasks.keys())}
+- 发现的漏洞数: {len(self._all_findings)}
+- 当前迭代: {iteration}
+
+请重新输出你的决策。"""
+                        })
+                        continue
 
                 # 重置格式重试计数器
                 self._format_retry_count = 0
@@ -1622,6 +1691,14 @@ Action Input: {{"参数": "值"}}
                 error=str(e),
             )
         finally:
+            # 🔥 v3.0: 最终化追踪文件
+            if self.trace_manager:
+                try:
+                    self.trace_manager.finalize()
+                    logger.info(f"[{self.name}] 审计追踪文件已保存: {self.trace_manager.trace_md}")
+                except Exception as e:
+                    logger.error(f"[{self.name}] 追踪文件最终化失败: {e}")
+
             # Wave 2 §3.2 停止心跳协程 + 清理 Redis registry key
             if _heartbeat_alive_task is not None and not _heartbeat_alive_task.done():
                 _heartbeat_alive_task.cancel()
@@ -1915,7 +1992,15 @@ Action Input: {{"参数": "值"}}
         return msg
 
     def _parse_llm_response(self, response: str) -> AgentStep | None:
-        """解析 LLM 响应"""
+        """
+        解析 LLM 响应（增强容错性）
+
+        v3.0 改进：
+        - 支持 Action 中的连字符和下划线
+        - 支持中英文冒号混用
+        - 更宽松的 Action Input 提取
+        - 记录解析失败的原因用于调试
+        """
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
         cleaned_response = response
         cleaned_response = re.sub(r'\*\*Action:\*\*', 'Action:', cleaned_response)
@@ -1923,19 +2008,34 @@ Action Input: {{"参数": "值"}}
         cleaned_response = re.sub(r'\*\*Thought:\*\*', 'Thought:', cleaned_response)
         cleaned_response = re.sub(r'\*\*Observation:\*\*', 'Observation:', cleaned_response)
 
+        # 🔥 v3.0: 兼容中文冒号
+        cleaned_response = re.sub(r'Action：', 'Action:', cleaned_response)
+        cleaned_response = re.sub(r'Action Input：', 'Action Input:', cleaned_response)
+        cleaned_response = re.sub(r'Thought：', 'Thought:', cleaned_response)
+
         # 提取 Thought
         thought_match = re.search(r'Thought:\s*(.*?)(?=Action:|$)', cleaned_response, re.DOTALL)
         thought = thought_match.group(1).strip() if thought_match else ""
 
-        # 提取 Action
-        action_match = re.search(r'Action:\s*(\w+)', cleaned_response)
+        # 🔥 v3.0: 提取 Action（增强容错性）
+        # 优先匹配标准格式：单词 + 下划线 + 连字符
+        action_match = re.search(r'Action:\s*([\w\-]+)', cleaned_response)
         if not action_match:
+            # 降级：匹配任何非换行字符（去除首尾空格）
+            action_match = re.search(r'Action:\s*([^\n]+?)(?:\s*\n|$)', cleaned_response)
+
+        if not action_match:
+            logger.warning(f"[{self.name}] 解析失败：未找到 Action 字段")
+            logger.debug(f"[{self.name}] 响应内容（前500字符）: {cleaned_response[:500]}")
             return None
+
         action = action_match.group(1).strip()
 
-        # 提取 Action Input
-        input_match = re.search(r'Action Input:\s*(.*?)(?=Thought:|Observation:|$)', cleaned_response, re.DOTALL)
+        # 🔥 v3.0: 提取 Action Input（更宽松的匹配）
+        input_match = re.search(r'Action Input:\s*(.*?)(?=\n(?:Thought:|Action:|Observation:)|$)', cleaned_response, re.DOTALL)
         if not input_match:
+            logger.warning(f"[{self.name}] 解析失败：未找到 Action Input 字段")
+            logger.debug(f"[{self.name}] Action: {action}, 响应内容（前500字符）: {cleaned_response[:500]}")
             return None
 
         input_text = input_match.group(1).strip()
@@ -1948,6 +2048,8 @@ Action Input: {{"参数": "值"}}
             input_text,
             default={"raw": input_text}
         )
+
+        logger.debug(f"[{self.name}] 解析成功: action={action}, input_keys={list(action_input.keys()) if isinstance(action_input, dict) else 'not_dict'}")
 
         return AgentStep(
             thought=thought,
@@ -2108,6 +2210,15 @@ Action Input: {{"参数": "值"}}
             if self.is_cancelled:
                 return f"## {agent_name} Agent 执行取消\n\n任务已被用户取消"
 
+            # 🔥 v3.0: 记录 Agent 调度到追踪文件
+            if self.trace_manager:
+                self.trace_manager.add_agent_dispatch(
+                    agent_name=agent_name,
+                    task=task,
+                    context=context,
+                    parent_agent=self.name
+                )
+
             # 🔥 fix-audit-time-budget-2026-08: 预算将尽拒发新调度；复位调度超时锁存
             # （reset 内部复判外部取消回调，用户取消锁存不会被洗掉）
             budget_refusal = self._budget_refusal()
@@ -2238,6 +2349,22 @@ Action Input: {{"参数": "值"}}
 
             if result.success and result.data:
                 data = result.data
+
+                # 🔥 v3.0: 压缩子 Agent 输出（如果过长）
+                original_output = str(data)
+                if self.context_manager and len(original_output) > get_agent_config().agent_output_compression_threshold:
+                    logger.info(f"[Orchestrator] {agent_name} 输出过长 ({len(original_output)} 字符)，开始压缩...")
+                    try:
+                        compressed_summary = await self.context_manager.compress_agent_output(
+                            agent_name=agent_name,
+                            output=original_output,
+                            max_length=10_000
+                        )
+                        # 注意：这里我们记录了压缩，但仍然使用完整 data 进行后续处理
+                        # 压缩主要用于传递给 LLM 的上下文
+                        logger.info(f"[Orchestrator] {agent_name} 输出已压缩并归档")
+                    except Exception as e:
+                        logger.error(f"[Orchestrator] {agent_name} 输出压缩失败: {e}")
 
                 # 🔥 FIX: 保存 Agent 的完整结果，供后续 Agent 使用
                 self._agent_results[agent_name] = data
@@ -2408,6 +2535,20 @@ Action Input: {{"参数": "值"}}
 
                         # T7 (REQ-VC-3): merge-back 统一入口（_sandbox_finding_id 精确匹配优先）
                         self._merge_or_append_finding(normalized_new)
+
+                        # 🔥 v3.0: 记录漏洞发现到追踪文件
+                        if self.trace_manager:
+                            self.trace_manager.add_finding(
+                                finding_type=normalized_new.get("type", "unknown"),
+                                severity=normalized_new.get("severity", "medium"),
+                                title=normalized_new.get("title", "未知漏洞"),
+                                description=normalized_new.get("description", "")[:500],
+                                file_path=normalized_new.get("file_path", ""),
+                                line_number=normalized_new.get("line_number"),
+                                code_snippet=normalized_new.get("code_snippet", "")[:300] if normalized_new.get("code_snippet") else None,
+                                poc=normalized_new.get("poc", "")[:300] if normalized_new.get("poc") else None,
+                                agent_source=agent_name
+                            )
 
                     logger.info(f"[Orchestrator] Total findings now: {len(self._all_findings)}")
                 else:

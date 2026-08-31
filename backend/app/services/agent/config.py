@@ -54,8 +54,16 @@ class AgentConfig(BaseSettings):
         description="Maximum tokens per LLM call"
     )
     llm_temperature: float = Field(
-        default=0.5,
-        description="Default temperature for LLM calls"
+        default=0.4,
+        description="Default temperature for LLM calls (v3.0: 从 0.5 降到 0.4，平衡稳定性与创造性)"
+    )
+    llm_temperature_orchestrator: float = Field(
+        default=0.4,
+        description="Temperature for Orchestrator (v3.0: 建议 0.3-0.5，避免过低导致格式错误)"
+    )
+    llm_use_structured_output: bool = Field(
+        default=False,
+        description="v3.0: 启用结构化输出（OpenAI Function Calling / Anthropic Tool Use）"
     )
     llm_stream_enabled: bool = Field(
         default=True,
@@ -102,7 +110,37 @@ class AgentConfig(BaseSettings):
         description="B5: verification 会话历史消息数软上限（超出时压缩最旧一半为摘要消息）"
     )
 
-    # ============ Agent Timeouts ============
+    # ============ Context Management (v3.0) ============
+    context_compression_enabled: bool = Field(
+        default=True,
+        description="v3.0: 启用智能上下文压缩"
+    )
+    context_compression_threshold: int = Field(
+        default=50_000,
+        description="v3.0: 上下文长度超过此阈值时触发压缩（字符数）"
+    )
+    context_max_messages: int = Field(
+        default=30,
+        description="v3.0: 滑动窗口最大保留消息数"
+    )
+    context_keep_recent: int = Field(
+        default=5,
+        description="v3.0: 始终保留最近 N 条消息"
+    )
+    agent_output_compression_threshold: int = Field(
+        default=100_000,
+        description="v3.0: 子 Agent 输出超过此长度时自动压缩（字符数）"
+    )
+
+    # ============ Audit Trace (v3.0) ============
+    audit_trace_enabled: bool = Field(
+        default=True,
+        description="v3.0: 启用审计追踪文件系统"
+    )
+    audit_trace_dir: str = Field(
+        default="./audit_traces",
+        description="v3.0: 审计追踪文件存储目录"
+    )
     orchestrator_timeout_seconds: int = Field(
         default=7200,
         description="Timeout in seconds for orchestrator (2 hours)"
