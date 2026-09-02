@@ -19,7 +19,7 @@
 
 - [x] **Task 2 完成**（实施 b6d663f + 第 1 轮修复 08b1641，review 初审 NEEDS_FIX→重审 CLEAN；Important"json-repair 绕过归因"已经真实路径+变异测试双重验证修复；Minor 记账：_run_forced_summary 归因调用 :487 挂在 if 块内，"修复成无 findings 键 dict"窄形态不触发，建议归档前移出 if 块与主循环同构）
 - [x] **Task 3 完成**（commit 4856fe1，review CLEAN——重构等价性逐行比对零差异 + 7 组对照测试锁定 + 变异检查；Minor 记账：①recon.py:572 存在同型未截断 observation 追加（同样有 50000 字符撑 prefill 风险），spec 只要求 analysis，建议记入 C 变更；②orchestrator.py:1461-1476 dedup_hint 注入块重复两次（既有问题））
-- [ ] **Task 4 完成**
+- [x] **Task 4 完成**（commit 66ecd41，review CLEAN——消费链四环全通经临时脚本亲测；主控裁决记账：semgrep_scan 的 rules 为固定规则集枚举不贡献 grep_patterns（报了污染"禁止重复"语义），spec delta 文字归档前补一句说明（Minor-1，向老板汇报项））
 
 ### Task 2: finish_reason 截断可见化
 - Files: `backend/app/services/agent/agents/base.py`（stream_llm_call done 块 :1145-1149）
