@@ -54,7 +54,7 @@
 ## Phase 3: 时间治理与沙箱预检
 
 - [x] **Task 5 完成**（commit 988fd9e，review CLEAN——调用点零绕过亲验、软停矛盾数学消除、变异检查有效；Minor 记账：①spec Scenario 3 的 metadata 以 reason 文本承载（归档前 spec 补措辞，与 Task 4 semgrep 说明同批）；②被拒调度仍占 _dispatched_tasks 计数（既有行为，记 C 变更观察））
-- [ ] **Task 6 完成**
+- [x] **Task 6 完成**（commit 329d858，review CLEAN——initialize 连接路径零行为回归、镜像路径 30+ 消费点统一 fail-closed 抽查 5 关键点安全、可重试自愈语义无风险；Minor 记账：endpoint 层为源码契约测试（重型 fixture 取舍），Task 7 真实事件流兜底；SANDBOX_IMAGE 默认 ：latest 与生产 v6.1.0 并存为既有现状）
 
 ### Task 5: 类型化拒发新调度阈值
 - Files: `backend/app/core/config.py`（新增 `TIME_BUDGET_MIN_EFFECTIVE` 配置）、`backend/app/services/agent/agents/orchestrator.py`（`_budget_refusal` :622-629）
