@@ -958,10 +958,16 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
             # 🔥 创建 TaskHandoff - 传递给 Verification Agent
             handoff = self._create_analysis_handoff(standardized_findings)
 
+            # Task 4: 上报本轮实际执行的文件读取/搜索模式，供 orchestrator
+            # 并入 _search_registry 与下一轮 CrossRoundContext（跨轮"禁止重读/禁止重复搜索"去重）
+            execution_report = self._collect_execution_report()
+
             return AgentResult(
                 success=True,
                 data={
                     "findings": standardized_findings,
+                    "files_read": execution_report["files_read"],
+                    "grep_patterns": execution_report["grep_patterns"],
                     "steps": [
                         {
                             "thought": s.thought,
@@ -991,6 +997,43 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
     def get_steps(self) -> List[AnalysisStep]:
         """获取执行步骤"""
         return self._steps
+
+    def _collect_execution_report(self) -> Dict[str, List[str]]:
+        """聚合本轮实际执行过的文件读取与搜索模式，上报 orchestrator 推进跨轮去重。
+
+        spec（fix-audit-observability-time-governance）：Analysis 完成时 data 须含
+        - files_read: read_file 的 file_path 去重排序（CrossRoundContext "R1 已读文件，
+          R2 禁止重读"）；
+        - grep_patterns: search_code 的 keyword 去重排序（"R1 已执行搜索，R2 禁止重复"）；
+          pattern 为 LLM 偶发违例（工具描述要求 keyword）的别名兜底。
+        semgrep_scan 参数为 target_path/rules（p/security-audit 等固定规则集枚举），
+        无"搜索模式"语义——rules 上报进跨轮提示只会污染"已执行搜索"列表，故不贡献
+        （其 action_input 无 keyword/pattern 字段，自然取空被过滤）。
+        全程非致命：action_input 为 None/非 dict、字段缺失/空白均跳过；任何异常按空列表上报。
+        """
+        files_read: set = set()
+        grep_patterns: set = set()
+        try:
+            for step in self._steps:
+                action = getattr(step, "action", None)
+                action_input = getattr(step, "action_input", None)
+                if not action or not isinstance(action_input, dict):
+                    continue
+                if action == "read_file":
+                    path = action_input.get("file_path")
+                    # 原样上报（与工具实际输入一致），仅过滤非 str/空白值
+                    if isinstance(path, str) and path.strip():
+                        files_read.add(path)
+                elif action in ("search_code", "semgrep_scan"):
+                    pattern = action_input.get("keyword") or action_input.get("pattern")
+                    if isinstance(pattern, str) and pattern.strip():
+                        grep_patterns.add(pattern)
+        except Exception as e:
+            logger.warning(
+                f"[{getattr(self, 'name', 'Analysis')}] 聚合执行状态上报失败（非致命，按空列表上报）: {e}"
+            )
+            return {"files_read": [], "grep_patterns": []}
+        return {"files_read": sorted(files_read), "grep_patterns": sorted(grep_patterns)}
 
     def _infer_knowledge_modules(self, config: Dict[str, Any], cross_round_context: str = "") -> List[str]:
         """根据任务配置和跨轮上下文推断需要加载的知识模块"""
