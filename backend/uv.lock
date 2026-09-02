@@ -1729,7 +1729,7 @@ wheels = [
 
 [[package]]
 name = "lanjian-backend"
-version = "6.2.4"
+version = "6.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
