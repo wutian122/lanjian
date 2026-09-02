@@ -2,6 +2,8 @@
 
 ## Phase 1: 时间预算短路修复
 
+- [x] **Task 1 完成**（commit c60d26b，review CLEAN——3 Scenario 全 ✅，14 测试过，回归 730/4 与基线持平；Minor 记账：双份解析逻辑靠时钟同源测试锁定、service.py:49 负数 agentTimeout 穿透留待 Task 5/C 变更、字符串容忍为理论路径）
+
 ### Task 1: 任务级 timeout_seconds 默认值短路修复
 - Files: `backend/app/api/v1/endpoints/agent_tasks.py`（AgentTaskCreate :140、创建落库 :2467、执行入口 :978、watchdog :1024 附近）
 - Interfaces: Consumes `AgentTaskCreate.timeout_seconds`（改为 `int|None`）、全局 `llmConfig.agentTimeout`；Produces 共享函数 `resolve_task_timeout_seconds(task, user_config) -> float`
@@ -14,6 +16,10 @@
 - 验收：全局 agentTimeout=7200 时新建任务 deadline=7200s（事件或日志可证）；历史 1800 任务行为不变
 
 ## Phase 2: 可观测性
+
+- [ ] **Task 2 完成**
+- [ ] **Task 3 完成**
+- [ ] **Task 4 完成**
 
 ### Task 2: finish_reason 截断可见化
 - Files: `backend/app/services/agent/agents/base.py`（stream_llm_call done 块 :1145-1149）
@@ -47,6 +53,9 @@
 
 ## Phase 3: 时间治理与沙箱预检
 
+- [ ] **Task 5 完成**
+- [ ] **Task 6 完成**
+
 ### Task 5: 类型化拒发新调度阈值
 - Files: `backend/app/core/config.py`（新增 `TIME_BUDGET_MIN_EFFECTIVE` 配置）、`backend/app/services/agent/agents/orchestrator.py`（`_budget_refusal` :622-629）
 - Interfaces: Consumes 剩余预算；Produces 拒绝文案 + `_gate_observations` 记录 `{gate:"dispatch_budget", remaining_seconds, required_seconds, agent_name}`
@@ -68,6 +77,8 @@
   5. commit
 
 ## Phase 4: 端到端验证
+
+- [ ] **Task 7 完成**
 
 ### Task 7: 端到端真实审计验证
 - Files: 无代码改动（验证任务）
