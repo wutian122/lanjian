@@ -27,6 +27,7 @@ from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, MULTI_AGENT_RULES, build_enhanced_prompt
 from ..round_strategy import RoundContext
 from .base import AgentConfig, AgentPattern, AgentResult, AgentType, BaseAgent, TaskHandoff
+from app.services.agent.config import get_agent_config
 
 logger = logging.getLogger(__name__)
 
@@ -870,7 +871,6 @@ class OrchestratorAgent(BaseAgent):
 
                 # P1: token 预算硬门禁 —— 超限优雅降级为 COMPLETED_WITH_GAPS
                 if self._check_token_budget_exceeded():
-                    from app.services.agent.config import get_agent_config
                     _budget = get_agent_config().token_budget
                     _total = self._total_tokens + self._sub_agent_total_tokens
                     logger.warning(
@@ -1137,7 +1137,6 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     # R4: 连续被门禁拒绝达上限后，停止强制重派 verification，直接放行按覆盖率收尾。
                     # 根治历史"拒绝→重派→再拒绝"的 token 黑洞循环（生产任务 8 轮失控）。
                     try:
-                        from app.services.agent.config import get_agent_config
                         max_redispatch = getattr(
                             get_agent_config(), "verification_max_force_redispatch", 3
                         )
