@@ -137,7 +137,7 @@ class AgentTaskCreate(BaseModel):
 
     # Agent 配置
     max_iterations: int = Field(50, ge=1, le=200, description="最大迭代次数")
-    timeout_seconds: int = Field(1800, ge=60, le=7200, description="超时时间（秒）")
+    timeout_seconds: int | None = Field(None, ge=60, le=7200, description="超时时间（秒），不传则使用全局 Agent 超时配置")
 
 
 class AgentTaskResponse(BaseModel):
@@ -481,10 +481,41 @@ async def _re_audit_task(task_id: str, finding_ids: list[str]):
                 await db.commit()
 
 
+def resolve_task_timeout_seconds(task: Any, user_config: dict[str, Any] | None) -> float:
+    """解析任务时间预算（秒）：显式任务级 timeout_seconds > 用户 llmConfig.agentTimeout
+    > settings.AGENT_TIMEOUT_SECONDS > 1800。
+
+    fix-audit-observability-time-governance：endpoint 侧 watchdog 时钟与 orchestrator
+    内部 deadline 时钟必须同源。任务未显式设置 timeout_seconds（DB NULL）时回退全局
+    agentTimeout 配置，而不是被 Pydantic 默认值 1800 短路导致全局"Agent 总超时"死配置。
+    语义与 OrchestratorAgent._resolve_task_timeout /
+    LLMService.get_agent_timeout_config 保持一致。
+    """
+    explicit = getattr(task, "timeout_seconds", None)
+    try:
+        if explicit is not None and float(explicit) > 0:
+            return float(explicit)
+    except (TypeError, ValueError):
+        pass
+
+    llm_config = (user_config or {}).get("llmConfig")
+    if isinstance(llm_config, dict):
+        agent_timeout = llm_config.get("agentTimeout")
+        try:
+            if agent_timeout is not None and float(agent_timeout) > 0:
+                return float(agent_timeout)
+        except (TypeError, ValueError):
+            pass
+
+    from app.core.config import settings
+
+    return float(getattr(settings, "AGENT_TIMEOUT_SECONDS", 1800) or 1800)
+
+
 async def _run_orchestrator_with_budget_watchdog(
     orchestrator,
     run_task: asyncio.Task,
-    task_timeout: int,
+    task_timeout: float,
     event_emitter,
     task_id: str,
     task_started_at: float,
@@ -974,8 +1005,10 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 "project_root": project_root,
                 "task_id": task_id,
                 "audit_memory": audit_memory,
-                # fix-audit-time-budget-2026-08: 任务时间预算传入 orchestrator（内部 deadline 同源）
-                "task_timeout_seconds": (task.timeout_seconds or 1800),
+                # fix-audit-observability-time-governance: 任务级超时仅透传显式值；
+                # NULL 时传 None，由 orchestrator._resolve_task_timeout 回退全局 agentTimeout，
+                # 不再被 Pydantic 默认值 1800 短路
+                "task_timeout_seconds": task.timeout_seconds,
             }
             if resume_state and isinstance(resume_state, dict):
                 input_data["resume_checkpoint"] = resume_state
@@ -1021,7 +1054,9 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 # Fix: 总体超时保护，防止任务无限运行
                 # fix-audit-time-budget-2026-08 (A1): watchdog 化——到点先优雅收口（宽限），
                 # 宽限耗尽才 hard-cancel；详见 _run_orchestrator_with_budget_watchdog
-                task_timeout = task.timeout_seconds or 1800
+                # fix-audit-observability-time-governance: watchdog 时钟与 orchestrator
+                # deadline 同源——NULL 任务级超时回退全局 agentTimeout，而非字面量 1800
+                task_timeout = resolve_task_timeout_seconds(task, user_config)
                 result, _deadline_hit = await _run_orchestrator_with_budget_watchdog(
                     orchestrator,
                     run_task,
@@ -2464,7 +2499,7 @@ async def create_agent_task(
         exclude_patterns=request.exclude_patterns,
         target_files=request.target_files,
         max_iterations=request.max_iterations or 50,
-        timeout_seconds=request.timeout_seconds or 1800,
+        timeout_seconds=request.timeout_seconds,  # None 即 NULL：未显式设置时回退全局 agentTimeout
         created_by=current_user.id,
         agent_config=task_agent_config,
     )
