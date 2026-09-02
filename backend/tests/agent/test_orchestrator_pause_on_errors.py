@@ -109,7 +109,9 @@ async def test_format_error_threshold_pauses_task(monkeypatch):
     pause_mock.assert_awaited_once()
     assert pause_mock.await_args.kwargs["reason"] == "format_error"
     assert pause_mock.await_args.kwargs["error_code"] == "format_error"
-    assert "连续格式错误" in pause_mock.await_args.kwargs["user_message"]
+    # 生产暂停文案为“连续 N 次格式错误，任务已暂停…”，按语义匹配
+    assert "连续" in pause_mock.await_args.kwargs["user_message"]
+    assert "格式错误" in pause_mock.await_args.kwargs["user_message"]
     assert exc.value.checkpoint_id == "ckpt-format"
     assert exc.value.reason == "format_error"
     assert exc.value.error_code == "format_error"

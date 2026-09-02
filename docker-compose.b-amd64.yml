@@ -44,7 +44,7 @@ services:
       - lanjian-network
 
   backend:
-    image: wutian449/lanjian-backend:v6.4.0
+    image: wutian449/lanjian-backend:v6.4.1
     restart: unless-stopped
     env_file:
       - ./backend/.env
