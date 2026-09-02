@@ -766,7 +766,15 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                                 f"发现 {finding.get('severity', 'medium')} 级别漏洞: {finding.get('title', 'Unknown')}"
                             )
                     else:
-                        logger.warning(f"[{self.name}] Final Answer has no 'findings' key or is None: {step.final_answer}")
+                        # 截断归因：上一轮 finish_reason=length 时 Final Answer 常被切断导致无 findings
+                        truncation_hint = (
+                            "（疑似 max_tokens 截断）"
+                            if getattr(self, "_last_llm_truncated", False) else ""
+                        )
+                        logger.warning(
+                            f"[{self.name}] Final Answer has no 'findings' key or is None: "
+                            f"{step.final_answer}{truncation_hint}"
+                        )
                     
                     # 🔥 记录工作完成
                     self.record_work(f"完成安全分析，发现 {len(all_findings)} 个潜在漏洞")
