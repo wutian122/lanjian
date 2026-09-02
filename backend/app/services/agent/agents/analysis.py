@@ -858,11 +858,19 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     
                     # 🔥 发射 LLM 观察事件
                     await self.emit_llm_observation(observation)
-                    
-                    # 添加观察结果到历史
+
+                    # 添加观察结果到历史（B5：超长 observation 保头尾截断，防止单条
+                    # 工具输出撑爆后续每轮 prefill；完整 observation 已在 step.observation
+                    # 上报 orchestrator，截断只影响对话历史）
+                    try:
+                        from app.services.agent.config import get_agent_config
+                        obs_max_chars = int(get_agent_config().observation_history_max_chars)
+                    except Exception:
+                        obs_max_chars = 4000
+                    obs_for_history = self._truncate_head_tail(observation, obs_max_chars)
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": f"Observation:\n{obs_for_history}",
                     })
                 else:
                     # LLM 没有选择工具，提示它继续

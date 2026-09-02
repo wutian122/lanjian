@@ -631,6 +631,31 @@ class BaseAgent(ABC):
         total = self._total_tokens + sub
         return total >= budget
 
+    @staticmethod
+    def _truncate_head_tail(text: str, max_chars: int) -> str:
+        """单条文本写入 conversation_history 前的保头尾截断（B5：verification/analysis 共享）。
+
+        超长时保留头部 1500 + 尾部 1500 字符，中间以省略标注替换：PoC/工具输出的铁证标记
+        （退出码/VULNERABILITY_CONFIRMED）通常在尾部，保尾防丢证据；头部保留命令/目标上下文。
+        max_chars 为总长阈值，len(text) <= max_chars 时原样返回。
+
+        防御：max_chars 配置过小（< 3000+标注空间）时按 budget=max(max_chars-200, 200)
+        收缩头尾，避免 omitted 为负/内容重复。
+        """
+        text = str(text or "")
+        if len(text) <= max_chars:
+            return text
+        head, tail = 1500, 1500
+        budget = max(max_chars - 200, 200)
+        if head + tail > budget:
+            head = tail = budget // 2
+        omitted = max(len(text) - head - tail, 0)
+        return (
+            text[:head]
+            + f"\n...[observation truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
+        )
+
     # ============ 协作方法 ============
     
     def receive_handoff(self, handoff: TaskHandoff):
