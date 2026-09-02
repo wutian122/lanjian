@@ -325,6 +325,9 @@ class BaseAgent(ABC):
         # 时间预算软停止（与取消语义分离，见 fix-audit-time-budget-2026-08）
         self._soft_stop = False
         self._soft_stop_consumed = False
+        # LLM 输出截断标志：最近一轮 stream_llm_call 是否 finish_reason=length
+        # （每轮调用开始时重置；Final Answer 解析失败路径据此归因"疑似 max_tokens 截断"）
+        self._last_llm_truncated = False
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -627,6 +630,31 @@ class BaseAgent(ABC):
         sub = getattr(self, "_sub_agent_total_tokens", 0)
         total = self._total_tokens + sub
         return total >= budget
+
+    @staticmethod
+    def _truncate_head_tail(text: str, max_chars: int) -> str:
+        """单条文本写入 conversation_history 前的保头尾截断（B5：verification/analysis 共享）。
+
+        超长时保留头部 1500 + 尾部 1500 字符，中间以省略标注替换：PoC/工具输出的铁证标记
+        （退出码/VULNERABILITY_CONFIRMED）通常在尾部，保尾防丢证据；头部保留命令/目标上下文。
+        max_chars 为总长阈值，len(text) <= max_chars 时原样返回。
+
+        防御：max_chars 配置过小（< 3000+标注空间）时按 budget=max(max_chars-200, 200)
+        收缩头尾，避免 omitted 为负/内容重复。
+        """
+        text = str(text or "")
+        if len(text) <= max_chars:
+            return text
+        head, tail = 1500, 1500
+        budget = max(max_chars - 200, 200)
+        if head + tail > budget:
+            head = tail = budget // 2
+        omitted = max(len(text) - head - tail, 0)
+        return (
+            text[:head]
+            + f"\n...[observation truncated: {omitted} chars omitted]...\n"
+            + text[-tail:]
+        )
 
     # ============ 协作方法 ============
     
@@ -1076,6 +1104,8 @@ class BaseAgent(ABC):
 
         accumulated = ""
         total_tokens = 0
+        # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
+        self._last_llm_truncated = False
 
         # 🔥 在开始 LLM 调用前检查取消
         if self.is_cancelled:
@@ -1146,6 +1176,10 @@ class BaseAgent(ABC):
                         accumulated = chunk["content"]
                         if chunk.get("usage"):
                             total_tokens = chunk["usage"].get("total_tokens", 0)
+                        # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
+                        if chunk.get("finish_reason") == "length":
+                            self._last_llm_truncated = True
+                            await self._record_llm_truncation(max_tokens)
                         break
 
                     elif chunk["type"] == "error":
@@ -1207,9 +1241,43 @@ class BaseAgent(ABC):
         # 🔥 记录空响应警告，帮助调试
         if not accumulated or not accumulated.strip():
             logger.warning(f"[{self.name}] Empty LLM response returned (total_tokens: {total_tokens})")
-        
+
         return accumulated, total_tokens
-    
+
+    async def _record_llm_truncation(self, max_tokens_arg: Optional[int]) -> None:
+        """finish_reason=length 的可见化处理（fix-audit-observability-time-governance Task 2）。
+
+        发射 warning 事件（含 agent 名/迭代号/max_tokens 值）并向对话历史追加截断提示，
+        供下一轮 LLM 压缩或分批输出。全部失败均非致命（仅记录日志），不影响主流程。
+        """
+        try:
+            effective_max = max_tokens_arg
+            if effective_max is None:
+                effective_max = getattr(
+                    getattr(self.llm_service, "config", None), "max_tokens", None
+                )
+            max_tokens_desc = str(effective_max) if effective_max else "用户配置 max_tokens"
+
+            warning_msg = (
+                f"[{self.name}] 第 {self._iteration} 轮 LLM 输出被 max_tokens 截断"
+                f"（finish_reason=length，max_tokens={max_tokens_desc}），"
+                f"请压缩输出或分批输出"
+            )
+            logger.warning(warning_msg)
+            await self.emit_event("warning", warning_msg)
+
+            # 追加到真实对话历史（而非本次 messages 引用——auto_compress 时
+            # messages 可能已被替换为压缩后的新列表）
+            history = getattr(self, "_conversation_history", None)
+            if isinstance(history, list):
+                history.append({
+                    "role": "user",
+                    "content": "（系统提示：上一轮输出被 max_tokens 截断，请压缩输出或分批输出）",
+                })
+        except Exception as e:
+            # 截断可见化本身失败不得影响 LLM 调用主流程
+            logger.error(f"[{self.name}] 截断提示处理失败（非致命）: {e}", exc_info=True)
+
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """
         统一的工具执行方法 - 支持取消和超时

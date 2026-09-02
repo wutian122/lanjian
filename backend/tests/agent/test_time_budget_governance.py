@@ -99,11 +99,11 @@ def test_budget_refusal_when_remaining_below_min_dispatch(monkeypatch):
     agent = _make_agent(monkeypatch)
     agent._deadline = time.time() - 1  # 已耗尽
 
-    refusal = agent._budget_refusal()
+    refusal = agent._budget_refusal("analysis")  # Task 5: 阈值类型化，按 agent 类型取阈值
     assert refusal is not None and "预算" in refusal
 
     agent._init_task_deadline({"task_timeout_seconds": 100000})
-    assert agent._budget_refusal() is None
+    assert agent._budget_refusal("analysis") is None
 
 
 # ---------- 软停止请求（仅 analysis、幂等、仅低剩余） ----------

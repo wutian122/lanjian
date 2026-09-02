@@ -1864,27 +1864,15 @@ class VerificationAgent(BaseAgent):
         """V6 B5（REQ-VE-5）：单条 observation 写入历史前截断，保头尾 1500+1500。
 
         PoC 输出的铁证标记（退出码/VULNERABILITY_CONFIRMED）通常在尾部，保尾防丢证据；
-        头部保留命令/目标上下文。
+        头部保留命令/目标上下文。截断实现已提取为 BaseAgent._truncate_head_tail
+        （Analysis 循环复用同一策略），本方法仅保留读配置的薄包装，行为不变。
         """
-        text = str(observation or "")
         try:
             from app.services.agent.config import get_agent_config
             max_chars = int(get_agent_config().observation_history_max_chars)
         except Exception:
             max_chars = 4000
-        if len(text) <= max_chars:
-            return text
-        head, tail = 1500, 1500
-        # 防御：配置值过小（<3000+标注空间）时收缩头尾，避免 omitted 为负/内容重复
-        budget = max(max_chars - 200, 200)
-        if head + tail > budget:
-            head = tail = budget // 2
-        omitted = max(len(text) - head - tail, 0)
-        return (
-            text[:head]
-            + f"\n...[observation truncated: {omitted} chars omitted]...\n"
-            + text[-tail:]
-        )
+        return self._truncate_head_tail(observation, max_chars)
 
     def _compress_history_if_needed(self) -> None:
         """V6 B5（REQ-VE-5）：累计历史超软上限时，最旧一半压缩为一条摘要消息。

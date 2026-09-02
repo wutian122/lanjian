@@ -405,6 +405,25 @@ class AnalysisAgent(BaseAgent):
     
 
     
+    async def _warn_truncated_final_answer(
+        self, findings_count: int, context: str = "Final Answer"
+    ) -> None:
+        """截断轮 Final Answer 统一归因（fix-audit-observability-time-governance Task 2）。
+
+        json-repair 会把半截 findings JSON 修成含部分 findings（或空 findings）的合法
+        dict，绕过"无 findings 键"告警分支造成静默回落。只要本轮来自
+        finish_reason=length，无论解析结果如何都发 warning 事件 + 容器日志。
+        """
+        if not getattr(self, "_last_llm_truncated", False):
+            return
+        if findings_count:
+            detail = f"已产出 {findings_count} 条 findings（尾部可能丢失）"
+        else:
+            detail = "解析失败或 findings 为空"
+        msg = f"[{self.name}] {context} 疑因 max_tokens 截断而不完整：{detail}"
+        logger.warning(msg)
+        await self.emit_event("warning", msg)
+
     async def _run_forced_summary(self, all_findings: list) -> list:
         """强制总结：轮次耗尽或软停止交卷时，让 LLM 立即输出 Final Answer 汇总发现。
 
@@ -461,10 +480,15 @@ Final Answer:""",
                     default={"findings": [], "summary": ""}
                 )
                 if "findings" in parsed_result and isinstance(parsed_result["findings"], list):
+                    summary_findings = parsed_result["findings"]
                     if all_findings:
-                        all_findings.extend(parsed_result["findings"])
+                        all_findings.extend(summary_findings)
                     else:
-                        all_findings = parsed_result["findings"]
+                        all_findings = summary_findings
+                    # 强制总结轮同样可能被 max_tokens 截断，统一归因
+                    await self._warn_truncated_final_answer(
+                        len(summary_findings), context="强制总结 Final Answer"
+                    )
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to generate summary: {e}")
         return all_findings
@@ -767,7 +791,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                             )
                     else:
                         logger.warning(f"[{self.name}] Final Answer has no 'findings' key or is None: {step.final_answer}")
-                    
+
+                    # 截断归因统一入口：json-repair 可能把半截 findings 修成部分/空
+                    # findings 走 if 分支静默，故无论解析结果如何，截断轮都在此归因
+                    await self._warn_truncated_final_answer(len(all_findings))
+
                     # 🔥 记录工作完成
                     self.record_work(f"完成安全分析，发现 {len(all_findings)} 个潜在漏洞")
                     
@@ -830,11 +858,19 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     
                     # 🔥 发射 LLM 观察事件
                     await self.emit_llm_observation(observation)
-                    
-                    # 添加观察结果到历史
+
+                    # 添加观察结果到历史（B5：超长 observation 保头尾截断，防止单条
+                    # 工具输出撑爆后续每轮 prefill；完整 observation 已在 step.observation
+                    # 上报 orchestrator，截断只影响对话历史）
+                    try:
+                        from app.services.agent.config import get_agent_config
+                        obs_max_chars = int(get_agent_config().observation_history_max_chars)
+                    except Exception:
+                        obs_max_chars = 4000
+                    obs_for_history = self._truncate_head_tail(observation, obs_max_chars)
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": f"Observation:\n{obs_for_history}",
                     })
                 else:
                     # LLM 没有选择工具，提示它继续
@@ -922,10 +958,16 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
             # 🔥 创建 TaskHandoff - 传递给 Verification Agent
             handoff = self._create_analysis_handoff(standardized_findings)
 
+            # Task 4: 上报本轮实际执行的文件读取/搜索模式，供 orchestrator
+            # 并入 _search_registry 与下一轮 CrossRoundContext（跨轮"禁止重读/禁止重复搜索"去重）
+            execution_report = self._collect_execution_report()
+
             return AgentResult(
                 success=True,
                 data={
                     "findings": standardized_findings,
+                    "files_read": execution_report["files_read"],
+                    "grep_patterns": execution_report["grep_patterns"],
                     "steps": [
                         {
                             "thought": s.thought,
@@ -955,6 +997,43 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
     def get_steps(self) -> List[AnalysisStep]:
         """获取执行步骤"""
         return self._steps
+
+    def _collect_execution_report(self) -> Dict[str, List[str]]:
+        """聚合本轮实际执行过的文件读取与搜索模式，上报 orchestrator 推进跨轮去重。
+
+        spec（fix-audit-observability-time-governance）：Analysis 完成时 data 须含
+        - files_read: read_file 的 file_path 去重排序（CrossRoundContext "R1 已读文件，
+          R2 禁止重读"）；
+        - grep_patterns: search_code 的 keyword 去重排序（"R1 已执行搜索，R2 禁止重复"）；
+          pattern 为 LLM 偶发违例（工具描述要求 keyword）的别名兜底。
+        semgrep_scan 参数为 target_path/rules（p/security-audit 等固定规则集枚举），
+        无"搜索模式"语义——rules 上报进跨轮提示只会污染"已执行搜索"列表，故不贡献
+        （其 action_input 无 keyword/pattern 字段，自然取空被过滤）。
+        全程非致命：action_input 为 None/非 dict、字段缺失/空白均跳过；任何异常按空列表上报。
+        """
+        files_read: set = set()
+        grep_patterns: set = set()
+        try:
+            for step in self._steps:
+                action = getattr(step, "action", None)
+                action_input = getattr(step, "action_input", None)
+                if not action or not isinstance(action_input, dict):
+                    continue
+                if action == "read_file":
+                    path = action_input.get("file_path")
+                    # 原样上报（与工具实际输入一致），仅过滤非 str/空白值
+                    if isinstance(path, str) and path.strip():
+                        files_read.add(path)
+                elif action in ("search_code", "semgrep_scan"):
+                    pattern = action_input.get("keyword") or action_input.get("pattern")
+                    if isinstance(pattern, str) and pattern.strip():
+                        grep_patterns.add(pattern)
+        except Exception as e:
+            logger.warning(
+                f"[{getattr(self, 'name', 'Analysis')}] 聚合执行状态上报失败（非致命，按空列表上报）: {e}"
+            )
+            return {"files_read": [], "grep_patterns": []}
+        return {"files_read": sorted(files_read), "grep_patterns": sorted(grep_patterns)}
 
     def _infer_knowledge_modules(self, config: Dict[str, Any], cross_round_context: str = "") -> List[str]:
         """根据任务配置和跨轮上下文推断需要加载的知识模块"""

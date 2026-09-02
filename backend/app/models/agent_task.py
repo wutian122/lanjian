@@ -79,7 +79,7 @@ class AgentTask(Base):
     agent_config = Column(JSON, nullable=True)  # Agent 特定配置
     max_iterations = Column(Integer, default=50)  # 最大迭代次数
     token_budget = Column(Integer, default=10000000)  # Token 预算（P1: 上调到 10M）
-    timeout_seconds = Column(Integer, default=1800)  # 超时时间（秒）
+    timeout_seconds = Column(Integer, nullable=True, default=None)  # 超时时间（秒）；NULL=未显式设置，回退全局 agentTimeout
     
     # 状态
     status = Column(String(20), default=AgentTaskStatus.PENDING)

@@ -619,13 +619,36 @@ class OrchestratorAgent(BaseAgent):
             return int(cap)  # 预算充足（含 deadline 未初始化的 inf）时等于类型上限
         return max(1, int(remaining))
 
-    def _budget_refusal(self) -> str | None:
-        """剩余预算低于 MIN_DISPATCH 时拒发新调度，返回给主循环的观察文本。"""
+    def _budget_refusal(self, agent_name: str) -> str | None:
+        """剩余预算不足以支撑该类型子 Agent 的最小有效工作时长时拒发新调度。
+
+        阈值类型化（analysis/verification=300s、recon=120s，settings 可覆盖，
+        未知类型保守取 300s）：旧统一 30s 阈值对 100-600s 的子任务无意义，且会
+        出现"派发成功后同一轮询周期立即软停止"的无效派发（nacos 任务实证空转
+        137s）。拒发阈值(300s)高于软停止阈值(180s)，该矛盾自然消除。
+        返回 None 表示可派发；返回收口文案时同时记 _gate_observations
+        （gate=dispatch_budget，remaining/required/agent_name 编入 reason 文本）。
+        """
         from app.core.config import settings
 
-        min_dispatch = int(getattr(settings, "TIME_BUDGET_MIN_DISPATCH_SECONDS", 30))
-        if self._remaining_seconds() <= min_dispatch:
-            return "⏰ 任务时间预算将尽，不再发起新的子 Agent 调度，请立即总结收口"
+        min_effective = {
+            "analysis": int(getattr(settings, "TIME_BUDGET_MIN_EFFECTIVE_ANALYSIS", 300)),
+            "verification": int(getattr(settings, "TIME_BUDGET_MIN_EFFECTIVE_VERIFICATION", 300)),
+            "recon": int(getattr(settings, "TIME_BUDGET_MIN_EFFECTIVE_RECON", 120)),
+        }
+        required = min_effective.get(agent_name, 300)  # 未知类型保守默认 300s
+        remaining = self._remaining_seconds()
+        if remaining <= required:
+            message = (
+                f"⏰ 任务时间预算将尽（剩余 {remaining:.0f}s），{agent_name} 子 Agent "
+                f"最小有效工作时长需 {required}s，预算不足以完成有效工作，"
+                f"不再发起新的子 Agent 调度，请立即总结收口"
+            )
+            self._record_gate_observation(
+                "dispatch_budget",
+                f"拒发 {agent_name}：剩余 {remaining:.0f}s <= 最小有效工作时长 {required}s，提前收口",
+            )
+            return message
         return None
 
     def _maybe_request_soft_stop(self, agent: BaseAgent, agent_name: str) -> bool:
@@ -2220,7 +2243,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
             # 🔥 fix-audit-time-budget-2026-08: 预算将尽拒发新调度；复位调度超时锁存
             # （reset 内部复判外部取消回调，用户取消锁存不会被洗掉）
-            budget_refusal = self._budget_refusal()
+            budget_refusal = self._budget_refusal(agent_name)
             if budget_refusal:
                 await self.emit_event("info", budget_refusal)
                 return f"## {agent_name} Agent 未调度\n\n{budget_refusal}"

@@ -2,6 +2,8 @@
 
 ## Phase 1: 时间预算短路修复
 
+- [x] **Task 1 完成**（commit c60d26b，review CLEAN——3 Scenario 全 ✅，14 测试过，回归 730/4 与基线持平；Minor 记账：双份解析逻辑靠时钟同源测试锁定、service.py:49 负数 agentTimeout 穿透留待 Task 5/C 变更、字符串容忍为理论路径）
+
 ### Task 1: 任务级 timeout_seconds 默认值短路修复
 - Files: `backend/app/api/v1/endpoints/agent_tasks.py`（AgentTaskCreate :140、创建落库 :2467、执行入口 :978、watchdog :1024 附近）
 - Interfaces: Consumes `AgentTaskCreate.timeout_seconds`（改为 `int|None`）、全局 `llmConfig.agentTimeout`；Produces 共享函数 `resolve_task_timeout_seconds(task, user_config) -> float`
@@ -14,6 +16,10 @@
 - 验收：全局 agentTimeout=7200 时新建任务 deadline=7200s（事件或日志可证）；历史 1800 任务行为不变
 
 ## Phase 2: 可观测性
+
+- [x] **Task 2 完成**（实施 b6d663f + 第 1 轮修复 08b1641，review 初审 NEEDS_FIX→重审 CLEAN；Important"json-repair 绕过归因"已经真实路径+变异测试双重验证修复；Minor 记账：_run_forced_summary 归因调用 :487 挂在 if 块内，"修复成无 findings 键 dict"窄形态不触发，建议归档前移出 if 块与主循环同构）
+- [x] **Task 3 完成**（commit 4856fe1，review CLEAN——重构等价性逐行比对零差异 + 7 组对照测试锁定 + 变异检查；Minor 记账：①recon.py:572 存在同型未截断 observation 追加（同样有 50000 字符撑 prefill 风险），spec 只要求 analysis，建议记入 C 变更；②orchestrator.py:1461-1476 dedup_hint 注入块重复两次（既有问题））
+- [x] **Task 4 完成**（commit 66ecd41，review CLEAN——消费链四环全通经临时脚本亲测；主控裁决记账：semgrep_scan 的 rules 为固定规则集枚举不贡献 grep_patterns（报了污染"禁止重复"语义），spec delta 文字归档前补一句说明（Minor-1，向老板汇报项））
 
 ### Task 2: finish_reason 截断可见化
 - Files: `backend/app/services/agent/agents/base.py`（stream_llm_call done 块 :1145-1149）
@@ -47,6 +53,9 @@
 
 ## Phase 3: 时间治理与沙箱预检
 
+- [x] **Task 5 完成**（commit 988fd9e，review CLEAN——调用点零绕过亲验、软停矛盾数学消除、变异检查有效；Minor 记账：①spec Scenario 3 的 metadata 以 reason 文本承载（归档前 spec 补措辞，与 Task 4 semgrep 说明同批）；②被拒调度仍占 _dispatched_tasks 计数（既有行为，记 C 变更观察））
+- [x] **Task 6 完成**（commit 329d858，review CLEAN——initialize 连接路径零行为回归、镜像路径 30+ 消费点统一 fail-closed 抽查 5 关键点安全、可重试自愈语义无风险；Minor 记账：endpoint 层为源码契约测试（重型 fixture 取舍），Task 7 真实事件流兜底；SANDBOX_IMAGE 默认 ：latest 与生产 v6.1.0 并存为既有现状）
+
 ### Task 5: 类型化拒发新调度阈值
 - Files: `backend/app/core/config.py`（新增 `TIME_BUDGET_MIN_EFFECTIVE` 配置）、`backend/app/services/agent/agents/orchestrator.py`（`_budget_refusal` :622-629）
 - Interfaces: Consumes 剩余预算；Produces 拒绝文案 + `_gate_observations` 记录 `{gate:"dispatch_budget", remaining_seconds, required_seconds, agent_name}`
@@ -68,6 +77,8 @@
   5. commit
 
 ## Phase 4: 端到端验证
+
+- [ ] **Task 7 完成**
 
 ### Task 7: 端到端真实审计验证
 - Files: 无代码改动（验证任务）
