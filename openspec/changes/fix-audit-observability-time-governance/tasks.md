@@ -17,7 +17,7 @@
 
 ## Phase 2: 可观测性
 
-- [ ] **Task 2 完成**
+- [x] **Task 2 完成**（实施 b6d663f + 第 1 轮修复 08b1641，review 初审 NEEDS_FIX→重审 CLEAN；Important"json-repair 绕过归因"已经真实路径+变异测试双重验证修复；Minor 记账：_run_forced_summary 归因调用 :487 挂在 if 块内，"修复成无 findings 键 dict"窄形态不触发，建议归档前移出 if 块与主循环同构）
 - [ ] **Task 3 完成**
 - [ ] **Task 4 完成**
 
