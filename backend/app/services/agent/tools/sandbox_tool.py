@@ -58,7 +58,13 @@ class SandboxManager:
         self._init_error = None
     
     async def initialize(self):
-        """初始化 Docker 客户端"""
+        """初始化 Docker 客户端并预检沙箱镜像
+
+        就绪判定：docker daemon 可达（ping 通过）**且** 配置镜像本地存在
+        （images.get 不抛错）。任一不过则 is_available=False，_init_error
+        区分"连接失败"与"镜像不存在"，供就绪事件与各工具降级路径归因。
+        镜像检查失败时 _initialized 保持 False，允许后续重试（镜像补齐后可恢复）。
+        """
         if self._initialized:
             logger.info("✅ SandboxManager already initialized")
             return
@@ -69,19 +75,41 @@ class SandboxManager:
             self._docker_client = docker.from_env()
             # 测试连接
             self._docker_client.ping()
-            self._initialized = True
-            self._init_error = None
-            logger.info("✅ Docker sandbox manager initialized successfully")
         except ImportError as e:
             logger.error(f"❌ Docker library not installed: {e}")
             self._docker_client = None
-            self._init_error = f"ImportError: {e}"
+            self._initialized = False
+            self._init_error = f"Docker 连接失败: Docker 库未安装 (ImportError: {e})"
+            return
         except Exception as e:
             logger.warning(f"❌ Docker not available: {e}")
             import traceback
             logger.warning(f"Docker connection traceback: {traceback.format_exc()}")
             self._docker_client = None
-            self._init_error = f"{type(e).__name__}: {str(e)}"
+            self._initialized = False
+            self._init_error = f"Docker 连接失败: {type(e).__name__}: {str(e)}"
+            return
+
+        # daemon 可达后预检沙箱镜像：镜像缺失时任何容器创建都会失败，
+        # 提前判定不可用，让就绪事件与 verification/外部工具降级在任务开始即生效
+        try:
+            self._docker_client.images.get(self.config.image)
+        except Exception as e:
+            logger.warning(
+                f"❌ Sandbox image not ready: {self.config.image} "
+                f"({type(e).__name__}: {e})"
+            )
+            self._docker_client = None
+            self._initialized = False
+            self._init_error = (
+                f"沙箱镜像不存在: {self.config.image}"
+                f"（本地未找到该镜像且未自动拉取；{type(e).__name__}: {str(e)}）"
+            )
+            return
+
+        self._initialized = True
+        self._init_error = None
+        logger.info("✅ Docker sandbox manager initialized successfully")
     
     @property
     def is_available(self) -> bool:

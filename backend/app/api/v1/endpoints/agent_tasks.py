@@ -716,7 +716,28 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             # Init progress: set status to INITIALIZING so frontend shows progress
             task.status = AgentTaskStatus.INITIALIZING
             await db.commit()
-            await event_emitter.emit_info("Docker sandbox ready", metadata={"init_step": "Docker sandbox", "init_status": "done"})
+            # 沙箱就绪真实检查：is_available 已包含 daemon 可达 + 镜像存在双重判定
+            # （SandboxManager.initialize 镜像预检）。不可用时发 failed 事件并附诊断，
+            # 任务不中断——verification/外部工具内部已有 Docker 不可用降级路径。
+            if sandbox_manager.is_available:
+                await event_emitter.emit_info(
+                    "Docker sandbox ready",
+                    metadata={"init_step": "Docker sandbox", "init_status": "done"},
+                )
+            else:
+                _sandbox_diagnosis = sandbox_manager.get_diagnosis()
+                logger.warning(
+                    f"🐳 Sandbox not available for task {task_id}: {_sandbox_diagnosis}"
+                )
+                await event_emitter.emit_warning(
+                    f"沙箱不可用（{_sandbox_diagnosis}），任务继续但漏洞沙箱验证将不可用",
+                    metadata={
+                        "init_step": "Docker sandbox",
+                        "init_status": "failed",
+                        "diagnosis": _sandbox_diagnosis,
+                        "image": settings.SANDBOX_IMAGE,
+                    },
+                )
 
             resume_state = None
             if resume_checkpoint_id:
