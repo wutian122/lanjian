@@ -78,3 +78,7 @@ test-results/
 
 # spec-superflow change directories (workflow artifacts, not committed)
 changes/
+
+# OpenSpec 变更产物入库（R16/R27）
+!openspec/changes/
+!openspec/changes/**
