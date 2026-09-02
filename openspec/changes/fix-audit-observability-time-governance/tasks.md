@@ -53,7 +53,7 @@
 
 ## Phase 3: 时间治理与沙箱预检
 
-- [ ] **Task 5 完成**
+- [x] **Task 5 完成**（commit 988fd9e，review CLEAN——调用点零绕过亲验、软停矛盾数学消除、变异检查有效；Minor 记账：①spec Scenario 3 的 metadata 以 reason 文本承载（归档前 spec 补措辞，与 Task 4 semgrep 说明同批）；②被拒调度仍占 _dispatched_tasks 计数（既有行为，记 C 变更观察））
 - [ ] **Task 6 完成**
 
 ### Task 5: 类型化拒发新调度阈值
