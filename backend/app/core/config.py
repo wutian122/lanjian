@@ -112,8 +112,13 @@ class Settings(BaseSettings):
     # fix-audit-time-budget-2026-08: 任务时间预算治理阈值（秒）
     TIME_BUDGET_HARD_FLOOR_SECONDS: int = 60   # 主循环剩余预算硬阈值：低于即停止发起新轮次并收口
     TIME_BUDGET_SOFT_STOP_SECONDS: int = 180   # 软停止阈值：低于即请求 in-flight analysis 立即交卷
-    TIME_BUDGET_MIN_DISPATCH_SECONDS: int = 30  # 剩余低于该值不再发起新的子 Agent 调度
+    TIME_BUDGET_MIN_DISPATCH_SECONDS: int = 30  # 剩余低于该值不再发起新的子 Agent 调度（旧统一阈值，已被下方类型化阈值取代，保留供 .env 兼容）
     TIME_BUDGET_GRACE_SECONDS: int = 45  # watchdog 触发后给编排器优雅收口的宽限
+    # fix-audit-observability-time-governance Task 5: 类型化拒发阈值——
+    # 剩余预算 <= 该类型最小有效工作时长时拒发新调度（消除"派发即软停"的无效派发）
+    TIME_BUDGET_MIN_EFFECTIVE_ANALYSIS: int = 300     # analysis 最小有效工作时长（秒）
+    TIME_BUDGET_MIN_EFFECTIVE_VERIFICATION: int = 300  # verification 最小有效工作时长（秒，PoC 验证耗时长）
+    TIME_BUDGET_MIN_EFFECTIVE_RECON: int = 120        # recon 最小有效工作时长（秒，侦察较轻量）；未知类型保守取 300
 
     # 鍚凩LM鎻愪緵鍟嗙殑API Key閰嶇疆锛堝吋瀹瑰崟鐙厤缃級
     OPENAI_API_KEY: Optional[str] = None
