@@ -405,6 +405,25 @@ class AnalysisAgent(BaseAgent):
     
 
     
+    async def _warn_truncated_final_answer(
+        self, findings_count: int, context: str = "Final Answer"
+    ) -> None:
+        """截断轮 Final Answer 统一归因（fix-audit-observability-time-governance Task 2）。
+
+        json-repair 会把半截 findings JSON 修成含部分 findings（或空 findings）的合法
+        dict，绕过"无 findings 键"告警分支造成静默回落。只要本轮来自
+        finish_reason=length，无论解析结果如何都发 warning 事件 + 容器日志。
+        """
+        if not getattr(self, "_last_llm_truncated", False):
+            return
+        if findings_count:
+            detail = f"已产出 {findings_count} 条 findings（尾部可能丢失）"
+        else:
+            detail = "解析失败或 findings 为空"
+        msg = f"[{self.name}] {context} 疑因 max_tokens 截断而不完整：{detail}"
+        logger.warning(msg)
+        await self.emit_event("warning", msg)
+
     async def _run_forced_summary(self, all_findings: list) -> list:
         """强制总结：轮次耗尽或软停止交卷时，让 LLM 立即输出 Final Answer 汇总发现。
 
@@ -461,10 +480,15 @@ Final Answer:""",
                     default={"findings": [], "summary": ""}
                 )
                 if "findings" in parsed_result and isinstance(parsed_result["findings"], list):
+                    summary_findings = parsed_result["findings"]
                     if all_findings:
-                        all_findings.extend(parsed_result["findings"])
+                        all_findings.extend(summary_findings)
                     else:
-                        all_findings = parsed_result["findings"]
+                        all_findings = summary_findings
+                    # 强制总结轮同样可能被 max_tokens 截断，统一归因
+                    await self._warn_truncated_final_answer(
+                        len(summary_findings), context="强制总结 Final Answer"
+                    )
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to generate summary: {e}")
         return all_findings
@@ -766,16 +790,12 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                                 f"发现 {finding.get('severity', 'medium')} 级别漏洞: {finding.get('title', 'Unknown')}"
                             )
                     else:
-                        # 截断归因：上一轮 finish_reason=length 时 Final Answer 常被切断导致无 findings
-                        truncation_hint = (
-                            "（疑似 max_tokens 截断）"
-                            if getattr(self, "_last_llm_truncated", False) else ""
-                        )
-                        logger.warning(
-                            f"[{self.name}] Final Answer has no 'findings' key or is None: "
-                            f"{step.final_answer}{truncation_hint}"
-                        )
-                    
+                        logger.warning(f"[{self.name}] Final Answer has no 'findings' key or is None: {step.final_answer}")
+
+                    # 截断归因统一入口：json-repair 可能把半截 findings 修成部分/空
+                    # findings 走 if 分支静默，故无论解析结果如何，截断轮都在此归因
+                    await self._warn_truncated_final_answer(len(all_findings))
+
                     # 🔥 记录工作完成
                     self.record_work(f"完成安全分析，发现 {len(all_findings)} 个潜在漏洞")
                     

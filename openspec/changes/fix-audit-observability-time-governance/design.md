@@ -23,6 +23,8 @@
 
 **设计**：
 - `BaseAgent.stream_llm_call` 的 done 块读取 `chunk.get("finish_reason")`；`=="length"` 时：`await self.emit_event("warning", ...)`（含 agent 名/迭代号/max_tokens 值）+ 在 `_conversation_history` 追加一条 system 提示（"上一轮输出被 max_tokens 截断，请压缩输出或分批输出"）
+- 角色决策：追加进 `_conversation_history` 的提示消息 role 取 **user** 而非 system——各 Agent ReAct 循环中既有系统注入（空响应重试、强制总结指令）全部以 user 角色追加，保持一致且避免部分模型/网关对多 system 消息的兼容问题；提示正文以"（系统提示：…）"前缀标明其系统来源
+- 归因入口：截断标志 `self._last_llm_truncated` 在 Analysis 的 is_final 分支统一消费（json-repair 会把半截 findings JSON 修成含部分/空 findings 的合法 dict 绕过"无 findings 键"分支，故不能只挂解析失败 else 分支）；`_run_forced_summary` 强制总结轮同样接入；归因走 emit_event warning + 容器日志双通道
 - 返回签名不变（`(output, tokens)`），截断标志挂 `self._last_llm_truncated`（ Final Answer 解析失败路径可读取并在 warning 中归因"疑似截断"）
 
 ### 3. 类型化拒发新调度阈值
