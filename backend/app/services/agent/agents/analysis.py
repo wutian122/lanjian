@@ -405,6 +405,144 @@ class AnalysisAgent(BaseAgent):
     
 
     
+    # ============ 原生 tools 协议（structured-output-protocol Task 8）============
+    # Final Answer 即工具调用：能力探测 tools=True 时，决策轮携带 submit_findings
+    # 工具定义（参数 = findings JSON Schema，与文本协议 Final Answer 契约一致）；
+    # 模型调用该工具 = 宣布分析完成，function.arguments 由服务端 tool-call-parser
+    # 保证合法 JSON，直接作为 final_answer——不再依赖 "Final Answer: 文本 + json-repair"
+    # （文本协议路径原样保留为降级共存，spec llm-structured-output 第二/三 Requirement）。
+
+    def _build_findings_schema(self) -> Dict[str, Any]:
+        """findings 报告 JSON Schema（submit_findings 参数与 guided response_format 共用）。
+
+        字段与系统提示词 "Final Answer 格式" 契约逐项对应。file_path/source/sink
+        允许空串（非污点类发现/路径待回填场景），不列入 item required；其余契约
+        字段强制存在，guided 解码下模型必须填值，消除文本协议的缺字段/截断归零。
+        """
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "整体分析总结（分析过程、覆盖范围、风险概览）",
+                },
+                "findings": {
+                    "type": "array",
+                    "description": "发现的安全漏洞列表；未发现漏洞时为空数组",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "vulnerability_type": {
+                                "type": "string",
+                                "enum": [
+                                    "sql_injection", "xss", "command_injection",
+                                    "path_traversal", "ssrf", "hardcoded_secret",
+                                    "other",
+                                ],
+                                "description": "漏洞类型",
+                            },
+                            "severity": {
+                                "type": "string",
+                                "enum": ["critical", "high", "medium", "low"],
+                                "description": "严重程度",
+                            },
+                            "title": {"type": "string", "description": "漏洞标题"},
+                            "description": {
+                                "type": "string",
+                                "description": "漏洞详细描述（污点流、触发条件、影响）",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "漏洞所在文件路径（必须为实际读取过的文件）",
+                            },
+                            "line_start": {"type": "integer", "description": "漏洞起始行号"},
+                            "code_snippet": {"type": "string", "description": "相关危险代码片段"},
+                            "source": {"type": "string", "description": "污点来源（用户可控输入）"},
+                            "sink": {"type": "string", "description": "危险汇聚点（危险函数/调用）"},
+                            "suggestion": {"type": "string", "description": "修复建议"},
+                            "confidence": {"type": "number", "description": "置信度 0.0-1.0"},
+                            "needs_verification": {
+                                "type": "boolean",
+                                "description": "是否需要沙箱动态验证",
+                            },
+                        },
+                        "required": [
+                            "vulnerability_type", "severity", "title", "description",
+                            "file_path", "line_start", "code_snippet", "suggestion",
+                            "confidence", "needs_verification",
+                        ],
+                    },
+                },
+            },
+            "required": ["findings", "summary"],
+        }
+
+    def _build_submit_findings_tool_def(self) -> Dict[str, Any]:
+        """submit_findings 工具定义：调用它即提交 Final Answer 并结束分析。
+
+        不传 tool_choice（与 Task 7 Orchestrator 一致）：模型可自由选择工具调用或
+        文本 Final Answer；"禁止无工具直接交卷"是系统提示词约束而非代码门禁——
+        submit_findings 本身就是一次工具调用，满足"先 Action 后 Final"语义。
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": "submit_findings",
+                "description": (
+                    "提交安全分析的最终漏洞报告并结束分析。仅在已使用扫描/读文件等"
+                    "工具完成代码审计后调用；参数即最终漏洞报告 JSON，字段与 Final "
+                    "Answer 契约一致。未发现漏洞时 findings 传空数组并在 summary 说明。"
+                ),
+                "parameters": self._build_findings_schema(),
+            },
+        }
+
+    def _build_findings_response_format(self) -> Dict[str, Any]:
+        """强制总结轮 guided json_schema 约束（该轮为纯 JSON 输出，无工具调用）。"""
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "analysis_findings",
+                "schema": self._build_findings_schema(),
+            },
+        }
+
+    def _final_step_from_tool_calls(
+        self, tool_calls: Optional[List[Dict[str, Any]]]
+    ) -> Optional[AnalysisStep]:
+        """tool_calls 响应映射为 Final Answer 步骤（与文本协议 _parse_llm_response 对等）。
+
+        仅 submit_findings 视为终态：function.arguments 由服务端 tool-call-parser
+        保证合法 JSON，直接 json.loads 作为 final_answer（不走 json-repair）。
+        其他函数名 / 坏 JSON / 非对象参数 → None，调用方降级文本解析路径
+        （同轮混合形态 tool_calls 优先，Task 7 边界）。
+        """
+        if not tool_calls:
+            return None
+        call = tool_calls[0] or {}
+        name = str(call.get("name") or "").strip()
+        if name != "submit_findings":
+            return None
+        arguments = call.get("arguments")
+        if isinstance(arguments, dict):
+            parsed: Any = arguments
+        elif isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        # 与文本路径同构：findings 过滤非字典项
+        if isinstance(parsed.get("findings"), list):
+            parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
+        step = AnalysisStep(thought="")
+        step.is_final = True
+        step.final_answer = parsed
+        return step
+
     async def _warn_truncated_final_answer(
         self, findings_count: int, context: str = "Final Answer"
     ) -> None:
@@ -464,8 +602,18 @@ Final Answer:""",
         })
 
         try:
+            # structured-output-protocol Task 8：强制总结轮为纯 JSON 一次性输出
+            # （无工具调用）——guided_json 可用时注入 findings schema 的
+            # response_format，输出严格合法 JSON；不可用/未探测时不传，维持
+            # 提示词约束 + json-repair 兜底现状。
+            summary_response_format = None
+            backend_caps = getattr(self.llm_service, "backend_capabilities", None)
+            if backend_caps is not None and getattr(backend_caps, "guided_json", False):
+                summary_response_format = self._build_findings_response_format()
+
             summary_output, _ = await self.stream_llm_call(
                 self._conversation_history,
+                response_format=summary_response_format,
                 # 🔥 不传递 temperature 和 max_tokens，使用用户配置
             )
 
@@ -703,21 +851,38 @@ Final Answer:""",
                     await self.emit_thinking("🛑 任务已取消，停止执行")
                     break
                 
+                # structured-output-protocol Task 8：能力探测 tools=True 时每轮携带
+                # submit_findings 工具定义（Final Answer 即工具调用）；不可用/未探测
+                # （backend_capabilities 为 None）时不传，走 ReAct 文本协议（json-repair
+                # 兜底保留）。主循环不注入 response_format——中间轮保持工具调用形态，
+                # Final Answer 的结构化约束由 submit_findings 参数 schema 承担；
+                # guided response_format 仅用于强制总结轮（_run_forced_summary）。
+                analysis_tools = None
+                backend_caps = getattr(self.llm_service, "backend_capabilities", None)
+                if backend_caps is not None and getattr(backend_caps, "tools", False):
+                    analysis_tools = [self._build_submit_findings_tool_def()]
+
                 # 调用 LLM 进行思考和决策（流式输出）
                 # 🔥 使用用户配置的 temperature 和 max_tokens
                 try:
                     llm_output, tokens_this_round = await self.stream_llm_call(
                         self._conversation_history,
+                        tools=analysis_tools,
                         # 🔥 不传递 temperature 和 max_tokens，使用用户配置
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
                     break
-                
+
                 self._total_tokens += tokens_this_round
 
+                # Task 8：本轮是否为原生 tool_calls 响应（done chunk 聚合结果）。
+                # 同轮混合形态（正文 + tool_calls）tool_calls 优先（Task 7 边界）。
+                tool_calls_this_round = getattr(self, "_last_tool_calls", None)
+
                 # 🔥 Enhanced: Handle empty LLM response with better diagnostics
-                if not llm_output or not llm_output.strip():
+                # tool_calls 形态正文为空属正常（arguments 在 tool_calls 中），不判空
+                if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     empty_retry_count = getattr(self, '_empty_retry_count', 0) + 1
                     self._empty_retry_count = empty_retry_count
                     
@@ -756,8 +921,15 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 # 重置空响应计数器
                 self._empty_retry_count = 0
 
-                # 解析 LLM 响应
-                step = self._parse_llm_response(llm_output)
+                # 解析 LLM 响应（Task 8 双形态）
+                # tool_calls 优先：submit_findings 的 arguments 由服务端 tool-call-parser
+                # 保证合法 JSON，直接作为 final_answer（不走 json-repair）；坏 JSON/未知
+                # 函数名 → None，降级文本解析（Final Answer: 文本 + json-repair 兜底保留）
+                step = None
+                if tool_calls_this_round:
+                    step = self._final_step_from_tool_calls(tool_calls_this_round)
+                if step is None:
+                    step = self._parse_llm_response(llm_output)
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示安全分析的思考过程
@@ -765,9 +937,18 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     await self.emit_llm_thought(step.thought, iteration + 1)
                 
                 # 添加 LLM 响应到历史
+                if tool_calls_this_round and step is not None and step.is_final:
+                    # Task 8：submit_findings 形态合成 Final Answer 文本入历史——多轮
+                    # 历史与文本协议自洽，避免 assistant 空 content 在 tools 模式下
+                    # 造成后端对话状态混乱（同 Task 7 orchestrator 历史合成）
+                    history_content = (
+                        "Final Answer: " + json.dumps(step.final_answer, ensure_ascii=False)
+                    )
+                else:
+                    history_content = llm_output
                 self._conversation_history.append({
                     "role": "assistant",
-                    "content": llm_output,
+                    "content": history_content,
                 })
                 
                 # 检查是否完成

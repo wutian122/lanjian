@@ -108,7 +108,7 @@ def _end_accumulated(agent, event_type):
 
 def _mixed_stream():
     """新协议后端：先思考后正文，chunk 带 kind + 双累计键（Task 3 adapter 形态）。"""
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {
             "type": "token", "kind": "reasoning", "content": "思",
             "accumulated": "思", "accumulated_content": "", "accumulated_reasoning": "思",
@@ -134,7 +134,7 @@ def _mixed_stream():
 
 def _legacy_stream():
     """旧后端/NATIVE_ONLY 伪流式：chunk 无 kind，token 全量走思考流（Task 4 前形态）。"""
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "token", "content": "混", "accumulated": "混"}
         yield {"type": "token", "content": "合", "accumulated": "混合"}
         yield {

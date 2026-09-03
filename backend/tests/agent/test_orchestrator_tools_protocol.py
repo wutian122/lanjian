@@ -197,7 +197,7 @@ async def test_stream_llm_call_passes_tools_and_exposes_tool_calls():
     """tools 参数透传至 chat_completion_stream；done 的 tool_calls 暴露到 _last_tool_calls。"""
     captured = {}
 
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         captured["tools"] = tools
         yield {"type": "token", "kind": "content", "content": "ok",
                "accumulated": "ok", "accumulated_content": "ok", "accumulated_reasoning": ""}
@@ -226,7 +226,7 @@ async def test_stream_llm_call_passes_tools_and_exposes_tool_calls():
 async def test_stream_llm_call_resets_tool_calls_each_round():
     """每轮调用开始时 _last_tool_calls 重置：上一轮的 tool_calls 不得泄漏到文本轮。"""
 
-    async def _gen_text(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen_text(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         captured["tools"] = tools
         yield {"type": "token", "content": "混", "accumulated": "混"}
         yield {"type": "done", "content": "混合",

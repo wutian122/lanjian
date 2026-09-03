@@ -791,6 +791,161 @@ class VerificationAgent(BaseAgent):
 
         return step
     
+    # ============ 原生 tools 协议（structured-output-protocol Task 8）============
+    # Final Answer 即工具调用：能力探测 tools=True 时，决策轮携带 submit_findings
+    # 工具定义（参数 = 验证报告 JSON Schema，与文本协议 Final Answer 契约一致）；
+    # 模型调用该工具 = 宣布验证完成，function.arguments 由服务端 tool-call-parser
+    # 保证合法 JSON，直接作为 final_answer——不再依赖 "Final Answer: 文本 +
+    # json-repair"（文本协议路径原样保留为降级共存）。沙箱门禁消费的
+    # step.final_answer 与文本形态同构（verdict/sandbox_skip_reason 等字段不变），
+    # 门禁拒绝/放行语义在工具形态下完全一致。
+
+    def _build_findings_schema(self) -> Dict[str, Any]:
+        """验证报告 JSON Schema（submit_findings 参数，搬运系统提示词 Final Answer 契约）。"""
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "object",
+                    "description": "验证结果统计",
+                    "properties": {
+                        "total": {"type": "integer", "description": "验证发现总数（与输入发现数一致）"},
+                        "confirmed": {"type": "integer", "description": "确认漏洞数"},
+                        "likely": {"type": "integer", "description": "高度可能数"},
+                        "false_positive": {"type": "integer", "description": "误报数"},
+                    },
+                    "required": ["total", "confirmed", "likely", "false_positive"],
+                },
+                "findings": {
+                    "type": "array",
+                    "description": "每个输入发现对应一条验证结果，数量与输入完全一致",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "与输入发现完全一致的文件路径（逐字匹配）",
+                            },
+                            "line_start": {"type": "integer", "description": "与输入发现一致的行号"},
+                            "vulnerability_type": {"type": "string", "description": "漏洞类型（原始字段）"},
+                            "severity": {"type": "string", "description": "严重程度（原始字段）"},
+                            "title": {"type": "string", "description": "漏洞标题（原始字段）"},
+                            "description": {"type": "string", "description": "漏洞描述（原始字段）"},
+                            "code_snippet": {"type": "string", "description": "相关代码片段（原始字段）"},
+                            "verdict": {
+                                "type": "string",
+                                "enum": [
+                                    "confirmed", "likely", "uncertain",
+                                    "false_positive", "not_reproducible", "needs_context",
+                                ],
+                                "description": "验证判定（沙箱 PoC 触发漏洞行为即 confirmed）",
+                            },
+                            "confidence": {"type": "number", "description": "置信度 0.0-1.0"},
+                            "is_verified": {"type": "boolean", "description": "是否已完成验证"},
+                            "verification_method": {"type": "string", "description": "验证方法描述"},
+                            "verification_details": {"type": "string", "description": "验证过程和结果详情"},
+                            "poc": {
+                                "type": "object",
+                                "description": "PoC（误报/无法复现时可省略）",
+                                "properties": {
+                                    "description": {"type": "string", "description": "PoC 描述"},
+                                    "steps": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "复现步骤",
+                                    },
+                                    "payload": {"type": "string", "description": "完整可执行的 PoC 代码或命令"},
+                                    "harness_code": {"type": "string", "description": "Fuzzing Harness 代码（如使用）"},
+                                },
+                                "required": ["description", "steps", "payload"],
+                            },
+                            "impact": {"type": "string", "description": "实际影响分析"},
+                            "recommendation": {"type": "string", "description": "修复建议"},
+                            "sandbox_skip_reason": {
+                                "type": "string",
+                                "description": "无法沙箱验证的原因（如需运行外部服务）；标注后门禁按已说明放行",
+                            },
+                            "sandbox_attempts": {
+                                "type": "array",
+                                "description": "沙箱执行尝试记录（系统也会自动回填运行时证据）",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "success": {"type": "boolean"},
+                                        "exit_code": {"type": "integer"},
+                                        "command": {"type": "string"},
+                                        "evidence_summary": {"type": "string"},
+                                        "target_ref": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                        "required": [
+                            "file_path", "line_start", "verdict", "confidence",
+                            "is_verified", "verification_method", "verification_details",
+                        ],
+                    },
+                },
+            },
+            "required": ["findings", "summary"],
+        }
+
+    def _build_submit_findings_tool_def(self) -> Dict[str, Any]:
+        """submit_findings 工具定义：调用它即提交验证 Final Answer 并结束验证。
+
+        不传 tool_choice（与 Task 7 一致）。沙箱证据门禁在调用后照常执行
+        （无沙箱成功且无 sandbox_skip_reason 仍会被拒绝并要求继续验证）。
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": "submit_findings",
+                "description": (
+                    "提交最终验证报告并结束验证。仅在完成沙箱验证（或为无法沙箱验证"
+                    "的发现标注 sandbox_skip_reason）后调用；参数即验证报告 JSON，"
+                    "findings 数量与输入发现完全一致，file_path/line_start 逐字匹配。"
+                ),
+                "parameters": self._build_findings_schema(),
+            },
+        }
+
+    def _final_step_from_tool_calls(
+        self, tool_calls: Optional[List[Dict[str, Any]]]
+    ) -> Optional[VerificationStep]:
+        """tool_calls 响应映射为 Final Answer 步骤（与文本协议 _parse_llm_response 对等）。
+
+        仅 submit_findings 视为终态：function.arguments 由服务端 tool-call-parser
+        保证合法 JSON，直接 json.loads 作为 final_answer（不走 json-repair），
+        下游沙箱门禁/skip_reason 统计/归一化消费的字段与文本形态同构。
+        其他函数名 / 坏 JSON / 非对象参数 → None，调用方降级文本解析路径
+        （同轮混合形态 tool_calls 优先，Task 7 边界）。
+        """
+        if not tool_calls:
+            return None
+        call = tool_calls[0] or {}
+        name = str(call.get("name") or "").strip()
+        if name != "submit_findings":
+            return None
+        arguments = call.get("arguments")
+        if isinstance(arguments, dict):
+            parsed: Any = arguments
+        elif isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        # 与文本路径同构：findings 过滤非字典项
+        if isinstance(parsed.get("findings"), list):
+            parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
+        step = VerificationStep(thought="")
+        step.is_final = True
+        step.final_answer = parsed
+        return step
+
     async def run(self, input_data: Dict[str, Any]) -> AgentResult:
         """
         执行漏洞验证 - LLM 全程参与！
@@ -1089,20 +1244,35 @@ class VerificationAgent(BaseAgent):
                     await self.emit_thinking(f"🚨 最终警告: 第{self._iteration}轮仍无sandbox_exec")
                     self._conversation_history.append({"role": "user", "content": force_msg})
 
+                # structured-output-protocol Task 8：能力探测 tools=True 时每轮携带
+                # submit_findings 工具定义（Final Answer 即工具调用）；不可用/未探测
+                # （backend_capabilities 为 None）时不传，走 ReAct 文本协议（json-repair
+                # 兜底保留）。主循环不注入 response_format（中间轮保持工具调用形态）。
+                verification_tools = None
+                backend_caps = getattr(self.llm_service, "backend_capabilities", None)
+                if backend_caps is not None and getattr(backend_caps, "tools", False):
+                    verification_tools = [self._build_submit_findings_tool_def()]
+
                 # 调用 LLM 进行思考和决策（流式输出）
                 try:
                     llm_output, tokens_this_round = await self.stream_llm_call(
                         self._conversation_history,
+                        tools=verification_tools,
                         # 🔥 不传递 temperature 和 max_tokens，使用用户配置
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
                     break
-                
+
                 self._total_tokens += tokens_this_round
 
+                # Task 8：本轮是否为原生 tool_calls 响应（done chunk 聚合结果）。
+                # 同轮混合形态（正文 + tool_calls）tool_calls 优先（Task 7 边界）。
+                tool_calls_this_round = getattr(self, "_last_tool_calls", None)
+
                 # 🔥 Handle empty LLM response to prevent loops
-                if not llm_output or not llm_output.strip():
+                # tool_calls 形态正文为空属正常（arguments 在 tool_calls 中），不判空
+                if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     logger.warning(f"[{self.name}] Empty LLM response in iteration {self._iteration}")
                     await self.emit_llm_decision("收到空响应", "LLM 返回内容为空，尝试重试通过提示")
                     self._conversation_history.append({
@@ -1111,8 +1281,15 @@ class VerificationAgent(BaseAgent):
                     })
                     continue
 
-                # 解析 LLM 响应
-                step = self._parse_llm_response(llm_output)
+                # 解析 LLM 响应（Task 8 双形态）
+                # tool_calls 优先：submit_findings 的 arguments 由服务端 tool-call-parser
+                # 保证合法 JSON，直接作为 final_answer（不走 json-repair）；坏 JSON/未知
+                # 函数名 → None，降级文本解析（Final Answer: 文本 + json-repair 兜底保留）
+                step = None
+                if tool_calls_this_round:
+                    step = self._final_step_from_tool_calls(tool_calls_this_round)
+                if step is None:
+                    step = self._parse_llm_response(llm_output)
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示验证的思考过程
@@ -1120,9 +1297,18 @@ class VerificationAgent(BaseAgent):
                     await self.emit_llm_thought(step.thought, iteration + 1)
                 
                 # 添加 LLM 响应到历史（V6 B5：assistant 输出同样过截断 + 压缩检查）
+                if tool_calls_this_round and step is not None and step.is_final:
+                    # Task 8：submit_findings 形态合成 Final Answer 文本入历史——门禁
+                    # 拒绝交卷并继续循环时，模型能看到自己上一轮的报告；同时避免
+                    # assistant 空 content 在 tools 模式下造成后端对话状态混乱
+                    raw_history_content = (
+                        "Final Answer: " + json.dumps(step.final_answer, ensure_ascii=False)
+                    )
+                else:
+                    raw_history_content = llm_output
                 self._conversation_history.append({
                     "role": "assistant",
-                    "content": self._truncate_observation_for_history(llm_output),
+                    "content": self._truncate_observation_for_history(raw_history_content),
                 })
                 self._compress_history_if_needed()
                 

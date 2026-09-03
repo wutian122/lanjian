@@ -50,7 +50,7 @@ async def test_rate_limiter_consumes_token_on_call():
     limiter = get_llm_rate_limiter()
     before = limiter.available_tokens
 
-    async def _ok(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _ok(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "done", "content": "ok", "usage": {"total_tokens": 10}}
 
     agent = _make_agent(_ok)
@@ -65,7 +65,7 @@ async def test_circuit_records_success_on_normal_call():
     circuit = get_llm_circuit()
     assert circuit.stats.successful_calls == 0
 
-    async def _ok(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _ok(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "done", "content": "ok", "usage": {"total_tokens": 5}}
 
     agent = _make_agent(_ok)
@@ -79,7 +79,7 @@ async def test_circuit_records_success_on_normal_call():
 async def test_circuit_records_failure_on_critical_error():
     circuit = get_llm_circuit()
 
-    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "error", "error_type": "connection", "error": "refused",
                "user_message": "conn failed", "accumulated": ""}
 
@@ -95,7 +95,7 @@ async def test_circuit_opens_after_threshold_and_rejects():
     circuit = get_llm_circuit()
     threshold = circuit.config.failure_threshold
 
-    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "error", "error_type": "connection", "error": "refused",
                "user_message": "conn failed", "accumulated": ""}
 

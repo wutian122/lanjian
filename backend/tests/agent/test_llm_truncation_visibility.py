@@ -58,7 +58,7 @@ def _make_agent(stream_fn, max_tokens=8192):
 
 
 def _stream_factory(text, finish_reason):
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "token", "content": text, "accumulated": text}
         yield {
             "type": "done",
@@ -184,7 +184,7 @@ async def test_intermediate_round_truncation_hint_reaches_next_round():
     # 下一轮：finish_reason=stop
     seen = {}
 
-    async def _stop_stream(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _stop_stream(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         seen["messages"] = messages
         yield {
             "type": "done",
@@ -277,7 +277,7 @@ def _make_analysis_with_real_stream(stream_fn):
 
 
 def _analysis_stream(text, finish_reason):
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "token", "content": text, "accumulated": text}
         yield {
             "type": "done",

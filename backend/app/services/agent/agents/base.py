@@ -1116,6 +1116,7 @@ class BaseAgent(ABC):
         max_tokens: Optional[int] = None,
         auto_compress: bool = True,
         tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, int]:
         """
         统一的流式 LLM 调用方法
@@ -1130,6 +1131,9 @@ class BaseAgent(ABC):
             tools: OpenAI function-calling 工具定义（structured-output-protocol
                 Task 7；None=不传，走 ReAct 文本协议）。响应为 tool_calls 形态时
                 聚合结果落到 self._last_tool_calls（每轮重置），供调用方分发
+            response_format: guided json_schema 约束（structured-output-protocol
+                Task 8；None=不传）。仅用于纯 JSON 一次性输出轮（如 Analysis
+                强制总结轮）；中间 ReAct 轮/工具轮不得注入
 
         Returns:
             (完整响应内容, token数量)
@@ -1173,6 +1177,7 @@ class BaseAgent(ABC):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
+                response_format=response_format,
             )
             # 兼容不同版本的 python async generator
             iterator = stream.__aiter__()

@@ -183,7 +183,7 @@ def mock_llm_service():
     }
     _response_text = "Thought: mock analysis complete.\nFinal Answer: " + _json.dumps(_final_answer, ensure_ascii=False)
 
-    async def _mock_stream(messages=None, temperature=None, max_tokens=None, tools=None):
+    async def _mock_stream(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
         yield {"type": "token", "content": _response_text, "accumulated": _response_text}
         yield {"type": "done", "content": _response_text, "usage": {"total_tokens": 100}}
 
