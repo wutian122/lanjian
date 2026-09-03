@@ -125,7 +125,16 @@ class LLMService:
             
             # 🔥 Max Tokens 优先级：用户配置 > 环境变量
             max_tokens = user_llm_config.get('llmMaxTokens') or int(getattr(settings, 'LLM_MAX_TOKENS', 4096))
-            
+
+            # 🔥 Repetition Penalty 优先级：用户配置 > 环境变量
+            # （structured-output-protocol 层次 6：默认 1.15，压制 thinking 模型
+            # 退化重复循环；适配器层集中注入 extra_body，SGLang/vLLM 接受）
+            repetition_penalty = (
+                user_llm_config.get('repetitionPenalty')
+                if user_llm_config.get('repetitionPenalty') is not None
+                else float(getattr(settings, 'LLM_REPETITION_PENALTY', 1.15))
+            )
+
             self._config = LLMConfig(
                 provider=provider,
                 api_key=api_key,
@@ -135,8 +144,26 @@ class LLMService:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 frequency_penalty=float(getattr(settings, 'LLM_FREQUENCY_PENALTY', 1.2)),
+                repetition_penalty=repetition_penalty,
             )
         return self._config
+
+    def sampling_params_summary(self) -> Dict[str, Any]:
+        """任务启动采样参数摘要（structured-output-protocol 层次 6 / spec llm-call-params：
+        「调用参数变更 SHALL 全链路可追溯」）。
+
+        任务启动能力探测事件以 info 事件 metadata（llm_params）挂载本摘要，
+        容器日志同步记录；用户可从事件流确认当次任务实际生效的参数组合。
+        guided_style/后端能力探测结果在事件 metadata 的 backend_capabilities 中。
+        """
+        cfg = self.config
+        return {
+            "provider": cfg.provider.value,
+            "model": cfg.model,
+            "temperature": cfg.temperature,
+            "repetition_penalty": cfg.repetition_penalty,
+            "max_tokens": cfg.max_tokens,
+        }
     
     def _get_provider_api_key_from_user_config(self, provider: LLMProvider, user_llm_config: Dict[str, Any]) -> Optional[str]:
         """从用户配置中获取平台专属API Key"""

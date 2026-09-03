@@ -883,16 +883,32 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             try:
                 caps = await llm_service.get_backend_capabilities()
                 caps_summary = caps.capabilities_summary()
+                # structured-output-protocol 层次 6（spec llm-call-params）：采样参数
+                # 全链路可追溯——temperature/repetition_penalty/max_tokens 摘要随
+                # 探测事件落事件流（guided_style/后端类型在 backend_capabilities 内），
+                # 容器日志同步记录。
+                llm_params = llm_service.sampling_params_summary()
+                logger.info(
+                    f"[LLMParams] 任务启动采样参数: {llm_params}, "
+                    f"guided_style={caps.guided_style}, backend_hint={caps.backend_hint}"
+                )
+                probe_metadata = {
+                    "backend_capabilities": caps_summary,
+                    "llm_params": llm_params,
+                }
                 if caps.probe_error and not (caps.tools or caps.guided_json):
                     await event_emitter.emit_warning(
                         f"后端能力探测失败，降级 ReAct 文本协议（{caps.probe_error}）",
-                        metadata={"backend_capabilities": caps_summary},
+                        metadata=probe_metadata,
                     )
                 else:
                     await event_emitter.emit_info(
                         f"后端能力探测完成：tools={caps.tools}，guided_json={caps.guided_json}"
-                        f"（{caps.guided_style or '无 guided'}，耗时 {caps.elapsed_ms}ms）",
-                        metadata={"backend_capabilities": caps_summary},
+                        f"（{caps.guided_style or '无 guided'}，耗时 {caps.elapsed_ms}ms）"
+                        f"；采样参数 temperature={llm_params['temperature']}，"
+                        f"repetition_penalty={llm_params['repetition_penalty']}，"
+                        f"max_tokens={llm_params['max_tokens']}",
+                        metadata=probe_metadata,
                     )
             except Exception as probe_err:
                 logger.warning(f"[CapabilityProbe] 能力探测异常，降级文本协议: {probe_err}")

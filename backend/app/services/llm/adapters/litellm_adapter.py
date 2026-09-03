@@ -394,6 +394,27 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         return None
 
+    def _merge_config_sampling_params(
+        self, extra_params: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """合并请求级 extra_params 与配置级采样参数（structured-output-protocol 层次 6）。
+
+        repetition_penalty（用户配置 llmConfig.repetitionPenalty > settings
+        .LLM_REPETITION_PENALTY，默认 1.15）集中在适配器层注入：Service/Agent
+        调用方无需显式传 extra_params，三条出站路径（litellm 非流式/流式、
+        native openai）对端点呈现的请求体一致——litellm 经 custom_httpx 把
+        extra_body 合并进 HTTP body（drop_params 不丢弃），native 经 openai
+        SDK 的 extra_body 同样合并进 body 顶层；不支持该参数的后端按 OpenAI
+        兼容行为自行忽略。请求级 extra_params 显式值优先（setdefault）。
+        config.repetition_penalty 为 None（直构配置）时返回仅含请求级参数的
+        dict（可能为空），由调用方决定是否挂 extra_body 键。
+        """
+        merged: Dict[str, Any] = dict(extra_params or {})
+        rp = self.config.repetition_penalty
+        if rp is not None:
+            merged.setdefault("repetition_penalty", rp)
+        return merged
+
     async def _native_openai_call(self, **kwargs: Any):
         """使用原生 OpenAI 客户端直接调用（绕过 LiteLLM）
 
@@ -436,7 +457,9 @@ class LiteLLMAdapter(BaseLLMAdapter):
             params["tools"] = kwargs["tools"]
         if kwargs.get("response_format"):
             params["response_format"] = kwargs["response_format"]
-        extra_body = kwargs.get("extra_body")
+        # 配置级 repetition_penalty 集中注入（与 _send_request 出口幂等双保险——
+        # 直接调用本方法的未来调用方也绕不过）；合并后为空则不挂 extra_body 键。
+        extra_body = self._merge_config_sampling_params(kwargs.get("extra_body"))
         if extra_body:
             params["extra_body"] = extra_body
 
@@ -500,16 +523,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         # 结构化输出协议（structured-output-protocol）：
         # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
-        # extra_params（repetition_penalty 等 provider 特有参数）经 litellm extra_body
-        # 官方透传机制合并进 HTTP body（litellm custom_httpx: data = {**data, **extra_body}），
-        # 不受 drop_params 影响。native 路径（_native_openai_call）同样原样透传 extra_body，
-        # 由 openai SDK 合并进 body——两条路径对端点呈现的请求体一致。
+        # extra_body 经 litellm 官方透传机制合并进 HTTP body（litellm custom_httpx:
+        # data = {**data, **extra_body}），不受 drop_params 影响。层次 6 参数治理：
+        # 配置级 repetition_penalty（默认 1.15）在此集中并入 extra_body，调用方无需
+        # 显式传 extra_params；native 路径（_native_openai_call）出口同样注入，
+        # 两条路径对端点呈现的请求体一致。
         if request.tools:
             kwargs["tools"] = request.tools
         if request.response_format:
             kwargs["response_format"] = request.response_format
-        if request.extra_params:
-            kwargs["extra_body"] = request.extra_params
+        extra_body = self._merge_config_sampling_params(request.extra_params)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         # 设置 API Key
         if self.config.api_key and self.config.api_key != "ollama":
@@ -670,13 +695,15 @@ class LiteLLMAdapter(BaseLLMAdapter):
         }
 
         # 结构化输出协议（structured-output-protocol）：与 _send_request 保持一致，
-        # tools/response_format 为标准参数，extra_params 经 extra_body 透传
+        # tools/response_format 为标准参数；extra_body 透传请求级 extra_params 与
+        # 配置级 repetition_penalty（层次 6 参数治理，集中注入）。
         if request.tools:
             kwargs["tools"] = request.tools
         if request.response_format:
             kwargs["response_format"] = request.response_format
-        if request.extra_params:
-            kwargs["extra_body"] = request.extra_params
+        extra_body = self._merge_config_sampling_params(request.extra_params)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         # 🔥 对于支持的模型，请求在流式输出中包含 usage 信息
         # OpenAI API 支持 stream_options

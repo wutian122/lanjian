@@ -46,7 +46,7 @@ const DEFAULT_MODELS: Record<string, string> = {
 
 interface SystemConfigData {
   llmProvider: string; llmApiKey: string; llmModel: string; llmBaseUrl: string;
-  llmTimeout: number; llmTemperature: number; llmMaxTokens: number;
+  llmTimeout: number; llmTemperature: number; llmMaxTokens: number; repetitionPenalty: number;
   // Agent超时配置
   llmFirstTokenTimeout: number; llmStreamTimeout: number;
   agentTimeout: number; subAgentTimeout: number; toolTimeout: number;
@@ -148,6 +148,7 @@ export function SystemConfig() {
           llmTimeout: llmConfig.llmTimeout || 150000,
           llmTemperature: llmConfig.llmTemperature ?? 0.1,
           llmMaxTokens: llmConfig.llmMaxTokens || 4096,
+          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.15,
           // Agent超时配置
           llmFirstTokenTimeout: llmConfig.llmFirstTokenTimeout || 30,
           llmStreamTimeout: llmConfig.llmStreamTimeout || 60,
@@ -177,7 +178,7 @@ export function SystemConfig() {
         console.warn('[SystemConfig] 后端返回空数据，使用默认配置');
         setConfig({
           llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
-          llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096,
+          llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
           llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
           agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
           githubToken: '', gitlabToken: '', giteaToken: '',
@@ -189,7 +190,7 @@ export function SystemConfig() {
       console.error('Failed to load config:', error);
       setConfig({
         llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
-        llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096,
+        llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
         llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
         agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
         githubToken: '', gitlabToken: '', giteaToken: '',
@@ -310,6 +311,7 @@ export function SystemConfig() {
           llmModel: config.llmModel, llmBaseUrl: config.llmBaseUrl,
           llmTimeout: config.llmTimeout, llmTemperature: config.llmTemperature,
           llmMaxTokens: config.llmMaxTokens,
+          repetitionPenalty: config.repetitionPenalty,
           // Agent超时配置
           llmFirstTokenTimeout: config.llmFirstTokenTimeout,
           llmStreamTimeout: config.llmStreamTimeout,
@@ -337,6 +339,7 @@ export function SystemConfig() {
           llmTimeout: llmConfig.llmTimeout || 150000,
           llmTemperature: llmConfig.llmTemperature ?? 0.1,
           llmMaxTokens: llmConfig.llmMaxTokens || 4096,
+          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.15,
           // Agent超时配置
           llmFirstTokenTimeout: llmConfig.llmFirstTokenTimeout || 30,
           llmStreamTimeout: llmConfig.llmStreamTimeout || 60,
@@ -698,6 +701,19 @@ export function SystemConfig() {
                     className="h-10"
                   />
                   <p className="text-xs text-muted-foreground">单次请求最大输出Token数</p>
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs text-muted-foreground uppercase">重复惩罚 (1.0-2.0)</Label>
+                  <Input
+                    type="number"
+                    step="0.05"
+                    min="1.0"
+                    max="2.0"
+                    value={config.repetitionPenalty}
+                    onChange={(e) => updateConfig('repetitionPenalty', Number(e.target.value))}
+                    className="h-10"
+                  />
+                  <p className="text-xs text-muted-foreground">抑制思考模型退化重复循环（SGLang/vLLM 生效），建议 1.1-1.2</p>
                 </div>
                 <div className="space-y-2">
                   <Label className="text-xs text-muted-foreground uppercase">每分钟请求次数 (RPM)</Label>

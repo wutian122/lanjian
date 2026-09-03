@@ -35,6 +35,11 @@ class LLMConfig:
     top_p: float = 1.0
     frequency_penalty: float = 0
     presence_penalty: float = 0
+    # structured-output-protocol 层次 6：重复惩罚（SGLang/vLLM 接受，经适配器
+    # extra_body 透传；压制 thinking 模型退化重复循环）。None=不注入（直构配置
+    # 与不走 service 回退链的调用方零行为变化）；LLMService 构建时从用户配置
+    # repetitionPenalty 回退 settings.LLM_REPETITION_PENALTY（默认 1.15）。
+    repetition_penalty: Optional[float] = None
     custom_headers: Dict[str, str] = field(default_factory=dict)
 
 

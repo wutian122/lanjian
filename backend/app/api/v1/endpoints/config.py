@@ -141,6 +141,9 @@ class LLMConfigSchema(BaseModel):
     llmTimeout: int | None = None
     llmTemperature: float | None = None
     llmMaxTokens: int | None = None
+    # structured-output-protocol 层次 6：重复惩罚（SGLang/vLLM 接受，经
+    # extra_body 透传；建议 1.1-1.2，默认 settings.LLM_REPETITION_PENALTY=1.15）
+    repetitionPenalty: float | None = None
     llmCustomHeaders: str | None = None
 
     # Agent超时配置
@@ -206,6 +209,8 @@ def get_default_config() -> dict:
             "llmTimeout": settings.LLM_TIMEOUT * 1000,  # 转换为毫秒
             "llmTemperature": settings.LLM_TEMPERATURE,
             "llmMaxTokens": settings.LLM_MAX_TOKENS,
+            # structured-output-protocol 层次 6：重复惩罚默认值（用户可在设置页调整）
+            "repetitionPenalty": settings.LLM_REPETITION_PENALTY,
             "llmCustomHeaders": "",
             # Agent超时配置（秒）
             "llmFirstTokenTimeout": getattr(settings, 'LLM_FIRST_TOKEN_TIMEOUT', 30),
@@ -521,6 +526,9 @@ async def test_llm_connection(
     saved_timeout_ms = saved_llm_config.get('llmTimeout', settings.LLM_TIMEOUT * 1000)
     saved_temperature = saved_llm_config.get('llmTemperature', settings.LLM_TEMPERATURE)
     saved_max_tokens = saved_llm_config.get('llmMaxTokens', settings.LLM_MAX_TOKENS)
+    saved_repetition_penalty = saved_llm_config.get(
+        'repetitionPenalty', getattr(settings, 'LLM_REPETITION_PENALTY', 1.15)
+    )
     saved_concurrency = saved_other_config.get('llmConcurrency', settings.LLM_CONCURRENCY)
     saved_gap_ms = saved_other_config.get('llmGapMs', settings.LLM_GAP_MS)
     saved_rpm = saved_other_config.get('llmRatePerMinute', 60)
@@ -552,6 +560,7 @@ async def test_llm_connection(
             "timeout_ms": saved_timeout_ms,
             "temperature": saved_temperature,
             "max_tokens": saved_max_tokens,
+            "repetition_penalty": saved_repetition_penalty,
             "concurrency": saved_concurrency,
             "gap_ms": saved_gap_ms,
             "llm_rate_per_minute": saved_rpm,
