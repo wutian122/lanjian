@@ -34,6 +34,7 @@
 - TDD: 失败测试（混合 chunk → 思考/正文事件分离；done 累计正文不含思考噪声）→ 实现 → 通过 → commit
 
 ### Task 5: 前端分流渲染
+- [x] **Task 5 完成**（commit 6f1b8e0，review CLEAN——双路径正文成形推演成立（实时流式+回放兜底）、去重正确性推演、旧后端兼容逐字未动、Task 4 两个承接项落实；3 Minor 记账：①agentStream.ts 的 AgentStreamHandler 类是既有死代码（新增 case 无消费者，后续前端基建时清理）；②回放思考日志无 cleanThinkingContent 清洗（既有行为非本次引入）；③frontend/pnpm-workspace.yaml 为 pnpm10 副产物——主控裁决进 .gitignore）
 - Files: `frontend/src/shared/api/agentStream.ts`（kind 字段 + content_token 类型）、`frontend/src/pages/AgentAudit/hooks/useResilientStream.ts`（:274-281 分流）、`frontend/src/pages/AgentAudit/index.tsx`（:667-690 正文流式日志）
 - Interfaces: content token → 正文流式日志；reasoning token → 现有"思考"区；tool_calls 事件 → 工具逻辑（现状保留）
 - TDD: 组件/hook 测试（分流断言 + 旧格式兼容）→ 实现 → 通过 → commit

@@ -82,3 +82,6 @@ changes/
 # OpenSpec 变更产物入库（R16/R27）
 !openspec/changes/
 !openspec/changes/**
+
+# pnpm10 构建审批副产物（主控裁决 2026-09-03，如需正式批准构建依赖请移入仓库）
+frontend/pnpm-workspace.yaml
