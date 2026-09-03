@@ -10,6 +10,9 @@
 - TDD: 失败测试（传 tools 不再 TypeError；native_openai_call 构造的 body 含 tools/response_format/repetition_penalty；litellm 路径 kwargs 同）→ 实现 → 通过 → commit
 
 ### Task 2: 关思考护栏
+- [x] **Task 2 完成**（实施 7f1ed84 + 第 1 轮修复 2ef85c8，review 初审 NEEDS_FIX（Important：/no_think 无词边界误剥代码常量/URL/observation/工具描述——审查者实测四案例）→ 裁决选项 A（词边界+system/user 作用域收窄+tool/assistant 豁免）→ 重审 CLEAN（7 行为契约全成立+19 案例独立探针）；正则偏差记账：主控裁决单侧边界与 URL 案例自相矛盾，实施者前后双边界修正并被重审判定更优；Minor 记账：socks 代理下 4 个路径测试体 error（环境限制非回归，collection 已修复）、返回值 stripped 消费待 Task 4/6 事件链路补挂）
+
+### Task 2: 关思考护栏
 - Files: `backend/app/services/llm/adapters/litellm_adapter.py`（_assert_no_thinking_off）
 - Interfaces: 拦截 enable_thinking/<|think_off|>/chat_template_kwargs 思考开关 → warning + 剥除
 - TDD: 失败测试（三种注入形态必被拦 + 正常请求不受影响）→ 实现 → 通过 → commit
