@@ -63,6 +63,7 @@ function AgentAuditPageContent() {
     setTask, setFindings, setAgentTree, addLog, updateLog, removeLog,
     selectAgent, setLoading, setConnectionStatus, setAutoScroll, toggleLogExpanded,
     setCurrentAgentName, getCurrentAgentName, setCurrentThinkingId, getCurrentThinkingId,
+    setCurrentContentId, getCurrentContentId,
     dispatch, reset,
   } = useAgentAuditState();
 
@@ -485,6 +486,10 @@ function AgentAuditPageContent() {
           case 'thinking_token':
             // 高频 token 事件仍然跳过，避免刷屏
             break;
+          case 'content_token':
+            // 正文 token 高频事件不落库（回放理论上不会出现）；显式跳过，
+            // 防止任何残留/回放路径把 token 当噪声日志
+            break;
           case 'thinking_start':
             dispatch({
               type: 'ADD_LOG',
@@ -507,6 +512,26 @@ function AgentAuditPageContent() {
             });
             processedCount++;
             break;
+          case 'content_end': {
+            // structured-output-protocol Task 5：正文流结束事件带全文
+            // （metadata.accumulated，落库兜底）。content_token 不落库，回放时
+            // 只有此事件携带正文全文——重建正文日志。必须显式 case 拦截，
+            // 否则其 message "正文输出完成" 会落入 default 渲染成噪声信息行。
+            const fullContent = (event.metadata?.accumulated as string) || '';
+            if (fullContent.trim()) {
+              dispatch({
+                type: 'ADD_LOG',
+                payload: {
+                  type: 'content',
+                  title: '回答',
+                  content: fullContent,
+                  agentName,
+                }
+              });
+              processedCount++;
+            }
+            break;
+          }
 
           default:
             // 其他事件类型也显示为 info（如果有消息）
@@ -663,6 +688,13 @@ function AgentAuditPageContent() {
         updateLog(currentId, { isStreaming: false });
       }
       setCurrentThinkingId(null);
+      // 防御：新一轮思考开始意味着上一轮正文流必然已结束（content_end 先于
+      // thinking_end 发射）；若 content_end 因极端原因漏收，在此收尾残留流式光标
+      const currentContentId = getCurrentContentId();
+      if (currentContentId) {
+        updateLog(currentContentId, { isStreaming: false });
+        setCurrentContentId(null);
+      }
     },
     onThinkingToken: (_token: string, accumulated: string) => {
       if (!accumulated?.trim()) return;
@@ -707,6 +739,65 @@ function AgentAuditPageContent() {
           isStreaming: false
         });
         setCurrentThinkingId(null);
+      }
+    },
+    // structured-output-protocol Task 5：正文流（content_token/content_end）成形
+    // 为独立 'content' 日志，与思考流（紫色 thinking 日志）分流，正文区永不混入
+    // reasoning 来源。旧后端不发 content_* 事件，此两回调不触发，行为同现状。
+    onContentToken: (_token: string, accumulated: string) => {
+      if (!accumulated?.trim()) return;
+
+      const currentId = getCurrentContentId();
+      if (!currentId) {
+        // 预生成 ID，跟踪本条正文流日志（与思考流同模式）
+        const newLogId = `content-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        dispatch({
+          type: 'ADD_LOG', payload: {
+            id: newLogId,
+            type: 'content',
+            title: '回答',
+            content: accumulated,
+            isStreaming: true,
+            agentName: getCurrentAgentName() || undefined,
+          }
+        });
+        setCurrentContentId(newLogId);
+      } else {
+        updateLog(currentId, { content: accumulated });
+      }
+    },
+    onContentEnd: (fullContent: string) => {
+      const currentId = getCurrentContentId();
+
+      if (!fullContent?.trim()) {
+        // 空正文（极端兜底）：移除流式中的占位日志
+        if (currentId) {
+          removeLog(currentId);
+        }
+        setCurrentContentId(null);
+        return;
+      }
+
+      if (currentId) {
+        // 正常路径：token 流已建日志，全文落定、正文流成形
+        updateLog(currentId, {
+          content: fullContent,
+          isStreaming: false,
+        });
+        setCurrentContentId(null);
+      } else {
+        // 兜底：SSE 重连后仅收到 content_end（content_token 不落库/可丢弃），
+        // 直接以全文建成形日志
+        dispatch({
+          type: 'ADD_LOG',
+          payload: {
+            type: 'content',
+            title: '回答',
+            content: fullContent,
+            isStreaming: false,
+            agentName: getCurrentAgentName() || undefined,
+          }
+        });
       }
     },
     onToolStart: (name: string, input: Record<string, unknown>) => {
@@ -810,7 +901,8 @@ function AgentAuditPageContent() {
     },
   }), [afterSequence, dispatch, loadTask, loadFindings, loadAgentTree, debouncedLoadAgentTree,
     updateLog, removeLog, getCurrentAgentName, getCurrentThinkingId,
-    setCurrentAgentName, setCurrentThinkingId]);
+    setCurrentAgentName, setCurrentThinkingId,
+    getCurrentContentId, setCurrentContentId]);
 
   const {
   connect: connectStream,

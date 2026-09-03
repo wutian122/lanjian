@@ -9,6 +9,7 @@ import type { AgentTask, AgentFinding, AgentTreeNode } from "@/shared/api/agentT
 
 export type LogType =
   | 'thinking'
+  | 'content'
   | 'tool'
   | 'phase'
   | 'finding'

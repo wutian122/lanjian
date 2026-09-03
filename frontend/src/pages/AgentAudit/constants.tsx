@@ -10,7 +10,7 @@ import {
   Brain, Wrench, Target, Bug, Zap, Terminal,
   AlertTriangle, Shield, Search, FileCode,
   CheckCircle2, XCircle, Clock, Loader2, Square, Bot,
-  Cpu, Scan, FileSearch, ShieldCheck
+  Cpu, Scan, FileSearch, ShieldCheck, MessageSquareText
 } from "lucide-react";
 
 // ============ Severity Colors (Enhanced contrast) ============
@@ -42,6 +42,13 @@ export const LOG_TYPE_CONFIG: Record<string, {
     icon: React.createElement(Brain, { className: "w-4 h-4 text-violet-600 dark:text-violet-400" }),
     borderColor: "border-l-violet-500",
     bgColor: "bg-violet-500/10"
+  },
+  content: {
+    // structured-output-protocol Task 5：正文回答流（content_token/content_end），
+    // 与思考流（紫）视觉区分——正文是主输出，用 emerald 绿
+    icon: React.createElement(MessageSquareText, { className: "w-4 h-4 text-emerald-600 dark:text-emerald-400" }),
+    borderColor: "border-l-emerald-500",
+    bgColor: "bg-emerald-500/10"
   },
   tool: {
     icon: React.createElement(Wrench, { className: "w-4 h-4 text-amber-600 dark:text-amber-400" }),

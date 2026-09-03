@@ -18,6 +18,7 @@ import type { LogEntryProps } from "../types";
 // Chinese log type labels
 const LOG_TYPE_LABELS: Record<string, string> = {
   thinking: '思考',
+  content: '回答',
   tool: '工具',
   phase: '阶段',
   finding: '漏洞',
@@ -65,6 +66,7 @@ function getStatusIcon(title: string) {
 
 const typeLabelColors: Record<string, string> = {
   thinking: 'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/20 dark:text-violet-300 dark:border-violet-800',
+  content: 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/20 dark:text-emerald-300 dark:border-emerald-800',
   tool: 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/20 dark:text-amber-300 dark:border-amber-800',
   finding: 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/20 dark:text-red-300 dark:border-red-800',
   error: 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/20 dark:text-red-300 dark:border-red-800',
@@ -78,11 +80,13 @@ const typeLabelColors: Record<string, string> = {
 export const LogEntry = memo(function LogEntry({ item, isExpanded, onToggle }: LogEntryProps) {
   const config = LOG_TYPE_CONFIG[item.type] || LOG_TYPE_CONFIG.info;
   const isThinking = item.type === 'thinking';
+  const isContent = item.type === 'content';
   const isFinding = item.type === 'finding';
   const isError = item.type === 'error';
   const isInfo = item.type === 'info';
-  const showContent = isThinking || isExpanded;
-  const isCollapsible = !isThinking && item.content;
+  // 思考与正文都是主输出流，内容始终可见、不折叠；其余类型按需展开
+  const showContent = isThinking || isContent || isExpanded;
+  const isCollapsible = !isThinking && !isContent && item.content;
 
   const formattedTitle = formatTitle(item.title, item.type);
   const statusIcon = isInfo ? getStatusIcon(formattedTitle) : null;
@@ -131,16 +135,19 @@ export const LogEntry = memo(function LogEntry({ item, isExpanded, onToggle }: L
             {/* Status icon for info messages */}
             {statusIcon && <span className="flex-shrink-0">{statusIcon}</span>}
 
-            {/* Title - for non-thinking types */}
-            {!isThinking && (
+            {/* Title - for non-thinking/non-content types (回答/思考 语义已由徽章承载) */}
+            {!isThinking && !isContent && (
               <span className="text-sm text-foreground truncate flex-1">
                 {formattedTitle}
               </span>
             )}
 
-            {/* Streaming cursor */}
+            {/* Streaming cursor：思考流紫色、正文流绿色，视觉区分 */}
             {item.isStreaming && (
-              <span className="w-2 h-4 bg-violet-500 rounded-sm flex-shrink-0 animate-pulse" />
+              <span className={cn(
+                "w-2 h-4 rounded-sm flex-shrink-0 animate-pulse",
+                isContent ? "bg-emerald-500" : "bg-violet-500"
+              )} />
             )}
 
             {/* Tool status */}
@@ -212,8 +219,19 @@ export const LogEntry = memo(function LogEntry({ item, isExpanded, onToggle }: L
             </div>
           )}
 
+          {/* Content (模型正文回答) - always visible，emerald 左边条与思考紫条区分；
+              正文是主输出，文本用满色 text-foreground */}
+          {isContent && item.content && (
+            <div className="mt-2.5 relative">
+              <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-emerald-300 dark:bg-emerald-700 rounded-full" />
+              <div className="pl-4 text-sm text-foreground whitespace-pre-wrap break-words">
+                {item.content}
+              </div>
+            </div>
+          )}
+
           {/* Collapsible content */}
-          {!isThinking && showContent && item.content && (
+          {!isThinking && !isContent && showContent && item.content && (
             <div className="mt-2.5 overflow-hidden">
               <div className="bg-muted/30 rounded-md border border-border overflow-hidden">
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-border bg-muted/50">

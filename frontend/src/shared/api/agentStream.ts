@@ -14,6 +14,9 @@ export type StreamEventType =
   | 'thinking_start'
   | 'thinking_token'
   | 'thinking_end'
+  // structured-output-protocol Task 5：正文流（kind="content"），与思考流事件层分离
+  | 'content_token'
+  | 'content_end'
   // 工具调用相关
   | 'tool_call_start'
   | 'tool_call_input'
@@ -67,8 +70,8 @@ export interface StreamEventData {
   metadata?: Record<string, unknown>;
   tokens_used?: number;
   // 特定类型数据
-  token?: string;           // thinking_token
-  accumulated?: string;     // thinking_token/thinking_end
+  token?: string;           // thinking_token/content_token 增量
+  accumulated?: string;     // thinking_token/thinking_end/content_token/content_end 累计全文
   status?: string;          // task_end
   error?: string;           // task_error
   findings_count?: number;  // task_complete
@@ -92,6 +95,9 @@ export interface StreamOptions {
   onThinkingStart?: () => void;
   onThinkingToken?: (token: string, accumulated: string) => void;
   onThinkingEnd?: (fullResponse: string) => void;
+  // structured-output-protocol Task 5：正文流回调（与思考流对称）
+  onContentToken?: (token: string, accumulated: string) => void;
+  onContentEnd?: (fullContent: string) => void;
   onToolStart?: (toolName: string, input: Record<string, unknown>) => void;
   onToolEnd?: (toolName: string, output: unknown, durationMs: number) => void;
   onNodeStart?: (nodeName: string, phase: string) => void;
@@ -227,8 +233,8 @@ export class AgentStreamHandler {
         // 🔥 逐个处理事件，添加微延迟确保 React 能逐个渲染
         for (const event of events.parsed) {
           this.handleEvent(event);
-          // 为 thinking_token 添加微延迟确保打字效果
-          if (event.type === 'thinking_token') {
+          // 为 thinking_token/content_token 添加微延迟确保打字效果
+          if (event.type === 'thinking_token' || event.type === 'content_token') {
             await new Promise(resolve => setTimeout(resolve, 5));
           }
         }
@@ -355,6 +361,27 @@ export class AgentStreamHandler {
         const fullResponse = event.accumulated || (event.metadata?.accumulated as string) || this.thinkingBuffer.join('');
         this.thinkingBuffer = [];
         this.options.onThinkingEnd?.(fullResponse);
+        break;
+
+      // structured-output-protocol Task 5：正文流（kind="content"），与思考流对称。
+      // 后端 metadata 始终带 accumulated 正文全文（token=增量）；旧后端不发此事件，
+      // 无 content_* 时本路径不触发，思考流行为完全不变。
+      case 'content_token':
+        // 兼容处理：token 可能在顶层，也可能在 metadata 中（与 thinking_token 同模式）
+        const contentToken = event.token || (event.metadata?.token as string);
+        const contentAccumulated = event.accumulated || (event.metadata?.accumulated as string);
+
+        if (contentToken) {
+          this.options.onContentToken?.(
+            contentToken,
+            contentAccumulated || contentToken
+          );
+        }
+        break;
+
+      case 'content_end':
+        const fullContent = event.accumulated || (event.metadata?.accumulated as string) || '';
+        this.options.onContentEnd?.(fullContent);
         break;
 
       // 工具调用

@@ -275,8 +275,9 @@ class EventManager:
     # #1 修复（E2E 实证 1493 条重要事件各等满 5s ≈ 124 分钟纯阻塞）：
     # token 事件时间窗聚合——每 token 一条事件对前端无感知（前端跳过逐 token 渲染，
     # 用 accumulated 全文更新），聚合可减少 90%+ 队列写入，从源头缓解饱和。
-    THINKING_TOKEN_COALESCE_WINDOW = 0.15  # 秒
-    THINKING_TOKEN_COALESCE_MIN_CHARS = 64  # accumulated 字符增量阈值
+    # structured-output-protocol Task 5：常量通用化（thinking_token/content_token 共用）。
+    TOKEN_COALESCE_WINDOW = 0.15  # 秒
+    TOKEN_COALESCE_MIN_CHARS = 64  # accumulated 字符增量阈值
 
     # Wave 2 §3.4 心跳配置
     HEARTBEAT_INTERVAL = 10  # 秒；前端 45s 心跳窗口 4.5x 余量
@@ -360,10 +361,10 @@ class EventManager:
                 last = self._token_coalesce_buf.get(buf_key)
                 if last is not None:
                     last_ts, last_len = last
-                    within_window = now - last_ts < self.THINKING_TOKEN_COALESCE_WINDOW
+                    within_window = now - last_ts < self.TOKEN_COALESCE_WINDOW
                     small_growth = (
                         len(accumulated) - last_len
-                    ) < self.THINKING_TOKEN_COALESCE_MIN_CHARS
+                    ) < self.TOKEN_COALESCE_MIN_CHARS
                     if within_window and small_growth:
                         # 聚合窗口内且增量小：丢弃中间 token（不计数，属正常聚合）
                         return event_id

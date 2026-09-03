@@ -286,6 +286,22 @@ export function useResilientStream(
         break;
       }
 
+      // structured-output-protocol Task 5：正文流（kind="content"），与思考流对称
+      case 'content_token': {
+        const token = event.token || (event.metadata?.token as string);
+        const accumulated = event.accumulated || (event.metadata?.accumulated as string) || '';
+        if (token) {
+          opts.onContentToken?.(token, accumulated || token);
+        }
+        break;
+      }
+
+      case 'content_end': {
+        const fullContent = event.accumulated || (event.metadata?.accumulated as string) || '';
+        opts.onContentEnd?.(fullContent);
+        break;
+      }
+
       case 'tool_call_start':
         if (event.tool) {
           opts.onToolStart?.(event.tool.name, event.tool.input || {});

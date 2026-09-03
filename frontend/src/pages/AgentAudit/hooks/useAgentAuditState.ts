@@ -248,6 +248,9 @@ function agentAuditReducer(state: AgentAuditState, action: AgentAuditAction): Ag
 export function useAgentAuditState() {
   const [state, dispatch] = useReducer(agentAuditReducer, initialState);
   const currentThinkingId = useRef<string | null>(null);
+  // structured-output-protocol Task 5：正文流日志 id（content_token/content_end），
+  // 与思考流 id 独立跟踪，两条流互不收尾对方
+  const currentContentId = useRef<string | null>(null);
   const currentAgentName = useRef<string | null>(null);
 
   // ============ Action Creators ============
@@ -309,6 +312,7 @@ export function useAgentAuditState() {
   const reset = useCallback(() => {
     dispatch({ type: 'RESET' });
     currentThinkingId.current = null;
+    currentContentId.current = null;
     currentAgentName.current = null;
   }, []);
 
@@ -328,6 +332,16 @@ export function useAgentAuditState() {
 
   const getCurrentThinkingId = useCallback(() => {
     return currentThinkingId.current;
+  }, []);
+
+  // ============ Content Stream State Management ============
+
+  const setCurrentContentId = useCallback((id: string | null) => {
+    currentContentId.current = id;
+  }, []);
+
+  const getCurrentContentId = useCallback(() => {
+    return currentContentId.current;
   }, []);
 
   // ============ Computed Values ============
@@ -405,6 +419,10 @@ export function useAgentAuditState() {
     getCurrentAgentName,
     setCurrentThinkingId,
     getCurrentThinkingId,
+
+    // Content stream state
+    setCurrentContentId,
+    getCurrentContentId,
 
     // Direct dispatch for complex operations
     dispatch,
