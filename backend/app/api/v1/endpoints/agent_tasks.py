@@ -874,6 +874,28 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             # 创建 LLM 服务
             llm_service = LLMService(user_config=user_config)
 
+            # 多后端能力探测（structured-output-protocol Task 6）：任务启动时探测
+            # tools/guided_json 能力并记录到事件流；探测失败/超时 → 全 False 降级
+            # ReAct 文本协议，探测本身永不阻塞任务。
+            try:
+                from app.services.agent.structured_output import get_backend_capabilities
+
+                caps = await get_backend_capabilities(llm_service)
+                caps_summary = caps.capabilities_summary()
+                if caps.probe_error and not (caps.tools or caps.guided_json):
+                    await event_emitter.emit_warning(
+                        f"后端能力探测失败，降级 ReAct 文本协议（{caps.probe_error}）",
+                        metadata={"backend_capabilities": caps_summary},
+                    )
+                else:
+                    await event_emitter.emit_info(
+                        f"后端能力探测完成：tools={caps.tools}，guided_json={caps.guided_json}"
+                        f"（{caps.guided_style or '无 guided'}，耗时 {caps.elapsed_ms}ms）",
+                        metadata={"backend_capabilities": caps_summary},
+                    )
+            except Exception as probe_err:
+                logger.warning(f"[CapabilityProbe] 能力探测异常，降级文本协议: {probe_err}")
+
             # 初始化工具集 - 传递排除模式和目标文件以及预初始化的 sandbox_manager
             # 🔥 传递 event_emitter 以发送索引进度，传递 task_id 以支持取消
             tools = await _initialize_tools(

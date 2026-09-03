@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 4096
     LLM_FREQUENCY_PENALTY: float = 1.2  # ??????? LLM ????
+    # structured-output-protocol 层次 6：repetition_penalty（SGLang/vLLM 接受，
+    # 经 extra_params→extra_body/native body 透传；用户配置 llmConfig.repetitionPenalty 优先）
+    LLM_REPETITION_PENALTY: float = 1.15
 
     # Agent 娴佸紡瓒呮椂閰嶇疆锛堢锛?
     LLM_FIRST_TOKEN_TIMEOUT: int = 180  # 首Token超时时间（秒），推理模型需要更长时间  # 绛夊緟棣栦釜Token鐨勮秴鏃舵椂闂?

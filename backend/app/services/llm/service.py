@@ -33,6 +33,26 @@ class LLMService:
         """
         self._config: Optional[LLMConfig] = None
         self._user_config = user_config or {}
+        # 多后端能力探测结果（structured-output-protocol 层次 1）：
+        # None=尚未探测；首次 get_backend_capabilities() 触发并缓存（进程内按
+        # (base_url, model) 去重）。Agent 循环（Task 7/8）据此选原生/文本协议。
+        self._backend_capabilities: Optional[Any] = None
+
+    @property
+    def backend_capabilities(self) -> Optional[Any]:
+        """已探测的后端能力（未探测为 None；触发探测用 get_backend_capabilities()）"""
+        return self._backend_capabilities
+
+    async def get_backend_capabilities(self, *, force_refresh: bool = False):
+        """惰性探测当前后端的 tools/guided_json 能力并缓存。
+
+        永不抛出：探测失败/超时返回全 False 能力对象，调用方降级文本协议。
+        """
+        from app.services.agent.structured_output import get_backend_capabilities as _probe
+
+        caps = await _probe(self, force_refresh=force_refresh)
+        self._backend_capabilities = caps
+        return caps
 
     def get_agent_timeout_config(self) -> Dict[str, int]:
         """
