@@ -9,7 +9,16 @@ parser 整个吞进 reasoning_content、content 恒为空（比乱码更糟）�
 - ``/no_think`` 为 Qwen3 官方软切换命令，同属关闭方向。
 
 护栏（``_assert_no_thinking_off``）在请求构造的最后出口剥除一切"关思考"参数/标记，
-请求以思考模式发出；``/think`` 开启标记不拦。无命中时零行为变化。
+请求以思考模式发出。作用域（第 1 轮修复收窄）：
+
+- ``enable_thinking=关语义``：任意层级递归剥除（参数注入，无角色概念）；
+- ``<|think_off|>``：special token 语法，业务内容不可能自然出现，全域字符串清洗
+  （含 assistant/tool 消息与 tools 描述，防注入藏入审计内容）；
+- ``/no_think``：Qwen3 软开关命令，仅清洗 system/user 角色消息 content 中的
+  独立命令形态（词边界：``/no_thinking_allowed``、URL 路径段等不拦）；
+  assistant/tool 消息是模型输出/审计证据，一个字都不许动；``/think`` 开启标记不拦。
+
+无命中时零行为变化。
 
 覆盖：
 1. 单元层：顶层 / extra_body / 嵌套 chat_template_kwargs 内 enable_thinking=关 语义
@@ -39,11 +48,20 @@ from app.services.llm.types import (
     LLMRequest,
 )
 
-# 真实 openai SDK 的 create 签名（同 Task 1 测试理由：构造实例不发起网络请求，
-# 用真实签名而非 **kwargs 假签名，SDK 升级后签名漂移测试自动跟进）
-_REAL_CREATE_SIGNATURE = inspect.signature(
-    openai.AsyncOpenAI(api_key="x", base_url="http://x").chat.completions.create
-)
+# 真实 openai SDK 的 create 签名（同 Task 1 测试理由：用真实签名而非 **kwargs 假签名，
+# SDK 升级后签名漂移测试自动跟进）。惰性获取：模块级构造 AsyncOpenAI 会在 pytest
+# collection 阶段初始化 httpx client，代理环境（socks）异常时整个模块收集崩溃；
+# 惰性化后仅测试实际执行（已清理代理环境变量）时构造。
+_REAL_CREATE_SIGNATURE: Optional[inspect.Signature] = None
+
+
+def _real_create_signature() -> inspect.Signature:
+    global _REAL_CREATE_SIGNATURE
+    if _REAL_CREATE_SIGNATURE is None:
+        _REAL_CREATE_SIGNATURE = inspect.signature(
+            openai.AsyncOpenAI(api_key="x", base_url="http://x").chat.completions.create
+        )
+    return _REAL_CREATE_SIGNATURE
 
 
 def _make_config(
@@ -112,7 +130,7 @@ class _FakeOpenAIClient:
                 self._owner = owner
 
             async def create(self, **kwargs: Any) -> MagicMock:
-                _REAL_CREATE_SIGNATURE.bind(**kwargs)
+                _real_create_signature().bind(**kwargs)
                 self._owner.created_kwargs.update(kwargs)
                 return _fake_response()
 
@@ -291,6 +309,180 @@ class TestGuardWarningContent:
 
         assert "stream_complete" in caplog.text
         assert "enable_thinking" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 单元层：第 1 轮修复——/no_think 词边界 + 角色作用域收窄
+#
+# 审查实测误伤四类：代码常量（/no_thinking_allowed）、URL（.../no_think/docs）、
+# tool observation、工具描述。裁决：<|think_off|> 是 special token 语法（业务内容
+# 不可能自然出现）保持全域清洗；/no_think 是软开关命令，仅拦 system/user 角色消息
+# 中的独立命令形态——assistant/tool 消息是模型输出/审计证据，一个字都不许动，
+# tools 等非消息参数内的文本也不洗 /no_think。
+# ---------------------------------------------------------------------------
+
+
+class TestGuardScopeRefinement:
+    def test_no_think_prefix_in_identifier_kept(self):
+        """词边界：/no_thinking_allowed 是标识符/代码常量的一部分，不拦"""
+        params = {
+            "messages": [
+                {"role": "user", "content": "const FLAG = '/no_thinking_allowed';"}
+            ]
+        }
+        before = copy.deepcopy(params)
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert params == before
+        assert result["stripped"] == []
+
+    def test_no_think_inside_url_path_kept(self):
+        """词边界：URL 路径段 /no_think/（前后均为路径分隔/字母）不是软开关，不拦"""
+        url = "http://wiki/internal/no_think/docs"
+        params = {
+            "messages": [
+                {"role": "system", "content": f"参考文档：{url}"}
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert url in params["messages"][0]["content"]
+        assert result["stripped"] == []
+
+    def test_tool_role_message_exempt_from_no_think(self):
+        """角色豁免：tool 角色消息（observation，审计证据）含裸 /no_think 一字不动"""
+        params = {
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "observation: flag /no_think is set in config",
+                }
+            ]
+        }
+        before = copy.deepcopy(params)
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert params == before
+        assert result["stripped"] == []
+
+    def test_assistant_role_message_exempt_from_no_think(self):
+        """角色豁免：assistant 角色消息（模型历史输出）含裸 /no_think 一字不动"""
+        params = {
+            "messages": [
+                {"role": "assistant", "content": "/no_think 我上一轮回复里出现过这个字符串"}
+            ]
+        }
+        before = copy.deepcopy(params)
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert params == before
+        assert result["stripped"] == []
+
+    def test_system_role_bare_no_think_still_stripped(self):
+        """护栏主功能不回归：system 消息行首裸 /no_think 仍被剥"""
+        params = {
+            "messages": [
+                {"role": "system", "content": "/no_think\n你是审计助手"}
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "/no_think" not in params["messages"][0]["content"]
+        assert "你是审计助手" in params["messages"][0]["content"]
+        assert result["stripped"]
+
+    def test_user_role_bare_no_think_still_stripped(self):
+        """护栏主功能不回归：user 消息空格分隔的裸 /no_think 仍被剥"""
+        params = {
+            "messages": [
+                {"role": "user", "content": "请审计 /no_think 这个文件"}
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "/no_think" not in params["messages"][0]["content"]
+        assert "这个文件" in params["messages"][0]["content"]
+        assert result["stripped"]
+
+    def test_user_multimodal_content_no_think_stripped(self):
+        """user 消息多模态 content parts（list 形态）内 /no_think 仍按角色清洗"""
+        params = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "/no_think 简单说"}],
+                }
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "/no_think" not in params["messages"][0]["content"][0]["text"]
+        assert "简单说" in params["messages"][0]["content"][0]["text"]
+        assert result["stripped"]
+
+    def test_think_off_token_stripped_in_assistant_message(self):
+        """special token 全域清洗不回归：assistant 消息含 <|think_off|> 仍被剥
+        （token 语法业务内容不可能自然出现，不受角色豁免影响）"""
+        params = {
+            "messages": [
+                {"role": "assistant", "content": "好的 <|think_off|>我不再思考"}
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "<|think_off|>" not in params["messages"][0]["content"]
+        assert "我不再思考" in params["messages"][0]["content"]
+        assert result["stripped"]
+
+    def test_think_off_token_stripped_in_tool_message(self):
+        """special token 全域清洗：tool observation 内 <|think_off|> 也剥
+        （防注入把 special token 藏进 observation 绕过命令式检测）"""
+        params = {
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "output: <|think_off|> done",
+                }
+            ]
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "<|think_off|>" not in params["messages"][0]["content"]
+        assert "done" in params["messages"][0]["content"]
+        assert result["stripped"]
+
+    def test_no_think_in_tool_description_not_stripped(self):
+        """tools 参数内 function 描述不是消息内容，/no_think 不按软开关清洗
+        （工具描述误伤根治）；user 消息正常零误伤"""
+        params = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "set_flag",
+                        "description": "设置 /no_think 标记位（业务参数名示例）",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+
+        result = _assert_no_thinking_off(params, source="unit-test")
+
+        assert "/no_think" in params["tools"][0]["function"]["description"]
+        assert result["stripped"] == []
 
 
 # ---------------------------------------------------------------------------

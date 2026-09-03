@@ -69,18 +69,34 @@ def _detect_max_tokens_error(error_str: str):
 #   * 提示词注入 <|think_off|>：思考真的关了，但 content 恒为空（有害）；
 #   * /no_think 是 Qwen3 官方软切换命令（/think 为开启），同属关闭方向。
 # 护栏在请求构造的最后出口（_send_request / stream_complete / _native_openai_call
-# 三处出站路径）剥除一切关思考参数与提示词标记，请求强制以思考模式发出。
+# 三处出站路径）剥除关思考参数与提示词标记，请求强制以思考模式发出。
+# 作用域（误伤实测后收窄）：enable_thinking 参数与 <|think_off|> token 全域剥除；
+# /no_think 仅剥 system/user 消息 content 中的独立命令形态（词边界），
+# assistant/tool 消息（模型输出/审计证据）与 tools 描述中的同形字符串不动。
 #
 # 解除条件：SGLang/vLLM 服务端 reasoning-parser 修正（关思考后 content 能正常
 # 返回）并经实测验证后，本护栏与其测试可一并移除。在此之前配置层（core/config.py、
 # 用户配置、前端设置页）SHALL NOT 新增任何关思考开关项。
 # ---------------------------------------------------------------------------
 
-# 关思考提示词标记：<|think_off|>（注入式 special token）与 /no_think（Qwen3 软开关）。
-# /think 为开启标记，不在拦截列。大小写不敏感（服务端模板匹配同样大小写宽容）。
-_THINK_OFF_MARKER_PATTERN = re.compile(r"<\|think_off\|>|/no_think", re.IGNORECASE)
+# 关思考提示词标记分两类（第 1 轮修复按误伤实测收窄作用域）：
+# 1. <|think_off|>：special token 语法，业务内容（代码/URL/observation/工具描述）
+#    不可能自然出现——全域字符串清洗，含 assistant/tool 消息与 tools 描述，
+#    防注入把 token 藏进审计内容；
+# 2. /no_think：Qwen3 官方软切换命令（/think 为开启），是自然语言可出现的字符序列
+#    （代码常量 /no_thinking_allowed、URL 路径段 .../no_think/docs、tool observation、
+#    工具描述都曾实测误伤）——仅清洗 system/user 角色消息 content 中的独立命令形态
+#    （前后词边界：邻接字母/数字/下划线/路径斜杠时不匹配）。assistant/tool 消息是
+#    模型输出与审计证据，一个字都不许动。大小写不敏感（服务端模板匹配同样宽容）。
+_THINK_OFF_TOKEN_PATTERN = re.compile(r"<\|think_off\|>", re.IGNORECASE)
+_NO_THINK_COMMAND_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_/])/no_think(?![A-Za-z0-9_/])", re.IGNORECASE
+)
 
-# 思考开关键名（SGLang/vLLM/Qwen  dashscope 三家统一为 enable_thinking），
+# /no_think 软开关仅在这两类角色的消息 content 内清洗（调用侧自身构造的提示词）
+_NO_THINK_COMMAND_ROLES = frozenset({"system", "user"})
+
+# 思考开关键名（SGLang/vLLM/Qwen dashscope 三家统一为 enable_thinking），
 # 可出现在请求顶层、extra_body/extra_params、chat_template_kwargs 任意层级。
 _THINK_SWITCH_KEY = "enable_thinking"
 
@@ -99,15 +115,44 @@ def _is_thinking_off_value(value: Any) -> bool:
     return False
 
 
-def _strip_thinking_off(node: Any, path: str, hits: List[str]) -> Any:
+def _clean_text_node(text: str, path: str, hits: List[str], *, allow_no_think: bool) -> str:
+    """清洗字符串节点。
+
+    - <|think_off|>：全域清洗（allow_no_think 无关）；
+    - /no_think：仅 allow_no_think=True（system/user 消息 content 子树）时清洗，
+      且须为独立命令形态（词边界正则排除代码常量/URL 路径误伤）。
+    """
+    result = text
+    token_hits = _THINK_OFF_TOKEN_PATTERN.findall(result)
+    if token_hits:
+        hits.append(f"{path} 含关思考标记 {sorted(set(token_hits))}（special token 已剥除，正文保留）")
+        result = _THINK_OFF_TOKEN_PATTERN.sub("", result)
+    if allow_no_think:
+        command_hits = _NO_THINK_COMMAND_PATTERN.findall(result)
+        if command_hits:
+            hits.append(f"{path} 含软关闭命令 /no_think（命令已剥除，正文保留）")
+            result = _NO_THINK_COMMAND_PATTERN.sub("", result)
+    return result
+
+
+def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think: bool = False) -> Any:
     """递归剥除 dict/list/str 节点中的关思考参数与提示词标记（原地修改容器）。
 
     - dict：键名（大小写不敏感）为 enable_thinking 且值为关语义 → 删键并记录；
-      其余值递归（覆盖 extra_body/extra_params/chat_template_kwargs/messages 等任意嵌套）；
-    - list：逐元素递归（messages 列表、多模态 content parts）；
-    - str：命中 <|think_off|> 或 /no_think 标记 → 替换为空串（正文其余部分原样保留）。
+      形如 chat message 的 dict（同时含 role 与 content 键）按 role 决定 content
+      子树是否允许清洗 /no_think（仅 system/user）；其余值递归；
+    - list：逐元素递归（messages 列表、多模态 content parts），allow_no_think 透传；
+    - str：按 _clean_text_node 规则清洗。
+
+    allow_no_think 仅在 system/user 消息的 content 子树内为 True；tools 描述、
+    extra_body、assistant/tool 消息等位置恒为 False（<|think_off|> 不受此限）。
     """
     if isinstance(node, dict):
+        role = node.get("role")
+        is_chat_message = isinstance(role, str) and "content" in node
+        content_allows_no_think = allow_no_think or (
+            is_chat_message and role.lower() in _NO_THINK_COMMAND_ROLES
+        )
         for key in list(node.keys()):
             child_path = f"{path}.{key}" if path else str(key)
             if (
@@ -117,21 +162,23 @@ def _strip_thinking_off(node: Any, path: str, hits: List[str]) -> Any:
             ):
                 hits.append(f"{child_path}={node[key]!r}（关思考参数已剥除）")
                 del node[key]
+            elif is_chat_message and key == "content":
+                node[key] = _strip_thinking_off(
+                    node[key], child_path, hits, allow_no_think=content_allows_no_think
+                )
             else:
-                node[key] = _strip_thinking_off(node[key], child_path, hits)
+                node[key] = _strip_thinking_off(
+                    node[key], child_path, hits, allow_no_think=allow_no_think
+                )
         return node
     if isinstance(node, list):
         for idx, item in enumerate(node):
-            node[idx] = _strip_thinking_off(item, f"{path}[{idx}]", hits)
+            node[idx] = _strip_thinking_off(
+                item, f"{path}[{idx}]", hits, allow_no_think=allow_no_think
+            )
         return node
     if isinstance(node, str):
-        matched = _THINK_OFF_MARKER_PATTERN.findall(node)
-        if matched:
-            hits.append(
-                f"{path} 含关思考标记 {sorted(set(matched))}（标记已剥除，正文保留）"
-            )
-            return _THINK_OFF_MARKER_PATTERN.sub("", node)
-        return node
+        return _clean_text_node(node, path, hits, allow_no_think=allow_no_think)
     return node
 
 
@@ -144,8 +191,11 @@ def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str,
     见本模块护栏注释）。拦截对象（大小写不敏感、递归检查）：
       1. 顶层或 extra_body/extra_params/chat_template_kwargs 任意层级的
          enable_thinking=关语义（False/0/"false"/"no"/"off"/"disable(d)"）；
-      2. messages 任意 content 内的 <|think_off|> 注入标记与 /no_think 软开关
-         （/think 开启标记不拦）。
+      2. <|think_off|> special token：全域字符串清洗（业务内容不可能自然出现，
+         含 assistant/tool 消息与 tools 描述，防注入藏入审计内容）；
+      3. /no_think 软开关：仅清洗 system/user 角色消息 content 中的独立命令形态
+         （词边界排除 /no_thinking_allowed、URL 路径段等误伤）；assistant/tool
+         消息是模型输出/审计证据绝不改动，/think 开启标记不拦。
 
     命中处理：剥除该参数/标记 + logger.warning（含触发位置 source 与剥除明细）。
     适配器层拿不到 event_emitter（llm 适配层无事件链路引用），故以 logger.warning

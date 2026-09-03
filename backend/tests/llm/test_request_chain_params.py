@@ -35,9 +35,19 @@ from app.services.llm.types import (
 # AsyncCompletions.create 无 **kwargs：SDK 不认识的参数（如 repetition_penalty
 # 被展开到 create() 顶层）在 bind 阶段即 TypeError——与生产中真实 SDK 抛错一致。
 # 用真实签名而非 **kwargs 假签名，SDK 升级后签名漂移测试自动跟进。
-_REAL_CREATE_SIGNATURE = inspect.signature(
-    openai.AsyncOpenAI(api_key="x", base_url="http://x").chat.completions.create
-)
+# 惰性获取：模块级构造 AsyncOpenAI 会在 pytest collection 阶段初始化 httpx client，
+# 代理环境（socks）异常时整个模块收集崩溃；惰性化后仅测试实际执行（已清理代理
+# 环境变量）时构造。
+_REAL_CREATE_SIGNATURE: Optional[inspect.Signature] = None
+
+
+def _real_create_signature() -> inspect.Signature:
+    global _REAL_CREATE_SIGNATURE
+    if _REAL_CREATE_SIGNATURE is None:
+        _REAL_CREATE_SIGNATURE = inspect.signature(
+            openai.AsyncOpenAI(api_key="x", base_url="http://x").chat.completions.create
+        )
+    return _REAL_CREATE_SIGNATURE
 
 
 TOOLS: List[Dict[str, Any]] = [
@@ -151,7 +161,7 @@ class _FakeOpenAIClient:
             async def create(self, **kwargs: Any) -> MagicMock:
                 # spec-aware：按真实 SDK 签名绑定，未知 kwarg（如展开到顶层的
                 # repetition_penalty）在此 TypeError，与生产行为一致
-                _REAL_CREATE_SIGNATURE.bind(**kwargs)
+                _real_create_signature().bind(**kwargs)
                 self._owner.created_kwargs.update(kwargs)
                 return _fake_response()
 
