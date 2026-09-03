@@ -42,6 +42,7 @@
 ## Phase 3: 能力探测与协议选择
 
 ### Task 6: 多后端能力探测层
+- [x] **Task 6 完成**（commit ac73408，review CLEAN——三 Scenario 三重证据（代码+测试+真实 SGLang 亲探 1098ms）+ guided 强制力对照实验（纯文本要求下服务端仍强制 schema）+ 死后端亲测全 False 不抛出；实施者真实发现：thinking 模型 reasoning 前缀耗尽小探测预算致 guided 假阴性，预算调 tools=256/guided=512 并测试锁死；5 Minor 记账：①**Task 7 顺手修探测 AsyncOpenAI 加 max_retries=0**（死后端 15-30s 延迟）；②**Task 7 顺手补 caps 写回 llm_service 实例属性**（否则 Task 7/8 读 service.backend_capabilities 得 None）；③跨任务并发首探竞态（后果仅重复请求，后续 task 字典去重）；④极端长 reasoning 模型假阴性降级（设计内零破坏）；⑤LLM_REPETITION_PENALTY 提前落库（Task 9 消费））
 - Files: `backend/app/services/agent/structured_output.py`（BackendCapabilities + probe_backend_capabilities + 缓存）、`backend/app/core/config.py`（LLM_REPETITION_PENALTY: float = 1.15）
 - Interfaces: 按 (base_url, model) 缓存；失败降级全 False；探测结果 info 事件（含参数摘要，满足 llm-call-params 可追溯）
 - TDD: 失败测试（mock HTTP 三态：双可用/部分/失败降级 + 缓存命中）→ 实现 → 通过 → commit
