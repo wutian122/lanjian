@@ -641,7 +641,12 @@ class LiteLLMAdapter(BaseLLMAdapter):
         流式调用 LLM，逐 token 返回
 
         Yields:
-            dict: {"type": "token", "content": str} 或 {"type": "done", "content": str, "usage": dict}
+            dict: token 块 {"type": "token", "kind": "content"|"reasoning",
+                    "content": 增量文本, "accumulated": 思考+正文按序拼接（兼容键）,
+                    "accumulated_content": 正文累计, "accumulated_reasoning": 思考累计}；
+                  done 块 {"type": "done", "content": 正文累计, "reasoning": 思考累计,
+                    "accumulated": 拼接累计, "usage": dict, "finish_reason": str}；
+                  error 块 {"type": "error", ..., "accumulated": 拼接累计}
         """
         import litellm
 
@@ -696,7 +701,15 @@ class LiteLLMAdapter(BaseLLMAdapter):
         # kwargs 已完全成型，在 litellm.acompletion 发出前统一清洗
         _assert_no_thinking_off(kwargs, source="stream_complete")
 
+        # structured-output-protocol Task 3：思考流/正文流在 chunk 层分离。
+        # accumulated_content 仅累计 delta.content（正文），accumulated_reasoning
+        # 仅累计 delta.reasoning_content/delta.thinking（思考）；accumulated_all
+        # 按流到达顺序拼接两者，作为旧 "accumulated" 键的兼容值（Task 4 前
+        # base.py 仍读旧键），也用于输出 token 估算（思考 token 同样计费）。
         accumulated_content = ""
+        accumulated_reasoning = ""
+        accumulated_all = ""
+        finished = False  # 是否已发射 finish_reason 的 done（防兜底路径重复发 done）
         final_usage = None  # 🔥 存储最终的 usage 信息
         chunk_count = 0  # 🔥 跟踪 chunk 数量
 
@@ -721,18 +734,41 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
                 delta = chunk.choices[0].delta
                 content = getattr(delta, "content", "") or ""
-                # 🔥 处理推理模型的 reasoning_content / thinking 字段
-                reasoning_content = getattr(delta, "reasoning_content", "") or ""
-                thinking_content = getattr(delta, "thinking", "") or ""
-                effective_content = content or reasoning_content or thinking_content
+                # 推理模型的思考流（SGLang qwen3 parser: delta.reasoning_content；
+                # 部分后端用 delta.thinking）——与正文 content 是两个独立通道。
+                # 旧实现用 or 链把两者混进同一 content 流，思考退化噪声
+                # （stopstopSTOP 等）由此污染正文视野与 Final Answer 解析；
+                # 现按 kind 分流（structured-output-protocol Task 3）。
+                reasoning_piece = (
+                    getattr(delta, "reasoning_content", "")
+                    or getattr(delta, "thinking", "")
+                    or ""
+                )
                 finish_reason = chunk.choices[0].finish_reason
 
-                if effective_content:
-                    accumulated_content += effective_content
+                # 思考与正文同轮出现时各自独立 yield（两个 if，非 if/else）；
+                # 思考阶段先于正文阶段到达，reasoning piece 先 yield。
+                if reasoning_piece:
+                    accumulated_reasoning += reasoning_piece
+                    accumulated_all += reasoning_piece
                     yield {
                         "type": "token",
-                        "content": effective_content,
-                        "accumulated": accumulated_content,
+                        "kind": "reasoning",
+                        "content": reasoning_piece,
+                        "accumulated": accumulated_all,
+                        "accumulated_content": accumulated_content,
+                        "accumulated_reasoning": accumulated_reasoning,
+                    }
+                if content:
+                    accumulated_content += content
+                    accumulated_all += content
+                    yield {
+                        "type": "token",
+                        "kind": "content",
+                        "content": content,
+                        "accumulated": accumulated_all,
+                        "accumulated_content": accumulated_content,
+                        "accumulated_reasoning": accumulated_reasoning,
                     }
                 # 🔥 ENHANCED: 处理没有 content 但也没有 finish_reason 的情况
                 # 某些模型（如智谱 GLM）可能在某些 chunk 中不返回内容
@@ -741,7 +777,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     # 流式完成
                     # 🔥 如果没有从 chunk 获取到 usage，进行估算
                     if not final_usage:
-                        output_tokens_estimate = estimate_tokens(accumulated_content)
+                        output_tokens_estimate = estimate_tokens(accumulated_all)
                         final_usage = {
                             "prompt_tokens": input_tokens_estimate,
                             "completion_tokens": output_tokens_estimate,
@@ -750,22 +786,29 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         logger.debug(f"Estimated usage: {final_usage}")
 
                     # 🔥 ENHANCED: 如果累积内容为空但有 finish_reason，记录警告
-                    if not accumulated_content:
+                    if not accumulated_all:
                         logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
 
                     yield {
                         "type": "done",
+                        # 语义拆分（Task 3）：content 仅正文累计、reasoning 仅思考累计；
+                        # accumulated 为两者拼接（兼容旧下游，Task 4 切换消费）
                         "content": accumulated_content,
+                        "reasoning": accumulated_reasoning,
+                        "accumulated": accumulated_all,
                         "usage": final_usage,
                         "finish_reason": finish_reason,
                     }
+                    finished = True
                     break
 
             # 🔥 ENHANCED: 如果循环结束但没有收到 finish_reason，也需要返回 done
-            if accumulated_content:
-                logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_content)} chars)")
+            # （finished 守卫：已发过 finish_reason done 的流不得再补发 done，
+            # 旧实现靠消费方拿到 done 后停止拉取隐式规避，全量排空时会重复发）
+            if accumulated_all and not finished:
+                logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_all)} chars)")
                 if not final_usage:
-                    output_tokens_estimate = estimate_tokens(accumulated_content)
+                    output_tokens_estimate = estimate_tokens(accumulated_all)
                     final_usage = {
                         "prompt_tokens": input_tokens_estimate,
                         "completion_tokens": output_tokens_estimate,
@@ -774,6 +817,8 @@ class LiteLLMAdapter(BaseLLMAdapter):
                 yield {
                     "type": "done",
                     "content": accumulated_content,
+                    "reasoning": accumulated_reasoning,
+                    "accumulated": accumulated_all,
                     "usage": final_usage,
                     "finish_reason": "complete",
                 }
@@ -800,18 +845,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
                 retry_seconds = float(retry_match.group(1)) if retry_match else 60
                 user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
 
-            output_tokens_estimate = estimate_tokens(accumulated_content) if accumulated_content else 0
+            output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
             yield {
                 "type": "error",
                 "error_type": error_type,
                 "error": error_msg,
                 "user_message": user_message,
-                "accumulated": accumulated_content,
+                "accumulated": accumulated_all,
                 "usage": {
                     "prompt_tokens": input_tokens_estimate,
                     "completion_tokens": output_tokens_estimate,
                     "total_tokens": input_tokens_estimate + output_tokens_estimate,
-                } if accumulated_content else None,
+                } if accumulated_all else None,
             }
 
         except litellm.exceptions.AuthenticationError as e:
@@ -822,7 +867,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
                 "error_type": "authentication",
                 "error": str(e),
                 "user_message": "API Key 无效或已过期，请检查配置",
-                "accumulated": accumulated_content,
+                "accumulated": accumulated_all,
                 "usage": None,
             }
 
@@ -834,7 +879,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
                 "error_type": "connection",
                 "error": str(e),
                 "user_message": "无法连接到 API 服务，请检查网络连接",
-                "accumulated": accumulated_content,
+                "accumulated": accumulated_all,
                 "usage": None,
             }
 
@@ -881,18 +926,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     error_type = "unknown"
                     user_message = "LLM 调用发生错误，请重试"
 
-            output_tokens_estimate = estimate_tokens(accumulated_content) if accumulated_content else 0
+            output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
             yield {
                 "type": "error",
                 "error_type": error_type,
                 "error": error_msg,
                 "user_message": user_message,
-                "accumulated": accumulated_content,
+                "accumulated": accumulated_all,
                 "usage": {
                     "prompt_tokens": input_tokens_estimate,
                     "completion_tokens": output_tokens_estimate,
                     "total_tokens": input_tokens_estimate + output_tokens_estimate,
-                } if accumulated_content else None,
+                } if accumulated_all else None,
             }
 
     async def validate_config(self) -> bool:
