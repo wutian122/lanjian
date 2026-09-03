@@ -56,6 +56,7 @@
 - TDD: 失败测试（mock tool_calls 响应 → dispatch/finish/summarize 三种分发等价于文本协议；探测不可用 → 文本路径回归）→ 实现 → 通过 → commit
 
 ### Task 8: Analysis/Verification tools 协议 + submit_findings 工具
+- [x] **Task 8 完成**（实施 7ddc5ba + 协议说明补丁 f2d8677，review CLEAN——spec 三组要求满足（机制偏差记账：spec 字面"Final Answer 轮 response_format"按 design 层次 5 实现为 tools schema 主轮 + response_format 仅强制总结轮，sync 时对齐措辞）、门禁无旁路双重核实（代码路径唯一收口 + 拒绝测试）、schema 与两份提示词契约逐字段对齐、json-repair 工具路径退役（间谍断言零调用）；Important 裁决：analysis 协议说明段本 commit 内补（无门禁侧防首轮凭推测交卷，审查者草案精确落地 RED/GREEN 齐全）；Minor 1-5 记账：幻觉工具名反馈/空 content/spec 措辞/verification 间谍测试/回放清洗——后续处理；conftest 第四次记账落地（环境默认值注入，JWT 失败 --noconftest 复核非新引入））
 - Files: `backend/app/services/agent/agents/analysis.py`（:709/:467）、`backend/app/services/agent/agents/verification.py`（:1094）、`backend/app/services/agent/agents/base.py`（submit_findings 注册与 tool_calls→Final Answer 语义）
 - Interfaces: submit_findings 工具参数=findings JSON Schema；模型调用它即 is_final（arguments 直接 json.loads 进 all_findings 流程）；强制总结轮 guided_json 注入（能力可用时）
 - TDD: 失败测试（submit_findings tool_calls → findings 流程触发且 arguments 合法 JSON；guided 注入仅强制总结轮；降级路径文本协议回归）→ 实现 → 通过 → commit
