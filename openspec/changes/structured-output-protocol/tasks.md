@@ -19,6 +19,8 @@
 
 ## Phase 2: 流式三字段分流
 
+- [x] **Task 3 完成**（commit 45ecff0，review CLEAN——done.content 语义切换的消费端逐点核实为预期收益、双 done 守卫正确、纯 content 逐字节零破坏；Minor 记账：①**Task 7/8 必须显式承接 delta.tool_calls 流式聚合**（spec 三字段第三字段，现状不读不传，切 tools 协议后必须有 chunk 出口）；②reasoning_content or thinking 同 delta 同现时 thinking 被丢（Task 7/8 顺带改双 if）；③tests/llm 缺 conftest 统一环境（SECRET_KEY/代理），后续补）
+
 ### Task 3: 适配器 chunk 分流（kind 字段）
 - Files: `backend/app/services/llm/adapters/litellm_adapter.py`（:508-522 拆 or 链，yield 带 kind）
 - Interfaces: chunk 增加 kind: "reasoning"|"content"；accumulated 拆分（正文累计不含思考）
