@@ -2,6 +2,8 @@
 
 ## Phase 1: 请求链修复（三断点）
 
+- [x] **Task 1 完成**（实施 a81626a + 第 1 轮修复 7849651，review 初审 NEEDS_FIX（Critical：native 路径 extra_body 展开在真实 openai 2.12.0 SDK 下必 TypeError，mock 签名过宽未抓住）→ 重审 CLEAN（变异 RED + 真实 SDK 端到端 + 假端点 HTTP body 三重证据）；测试加固为真实签名 bind 校验（AsyncMock spec 不校验签名/create_autospec 与 @required_args 冲突，实施者实测后走 bind 方案，SDK 升级自动跟进）；litellm 两路径无同型坑核实闭合；记账：litellm extra_body 最终合并属库行为，Task 9 真实 SGLang smoke 仍保留端到端验收）
+
 ### Task 1: LLMRequest/service/adapter 参数链打通
 - Files: `backend/app/services/llm/types.py`（LLMRequest 加 tools/response_format/extra_params）、`backend/app/services/llm/service.py`（chat_completion/stream 签名与透传）、`backend/app/services/llm/adapters/litellm_adapter.py`（_send_request kwargs + _native_openai_call 扩展 + extra_body）
 - Interfaces: Consumes tools/response_format/extra_params；Produces 三层透传（native_openai_call 为 SGLang 实际路径必须覆盖）
