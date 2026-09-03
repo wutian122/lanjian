@@ -258,15 +258,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
             params["max_tokens"] = kwargs["max_tokens"]
 
         # 结构化输出协议（structured-output-protocol）：tools/response_format 为
-        # OpenAI 标准参数；extra_body 中的 provider 特有参数（如 repetition_penalty）
-        # 直接展开进请求 body dict
+        # OpenAI 标准参数；extra_body（repetition_penalty 等 provider 特有参数）
+        # 必须原样透传给 create()——openai SDK 的官方透传机制会把 extra_body 合并
+        # 进 HTTP body 顶层（SGLang 收到的请求体语义不变）。
+        # 禁止 params.update(extra_body) 展开：create() 无 **kwargs 也无
+        # repetition_penalty 形参，展开必 TypeError（openai 2.12.0 实证）。
         if kwargs.get("tools"):
             params["tools"] = kwargs["tools"]
         if kwargs.get("response_format"):
             params["response_format"] = kwargs["response_format"]
         extra_body = kwargs.get("extra_body")
         if extra_body:
-            params.update(extra_body)
+            params["extra_body"] = extra_body
 
         return await client.chat.completions.create(**params)
 
@@ -329,8 +332,9 @@ class LiteLLMAdapter(BaseLLMAdapter):
         # 结构化输出协议（structured-output-protocol）：
         # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
         # extra_params（repetition_penalty 等 provider 特有参数）经 litellm extra_body
-        # 官方透传机制合并进 HTTP body，同样不受 drop_params 影响。
-        # native 路径（_native_openai_call）收到 extra_body 后直接展开进 body dict。
+        # 官方透传机制合并进 HTTP body（litellm custom_httpx: data = {**data, **extra_body}），
+        # 不受 drop_params 影响。native 路径（_native_openai_call）同样原样透传 extra_body，
+        # 由 openai SDK 合并进 body——两条路径对端点呈现的请求体一致。
         if request.tools:
             kwargs["tools"] = request.tools
         if request.response_format:

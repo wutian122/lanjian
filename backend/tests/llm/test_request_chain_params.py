@@ -13,9 +13,11 @@ structured-output-protocol Task 1：请求链三参数透传测试
 必然 TypeError。
 """
 
+import inspect
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import openai
 import pytest
 
 from app.services.llm.service import LLMService
@@ -27,6 +29,14 @@ from app.services.llm.types import (
     LLMRequest,
     LLMResponse,
     LLMUsage,
+)
+
+# 真实 openai SDK 的 create 签名（构造 AsyncOpenAI 实例不发起网络请求）。
+# AsyncCompletions.create 无 **kwargs：SDK 不认识的参数（如 repetition_penalty
+# 被展开到 create() 顶层）在 bind 阶段即 TypeError——与生产中真实 SDK 抛错一致。
+# 用真实签名而非 **kwargs 假签名，SDK 升级后签名漂移测试自动跟进。
+_REAL_CREATE_SIGNATURE = inspect.signature(
+    openai.AsyncOpenAI(api_key="x", base_url="http://x").chat.completions.create
 )
 
 
@@ -139,6 +149,9 @@ class _FakeOpenAIClient:
                 self._owner = owner
 
             async def create(self, **kwargs: Any) -> MagicMock:
+                # spec-aware：按真实 SDK 签名绑定，未知 kwarg（如展开到顶层的
+                # repetition_penalty）在此 TypeError，与生产行为一致
+                _REAL_CREATE_SIGNATURE.bind(**kwargs)
                 self._owner.created_kwargs.update(kwargs)
                 return _fake_response()
 
@@ -290,8 +303,14 @@ class TestServicePassThrough:
 
 class TestNativeOpenAICall:
     @pytest.mark.asyncio
-    async def test_body_contains_tools_response_format_repetition_penalty(self):
-        """native 路径请求 body 必须含 tools/response_format，extra_body 展开为顶层参数"""
+    async def test_native_call_passes_extra_body_through_under_real_sdk_signature(self):
+        """native 路径：tools/response_format 为 create() 标准参数；extra_params 必须以
+        extra_body 原样传入（SDK 官方透传机制，合并进 HTTP body 顶层），不得展开为
+        create() 顶层 kwarg——真实 openai 2.12.0 SDK 的 create 无 **kwargs 也无
+        repetition_penalty 参数，展开必 TypeError。
+
+        fake client 内建真实签名 bind 校验：本测试在"展开"实现下直接 RED（TypeError）。
+        """
         adapter = LiteLLMAdapter(_make_config())
         fake_client = _FakeOpenAIClient()
 
@@ -312,9 +331,11 @@ class TestNativeOpenAICall:
         assert body["model"] == "qwen-test"  # openai/ 前缀剥离
         assert body["tools"] == TOOLS
         assert body["response_format"] == RESPONSE_FORMAT
-        # extra_params 直接并入 body dict（repetition_penalty 为 SGLang 接受的顶层参数）
-        assert body["repetition_penalty"] == 1.15
-        assert "extra_body" not in body
+        # extra_body 原样透传：openai SDK 将其合并进 HTTP body 顶层，
+        # SGLang 收到的 repetition_penalty 语义与展开相同，但不触发 SDK TypeError
+        assert body["extra_body"] == {"repetition_penalty": 1.15}
+        # provider 特有参数绝不能出现在 create() 顶层
+        assert "repetition_penalty" not in body
 
     @pytest.mark.asyncio
     async def test_body_without_params_identical_to_before(self):
