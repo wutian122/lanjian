@@ -64,6 +64,7 @@
 ## Phase 5: 参数治理与端到端
 
 ### Task 9: repetition_penalty/temperature 落地
+- [x] **Task 9 完成**（代码 commit d674627 review CLEAN——wire body 假端点抓包 + 真实 SGLang 端点流式 smoke 双重实证 repetition_penalty=1.15/temperature=0.6 顶层到达；setdefault 合并显式值优先；护栏零影响确认；两台生产落库已由主控执行并验证（本机 0.6/1.15/8192、ARM 0.6/1.15/16384，备份追加）；4 Minor 记账：①spec"所有 Agent 调用 0.6"措辞过强——orchestrator 调度轮 0.4/context_manager 0.3 是 v3.0 有意设计，**Task 10 与老板确认是否保留**；②摘要事件挂载用 AST 契约断言（可后续运行时断言）；③conftest 代理清理第五次记账；④pydantic v1 .dict 风格既有；⑤前端 min 1.0 与 spec 建议 1.1-1.2 的提示区间差异）
 - Files: 两台生产 user_configs（llmTemperature 0.3→0.6、新增 repetitionPenalty=1.15）、`backend/app/services/llm/service.py`（config 构建读 repetitionPenalty）
 - Interfaces: 端点请求体实测含两参数（SGLang smoke）；vLLM/ollama 不支持的参数由后端忽略（OpenAI 兼容行为）
 - TDD: config 构建测试 + SGLang 真实端点 smoke（tools+guided+params 三合一）→ commit
