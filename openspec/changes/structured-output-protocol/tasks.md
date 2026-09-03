@@ -21,6 +21,8 @@
 
 - [x] **Task 3 完成**（commit 45ecff0，review CLEAN——done.content 语义切换的消费端逐点核实为预期收益、双 done 守卫正确、纯 content 逐字节零破坏；Minor 记账：①**Task 7/8 必须显式承接 delta.tool_calls 流式聚合**（spec 三字段第三字段，现状不读不传，切 tools 协议后必须有 chunk 出口）；②reasoning_content or thinking 同 delta 同现时 thinking 被丢（Task 7/8 顺带改双 if）；③tests/llm 缺 conftest 统一环境（SECRET_KEY/代理），后续补）
 
+- [x] **Task 4 完成**（commit 69a956f，review CLEAN——content_end 落库兜底设计成立（SSE 重连/回放正文不丢）、聚合缓冲拆分修复真实 bug（token 交替互相饿死，代码推演证实）、无 kind 兼容路径逐字一致、变异验证通过；Minor 记账：①**Task 5 前端 index.tsx:505-513 历史回放 switch 需补 content_end case**（否则回放出现"正文输出完成"噪声行）；②THINKING_TOKEN_COALESCE_* 常量命名待 Task 5 顺手改 TOKEN_COALESCE_*；③tests conftest 统一环境问题延续）
+
 ### Task 3: 适配器 chunk 分流（kind 字段）
 - Files: `backend/app/services/llm/adapters/litellm_adapter.py`（:508-522 拆 or 链，yield 带 kind）
 - Interfaces: chunk 增加 kind: "reasoning"|"content"；accumulated 拆分（正文累计不含思考）
