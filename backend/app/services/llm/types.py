@@ -53,6 +53,12 @@ class LLMRequest:
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     stream: bool = False
+    # 结构化输出协议（structured-output-protocol）：
+    # tools——OpenAI function-calling 工具定义；response_format——guided json_schema；
+    # extra_params——provider 特有参数（如 repetition_penalty），经 extra_body/body 透传
+    tools: Optional[List[Dict[str, Any]]] = None
+    response_format: Optional[Dict[str, Any]] = None
+    extra_params: Optional[Dict[str, Any]] = None
 
 
 @dataclass

@@ -257,6 +257,17 @@ class LiteLLMAdapter(BaseLLMAdapter):
         if "max_tokens" in kwargs:
             params["max_tokens"] = kwargs["max_tokens"]
 
+        # 结构化输出协议（structured-output-protocol）：tools/response_format 为
+        # OpenAI 标准参数；extra_body 中的 provider 特有参数（如 repetition_penalty）
+        # 直接展开进请求 body dict
+        if kwargs.get("tools"):
+            params["tools"] = kwargs["tools"]
+        if kwargs.get("response_format"):
+            params["response_format"] = kwargs["response_format"]
+        extra_body = kwargs.get("extra_body")
+        if extra_body:
+            params.update(extra_body)
+
         return await client.chat.completions.create(**params)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
@@ -314,6 +325,18 @@ class LiteLLMAdapter(BaseLLMAdapter):
             "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
             "top_p": request.top_p if request.top_p is not None else self.config.top_p,
         }
+
+        # 结构化输出协议（structured-output-protocol）：
+        # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
+        # extra_params（repetition_penalty 等 provider 特有参数）经 litellm extra_body
+        # 官方透传机制合并进 HTTP body，同样不受 drop_params 影响。
+        # native 路径（_native_openai_call）收到 extra_body 后直接展开进 body dict。
+        if request.tools:
+            kwargs["tools"] = request.tools
+        if request.response_format:
+            kwargs["response_format"] = request.response_format
+        if request.extra_params:
+            kwargs["extra_body"] = request.extra_params
 
         # 设置 API Key
         if self.config.api_key and self.config.api_key != "ollama":
@@ -462,6 +485,15 @@ class LiteLLMAdapter(BaseLLMAdapter):
             "top_p": request.top_p if request.top_p is not None else self.config.top_p,
             "stream": True,  # 启用流式输出
         }
+
+        # 结构化输出协议（structured-output-protocol）：与 _send_request 保持一致，
+        # tools/response_format 为标准参数，extra_params 经 extra_body 透传
+        if request.tools:
+            kwargs["tools"] = request.tools
+        if request.response_format:
+            kwargs["response_format"] = request.response_format
+        if request.extra_params:
+            kwargs["extra_body"] = request.extra_params
 
         # 🔥 对于支持的模型，请求在流式输出中包含 usage 信息
         # OpenAI API 支持 stream_options

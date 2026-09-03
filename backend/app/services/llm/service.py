@@ -428,6 +428,8 @@ Please analyze the following code:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         🔥 Agent 使用的聊天完成接口（支持工具调用）
@@ -436,7 +438,9 @@ Please analyze the following code:
             messages: 消息列表，格式为 [{"role": "user", "content": "..."}]
             temperature: 温度参数（None 时使用用户配置）
             max_tokens: 最大token数（None 时使用用户配置）
-            tools: 工具描述列表（可选）
+            tools: 工具描述列表（可选，OpenAI function-calling 格式）
+            response_format: 结构化输出约束（可选，guided json_schema）
+            extra_params: provider 特有参数（可选，如 repetition_penalty）
 
         Returns:
             包含 content、usage 和 tool_calls 的字典
@@ -451,14 +455,14 @@ Please analyze the following code:
             for msg in messages
         ]
 
-        request_kwargs = {
-            "messages": llm_messages,
-            "temperature": actual_temperature,
-            "max_tokens": actual_max_tokens,
-        }
-        if tools is not None:
-            request_kwargs["tools"] = tools
-        request = LLMRequest(**request_kwargs)
+        request = LLMRequest(
+            messages=llm_messages,
+            temperature=actual_temperature,
+            max_tokens=actual_max_tokens,
+            tools=tools,
+            response_format=response_format,
+            extra_params=extra_params,
+        )
 
         adapter = LLMFactory.create_adapter(self.config)
         response = await adapter.complete(request)
@@ -528,6 +532,9 @@ Please analyze the following code:
         messages: List[Dict[str, str]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ):
         """
         流式聊天完成接口，逐 token 返回
@@ -536,6 +543,9 @@ Please analyze the following code:
             messages: 消息列表
             temperature: 温度参数（None 时使用用户配置）
             max_tokens: 最大token数（None 时使用用户配置）
+            tools: 工具描述列表（可选，OpenAI function-calling 格式）
+            response_format: 结构化输出约束（可选，guided json_schema）
+            extra_params: provider 特有参数（可选，如 repetition_penalty）
 
         Yields:
             dict: {"type": "token", "content": str} 或 {"type": "done", ...}
@@ -553,6 +563,9 @@ Please analyze the following code:
             messages=llm_messages,
             temperature=actual_temperature,
             max_tokens=actual_max_tokens,
+            tools=tools,
+            response_format=response_format,
+            extra_params=extra_params,
         )
         
         if self.config.provider in NATIVE_ONLY_PROVIDERS:
