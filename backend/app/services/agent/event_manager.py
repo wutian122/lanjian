@@ -267,11 +267,14 @@ class EventManager:
     # 消费者永久离线时避免 Orchestrator 永久挂死；事件已落 DB，重连时回补可送达
     TERMINAL_PUT_TIMEOUT_SECONDS = 30.0
     TERMINAL_EVENT_TYPES = frozenset({"task_complete", "task_error", "task_cancel"})
-    DROPPABLE_EVENT_TYPES = frozenset({"thinking_token"})  # 可安全丢弃的事件
+    # 可安全丢弃的高频 token 事件（时间窗聚合 + 队列满丢弃；end 事件带全文落库兜底）。
+    # content_token（structured-output-protocol Task 4）与 thinking_token 同策略：
+    # 前端以 metadata.accumulated 全文更新，丢弃中间 token 无损；content_end 落库兜底。
+    DROPPABLE_EVENT_TYPES = frozenset({"thinking_token", "content_token"})  # 可安全丢弃的事件
 
     # #1 修复（E2E 实证 1493 条重要事件各等满 5s ≈ 124 分钟纯阻塞）：
-    # thinking_token 时间窗聚合——每 token 一条事件对前端无感知（前端跳过渲染），
-    # 聚合可减少 90%+ 队列写入，从源头缓解饱和。
+    # token 事件时间窗聚合——每 token 一条事件对前端无感知（前端跳过逐 token 渲染，
+    # 用 accumulated 全文更新），聚合可减少 90%+ 队列写入，从源头缓解饱和。
     THINKING_TOKEN_COALESCE_WINDOW = 0.15  # 秒
     THINKING_TOKEN_COALESCE_MIN_CHARS = 64  # accumulated 字符增量阈值
 
@@ -286,10 +289,13 @@ class EventManager:
         self._terminal_tasks: set = set()  # 已终态的 task_id 集合
         # Wave 2 §3.3 分级丢弃计数器：追踪被丢弃的 thinking_token 数量
         self.dropped_thinking_tokens: Dict[str, int] = {}
+        # structured-output-protocol Task 4：正文 token 同级丢弃计数
+        self.dropped_content_tokens: Dict[str, int] = {}
         # #1 修复：重要事件队列满时非阻塞跳过的计数器（原实现同步等 5s）
         self.dropped_important_events: Dict[str, int] = {}
-        # #1 修复：thinking_token 聚合状态 task_id -> (last_emit_ts, last_accumulated)
-        self._thinking_token_buf: Dict[str, tuple] = {}
+        # #1 修复：token 事件聚合状态 (task_id, event_type) -> (last_emit_ts, last_accumulated_len)；
+        # thinking_token 与 content_token 缓冲独立，交替到达互不刷新窗口
+        self._token_coalesce_buf: Dict[tuple, tuple] = {}
     
     async def add_event(
         self,
@@ -327,8 +333,9 @@ class EventManager:
             "timestamp": timestamp.isoformat(),
         }
         
-        # 保存到数据库（跳过高频事件如 thinking_token）
-        skip_db_events = {"thinking_token"}
+        # 保存到数据库（跳过高频 token 事件：thinking_token/content_token；
+        # 全文由 thinking_end/content_end 落库兜底，重连/回放不丢内容）
+        skip_db_events = {"thinking_token", "content_token"}
         if self.db_session_factory and event_type not in skip_db_events:
             try:
                 await self._save_event_to_db(event_data)
@@ -344,11 +351,13 @@ class EventManager:
             q = self._event_queues[task_id]
 
             if event_type in self.DROPPABLE_EVENT_TYPES:
-                # 可丢弃事件：时间窗聚合（前端不渲染逐 token，thinking_end 兜底全文）
+                # 可丢弃事件：时间窗聚合（前端不渲染逐 token，以 accumulated 全文
+                # 更新；thinking_end/content_end 落库带全文兜底）
                 metadata = event_data.get("metadata") or {}
                 accumulated = str(metadata.get("accumulated") or "")
                 now = time.monotonic()
-                last = self._thinking_token_buf.get(task_id)
+                buf_key = (task_id, event_type)
+                last = self._token_coalesce_buf.get(buf_key)
                 if last is not None:
                     last_ts, last_len = last
                     within_window = now - last_ts < self.THINKING_TOKEN_COALESCE_WINDOW
@@ -358,19 +367,21 @@ class EventManager:
                     if within_window and small_growth:
                         # 聚合窗口内且增量小：丢弃中间 token（不计数，属正常聚合）
                         return event_id
-                self._thinking_token_buf[task_id] = (now, len(accumulated))
-                # 立即入队，满则丢弃（thinking_token 只是 UX 增强）
+                self._token_coalesce_buf[buf_key] = (now, len(accumulated))
+                # 立即入队，满则丢弃（token 事件只是 UX 增强，end 事件兜底全文）
                 try:
                     q.put_nowait(event_data)
                 except asyncio.QueueFull:
-                    self.dropped_thinking_tokens[task_id] = (
-                        self.dropped_thinking_tokens.get(task_id, 0) + 1
-                    )
-                    dropped_total = self.dropped_thinking_tokens[task_id]
+                    if event_type == "content_token":
+                        counters = self.dropped_content_tokens
+                    else:
+                        counters = self.dropped_thinking_tokens
+                    counters[task_id] = counters.get(task_id, 0) + 1
+                    dropped_total = counters[task_id]
                     # 每 100 条 WARNING 一次，避免日志刷屏
                     if dropped_total % 100 == 0:
                         logger.warning(
-                            f"[EventQueue] Dropped {dropped_total} thinking_token events for task {task_id} "
+                            f"[EventQueue] Dropped {dropped_total} {event_type} events for task {task_id} "
                             f"(queue full, size={q.qsize()}/{q.maxsize}); consumer likely slow or disconnected"
                         )
             elif event_type in self.TERMINAL_EVENT_TYPES:
@@ -395,8 +406,8 @@ class EventManager:
                 # 重要事件：非阻塞入队（DB 已落，重连时 DB 回补可拿到；不再同步等 5s）
                 try:
                     q.put_nowait(event_data)
-                    if event_type in {"thinking_start", "thinking_end", "dispatch",
-                                      "tool_call", "tool_result", "llm_action"}:
+                    if event_type in {"thinking_start", "thinking_end", "content_end",
+                                      "dispatch", "tool_call", "tool_result", "llm_action"}:
                         logger.info(
                             f"[EventQueue] Added {event_type} to queue for task {task_id}, queue size: {q.qsize()}"
                         )
@@ -505,9 +516,12 @@ class EventManager:
         """移除事件队列（清理全部任务级状态）"""
         if task_id in self._event_queues:
             del self._event_queues[task_id]
-        # Code Review Finding #7: 清理 thinking_token 聚合缓冲区（防止内存泄漏）
-        self._thinking_token_buf.pop(task_id, None)
+        # Code Review Finding #7: 清理 token 聚合缓冲区（防止内存泄漏）；
+        # 缓冲键为 (task_id, event_type)，thinking/content 两类都要清
+        for buf_key in [k for k in self._token_coalesce_buf if k[0] == task_id]:
+            self._token_coalesce_buf.pop(buf_key, None)
         self.dropped_thinking_tokens.pop(task_id, None)
+        self.dropped_content_tokens.pop(task_id, None)
         self.dropped_important_events.pop(task_id, None)
     
     def add_callback(self, task_id: str, callback: Callable):

@@ -27,6 +27,9 @@ class StreamEventType(str, Enum):
     THINKING_START = "thinking_start"      # 开始思考
     THINKING_TOKEN = "thinking_token"      # 思考 Token (流式)
     THINKING_END = "thinking_end"          # 思考结束
+    # structured-output-protocol Task 4：正文流独立事件（与思考流分离）
+    CONTENT_TOKEN = "content_token"        # 正文 Token (流式)
+    CONTENT_END = "content_end"            # 正文流结束（带全文，落库兜底）
     
     # 工具调用相关 - LLM 决定调用工具
     TOOL_CALL_START = "tool_call_start"    # 工具调用开始

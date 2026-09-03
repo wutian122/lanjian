@@ -832,7 +832,36 @@ class BaseAgent(ABC):
                 "accumulated": accumulated,
             }
         )
-    
+
+    async def emit_content_token(self, token: str, accumulated_content: str):
+        """发射正文 token 事件（流式输出用）
+
+        structured-output-protocol Task 4：kind="content" 的 chunk 走此事件，
+        与思考流（thinking_token）在事件层分离；metadata 形态与
+        emit_thinking_token 一致（token=增量，accumulated=正文通道累计全文）。
+        """
+        await self.emit_event(
+            "content_token",
+            "",  # 不需要 message，前端从 metadata 获取
+            metadata={
+                "token": token,
+                "accumulated": accumulated_content,
+            }
+        )
+
+    async def emit_content_end(self, full_content: str):
+        """发射正文流结束事件（流式输出用）
+
+        与 thinking_end 对称：携带正文全文 accumulated，落库供 SSE 重连/历史
+        回放校准（content_token 高频不落库、队列满可丢弃，前端实时流以
+        metadata.accumulated 全文更新，此事件为最终兜底）。
+        """
+        await self.emit_event(
+            "content_end",
+            "正文输出完成",
+            metadata={"accumulated": full_content}
+        )
+
     async def emit_thinking_end(self, full_response: str):
         """发射思考结束事件（流式输出用）"""
         await self.emit_event(
@@ -1103,6 +1132,16 @@ class BaseAgent(ABC):
             messages = self.compress_messages_if_needed(messages)
 
         accumulated = ""
+        # structured-output-protocol Task 4：思考/正文通道各自累计。
+        # accumulated_content 仅正文（返回值/Final Answer 解析视角），
+        # accumulated_reasoning 仅思考（thinking_end 收尾视角）；
+        # accumulated 保留为拼接/兼容视角（旧后端无 kind 时的全文、error/timeout 兜底）。
+        accumulated_content = ""
+        accumulated_reasoning = ""
+        # 本轮流是否为新协议（chunk 带 kind）：决定 end 事件语义；
+        # content_emitted：本轮是否发射过正文 token（决定是否发 content_end）。
+        stream_has_kind = False
+        content_emitted = False
         total_tokens = 0
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
@@ -1117,7 +1156,8 @@ class BaseAgent(ABC):
         logger.info(f"[{self.name}] ✅ thinking_start emitted, starting LLM stream...")
 
         async def _consume() -> Tuple[str, int]:
-            nonlocal accumulated, total_tokens
+            nonlocal accumulated, accumulated_content, accumulated_reasoning
+            nonlocal stream_has_kind, content_emitted, total_tokens
             # 获取流式迭代器（传入 None 时使用用户配置）
             stream = self.llm_service.chat_completion_stream(
                 messages=messages,
@@ -1151,29 +1191,49 @@ class BaseAgent(ABC):
                     if chunk["type"] == "token":
                         first_token_received = True
                         token = chunk["content"]
-                        # 🔥 累积 content，确保 accumulated 变量更新
-                        # 注意：某些 adapter 返回的 chunk["accumulated"] 可能已经包含了累积值，
-                        # 但为了安全起见，如果不一致，我们自己累积
+                        # structured-output-protocol Task 4：按 chunk kind 分流。
+                        # adapter（Task 3）对 reasoning_content/content 两个独立通道
+                        # 分别 yield 并带 accumulated_content/accumulated_reasoning 累计键；
+                        # 旧后端/NATIVE_ONLY 伪流式 chunk 无 kind，保持全量走思考流（兼容）。
+                        kind = chunk.get("kind")
+                        # 拼接累计键（新协议=思考+正文按序拼接，旧后端=全文）：
+                        # 必须在分支发射前读取——旧路径思考流的 accumulated 即此值；
+                        # 新路径它只作 error/timeout 兜底返回值（done 时被 content 覆盖）
                         if "accumulated" in chunk:
                             accumulated = chunk["accumulated"]
+                        if kind == "reasoning":
+                            stream_has_kind = True
+                            # 信任 adapter 的通道累计键（同旧逻辑信任 accumulated），缺失则自拼
+                            if "accumulated_reasoning" in chunk:
+                                accumulated_reasoning = chunk["accumulated_reasoning"]
+                            else:
+                                accumulated_reasoning += token
+                            await self.emit_thinking_token(token, accumulated_reasoning)
+                        elif kind == "content":
+                            stream_has_kind = True
+                            content_emitted = True
+                            if "accumulated_content" in chunk:
+                                accumulated_content = chunk["accumulated_content"]
+                            else:
+                                accumulated_content += token
+                            await self.emit_content_token(token, accumulated_content)
                         else:
-                            # 如果 adapter 没返回 accumulated，我们自己拼
-                            # 注意：如果是 token 类型，content 是增量
-                            # 如果 accumulated 被覆盖了，需要小心。
-                            # 实际上 service.py 中 chat_completion_stream 保证了 accumulated 存在
-                            # 这里我们信任 service 层的 accumulated
-                            pass
+                            # 无 kind（旧后端/伪流式）：全部走思考流，行为同 Task 4 前
+                            if not accumulated and token:
+                                accumulated += token  # adapter 未返回 accumulated 时的 fallback
+                            await self.emit_thinking_token(token, accumulated)
 
-                        # Double check if accumulated is empty but we have token
-                        if not accumulated and token:
-                            accumulated += token # Fallback
-
-                        await self.emit_thinking_token(token, accumulated)
                         # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
                         await asyncio.sleep(0)
 
                     elif chunk["type"] == "done":
+                        # Task 3 语义：done.content 仅正文（旧后端/伪流式无 reasoning 键，
+                        # content 即全文）；新协议 done 另带 reasoning 仅思考累计。
                         accumulated = chunk["content"]
+                        if "reasoning" in chunk:
+                            stream_has_kind = True
+                            accumulated_content = chunk["content"]
+                            accumulated_reasoning = chunk["reasoning"]
                         if chunk.get("usage"):
                             total_tokens = chunk["usage"].get("total_tokens", 0)
                         # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
@@ -1236,7 +1296,15 @@ class BaseAgent(ABC):
             await self.emit_event("error", f"LLM 调用错误: {str(e)}")
             accumulated = f"[LLM调用错误: {str(e)}] 请重试。"
         finally:
-            await self.emit_thinking_end(accumulated)
+            # 正文流收尾（仅新协议且本轮发射过正文 token）：content_end 带正文全文，
+            # 落库供 SSE 重连/历史回放校准，先于 thinking_end 发射
+            if content_emitted:
+                await self.emit_content_end(accumulated_content)
+            # thinking_end：新协议传仅思考累计（思考区收尾显示思考文本而非正文）；
+            # 旧后端无 kind 分流，保持传全文累计（前端 cleanThinkingContent 兼容路径不变）
+            await self.emit_thinking_end(
+                accumulated_reasoning if stream_has_kind else accumulated
+            )
         
         # 🔥 记录空响应警告，帮助调试
         if not accumulated or not accumulated.strip():

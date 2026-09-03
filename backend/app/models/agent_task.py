@@ -205,6 +205,12 @@ class AgentEventType:
     THINKING = "thinking"
     PLANNING = "planning"
     DECISION = "decision"
+
+    # 流式 Token（structured-output-protocol：思考流/正文流事件层分离）
+    # thinking_start/thinking_token/thinking_end 为历史字符串事件（未入本常量类）；
+    # 正文流为新协议事件，此处登记常量
+    CONTENT_TOKEN = "content_token"  # 正文 Token (流式)
+    CONTENT_END = "content_end"      # 正文流结束（带全文，落库兜底）
     
     # 工具调用
     TOOL_CALL = "tool_call"
