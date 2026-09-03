@@ -709,6 +709,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
         accumulated_content = ""
         accumulated_reasoning = ""
         accumulated_all = ""
+        # structured-output-protocol Task 7：流式 tool_calls 聚合。
+        # OpenAI 流式形态：delta.tool_calls[{index, id, function:{name, arguments 增量}}]，
+        # id/name 通常仅首块到达，arguments 按块增量拼接；按 index 归槽。
+        aggregated_tool_calls: Dict[int, Dict[str, Any]] = {}
         finished = False  # 是否已发射 finish_reason 的 done（防兜底路径重复发 done）
         final_usage = None  # 🔥 存储最终的 usage 信息
         chunk_count = 0  # 🔥 跟踪 chunk 数量
@@ -745,6 +749,25 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     or ""
                 )
                 finish_reason = chunk.choices[0].finish_reason
+
+                # 流式 tool_calls 聚合（Task 7）：同一 index 的 id/name 首块到达、
+                # arguments 增量拼接；缺失字段（后续块 id/name 为 None）不覆盖。
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    for tc in delta_tool_calls:
+                        tc_index = getattr(tc, "index", 0) or 0
+                        slot = aggregated_tool_calls.setdefault(
+                            tc_index, {"id": None, "name": None, "arguments": ""}
+                        )
+                        if getattr(tc, "id", None):
+                            slot["id"] = tc.id
+                        tc_function = getattr(tc, "function", None)
+                        if tc_function is not None:
+                            if getattr(tc_function, "name", None):
+                                slot["name"] = tc_function.name
+                            fn_arguments = getattr(tc_function, "arguments", None)
+                            if fn_arguments:
+                                slot["arguments"] += fn_arguments
 
                 # 思考与正文同轮出现时各自独立 yield（两个 if，非 if/else）；
                 # 思考阶段先于正文阶段到达，reasoning piece 先 yield。
@@ -786,10 +809,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         logger.debug(f"Estimated usage: {final_usage}")
 
                     # 🔥 ENHANCED: 如果累积内容为空但有 finish_reason，记录警告
-                    if not accumulated_all:
+                    if not accumulated_all and not aggregated_tool_calls:
                         logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
 
-                    yield {
+                    done_chunk: Dict[str, Any] = {
                         "type": "done",
                         # 语义拆分（Task 3）：content 仅正文累计、reasoning 仅思考累计；
                         # accumulated 为两者拼接（兼容旧下游，Task 4 切换消费）
@@ -799,13 +822,20 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         "usage": final_usage,
                         "finish_reason": finish_reason,
                     }
+                    # Task 7：tool_calls 聚合结果随 done 输出（无 tool_calls 不带该键）
+                    if aggregated_tool_calls:
+                        done_chunk["tool_calls"] = [
+                            aggregated_tool_calls[idx]
+                            for idx in sorted(aggregated_tool_calls)
+                        ]
+                    yield done_chunk
                     finished = True
                     break
 
             # 🔥 ENHANCED: 如果循环结束但没有收到 finish_reason，也需要返回 done
             # （finished 守卫：已发过 finish_reason done 的流不得再补发 done，
             # 旧实现靠消费方拿到 done 后停止拉取隐式规避，全量排空时会重复发）
-            if accumulated_all and not finished:
+            if (accumulated_all or aggregated_tool_calls) and not finished:
                 logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_all)} chars)")
                 if not final_usage:
                     output_tokens_estimate = estimate_tokens(accumulated_all)
@@ -814,7 +844,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         "completion_tokens": output_tokens_estimate,
                         "total_tokens": input_tokens_estimate + output_tokens_estimate,
                     }
-                yield {
+                done_chunk = {
                     "type": "done",
                     "content": accumulated_content,
                     "reasoning": accumulated_reasoning,
@@ -822,6 +852,12 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     "usage": final_usage,
                     "finish_reason": "complete",
                 }
+                if aggregated_tool_calls:
+                    done_chunk["tool_calls"] = [
+                        aggregated_tool_calls[idx]
+                        for idx in sorted(aggregated_tool_calls)
+                    ]
+                yield done_chunk
 
         except litellm.exceptions.RateLimitError as e:
             # 速率限制错误 - 需要特殊处理

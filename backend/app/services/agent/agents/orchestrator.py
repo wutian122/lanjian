@@ -956,6 +956,14 @@ class OrchestratorAgent(BaseAgent):
                     except Exception as e:
                         logger.error(f"[{self.name}] 上下文压缩失败: {e}")
 
+                # structured-output-protocol Task 7：后端能力探测支持 tools 时
+                # 注入调度轮三函数定义；探测不可用/未探测（属性为 None）时不传，
+                # 保持 ReAct 文本协议现状（降级共存）。tool_choice 不传。
+                orchestrator_tools = None
+                backend_caps = getattr(self.llm_service, "backend_capabilities", None)
+                if backend_caps is not None and getattr(backend_caps, "tools", False):
+                    orchestrator_tools = self._build_orchestrator_tool_defs()
+
                 # 调用 LLM 进行思考和决策（流式输出）
                 try:
                     llm_output, tokens_this_round = await self.stream_llm_call(
@@ -963,6 +971,7 @@ class OrchestratorAgent(BaseAgent):
                         # 🔥 v3.0: 使用 Orchestrator 专用 temperature
                         temperature=get_agent_config().llm_temperature_orchestrator,
                         # 🔥 frequency_penalty/presence_penalty 通过 LLMConfig -> litellm_adapter.stream_complete 生效
+                        tools=orchestrator_tools,
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
@@ -970,8 +979,11 @@ class OrchestratorAgent(BaseAgent):
 
                 self._total_tokens += tokens_this_round
 
-                # 🔥 检测空响应
-                if not llm_output or not llm_output.strip():
+                # Task 7：本轮是否为原生 tool_calls 响应（done chunk 聚合结果）
+                tool_calls_this_round = getattr(self, "_last_tool_calls", None)
+
+                # 🔥 检测空响应（tool_calls 形态正文为空属正常，不判空）
+                if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     logger.warning(f"[{self.name}] Empty LLM response")
                     empty_retry_count = getattr(self, '_empty_retry_count', 0) + 1
                     self._empty_retry_count = empty_retry_count
@@ -1073,8 +1085,15 @@ Action Input: {{"参数": "值"}}
                 # 重置 API 重试计数器（成功获取响应后）
                 self._api_retry_count = 0
 
-                # 解析 LLM 的决策
-                step = self._parse_llm_response(llm_output)
+                # 解析 LLM 的决策（Task 7 双形态）
+                if tool_calls_this_round:
+                    # 原生 tool_calls 形态：直接映射为 AgentStep。服务端
+                    # tool-call-parser 保证结构合法，不参与文本格式错误重试；
+                    # 未知函数名/坏参数由现有"未知操作"/参数缺失观察分支自愈。
+                    step = self._step_from_tool_calls(tool_calls_this_round)
+                else:
+                    # 文本协议（Thought:/Action:/Action Input:）：现状路径不变
+                    step = self._parse_llm_response(llm_output)
 
                 if not step:
                     # 🔥 v3.0: LLM 输出格式不正确，智能重试策略
@@ -1145,9 +1164,19 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     await self.emit_llm_thought(step.thought, iteration + 1)
 
                 # 添加 LLM 响应到历史
+                if tool_calls_this_round and step:
+                    # Task 7：tool_calls 形态合成 ReAct 文本入历史——多轮历史与
+                    # 文本协议自洽（后续 Observation 仍为 user 消息），避免 assistant
+                    # 空 content 在 tools 模式下造成后端对话状态混乱
+                    history_content = (
+                        f"Action: {step.action}\n"
+                        f"Action Input: {json.dumps(step.action_input, ensure_ascii=False)}"
+                    )
+                else:
+                    history_content = llm_output
                 self._conversation_history.append({
                     "role": "assistant",
-                    "content": llm_output,
+                    "content": history_content,
                 })
 
                 # 执行 LLM 决定的操作
@@ -2078,6 +2107,98 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             action=action,
             action_input=action_input,
         )
+
+    # ============ 原生 tools 协议（structured-output-protocol Task 7）============
+    # 能力探测 tools=True 时，调度轮携带 OpenAI tools 定义，模型 tool_calls 响应
+    # 直接映射到现有 action 分发；文本协议（Thought:/Action:/Action Input:）路径
+    # 原样保留（降级共存，spec llm-structured-output 第三 Requirement）。
+
+    def _build_orchestrator_tool_defs(self) -> list[dict[str, Any]]:
+        """调度轮 OpenAI tools 定义：三函数与文本协议 Action 一一对应。
+
+        不传 tool_choice：模型可自由选择工具或文本（温和约束，避免强推导致
+        模型混乱）；finish 无参数，现有 finish 门禁链（沙箱证据/覆盖率等）不变。
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "dispatch_agent",
+                    "description": (
+                        "调度一个子 Agent 执行审计任务。"
+                        "recon=信息收集（项目结构/技术栈/入口点），"
+                        "analysis=深度代码审计与漏洞检测，"
+                        "verification=在沙箱中验证发现的漏洞并生成 PoC。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {
+                                "type": "string",
+                                "enum": ["recon", "analysis", "verification"],
+                                "description": "要调度的子 Agent 名称",
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "具体任务描述（目标与范围）",
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "任务上下文（已知信息、前置发现）",
+                            },
+                        },
+                        "required": ["agent", "task"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "finish",
+                    "description": (
+                        "完成审计并收尾。仅在审计覆盖充分、发现均已处理后调用；"
+                        "系统仍会执行验证证据/覆盖率门禁检查。"
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "summarize",
+                    "description": "查看当前已收集发现的汇总（不结束审计）",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+    def _step_from_tool_calls(
+        self, tool_calls: list[dict[str, Any]] | None
+    ) -> AgentStep | None:
+        """tool_calls 响应映射为 AgentStep（与文本协议 _parse_llm_response 对等）。
+
+        取第一个工具调用：function.name → action，function.arguments（JSON 字符串）
+        → action_input。tool_calls 形态由服务端 tool-call-parser 保证合法，因此
+        不走文本格式错误重试计数；非法 JSON/未知函数名不抛错——空参数或原名
+        进入现有分发分支（"未知操作"/参数缺失观察喂回模型自愈）。
+        """
+        if not tool_calls:
+            return None
+        call = tool_calls[0] or {}
+        action = str(call.get("name") or "").strip()
+        arguments = call.get("arguments")
+        if isinstance(arguments, dict):
+            parsed: dict[str, Any] = arguments
+        elif isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+        else:
+            parsed = {}
+        return AgentStep(thought="", action=action, action_input=parsed)
 
     async def _dispatch_agent(self, params: dict[str, Any]) -> str:
         """调度子 Agent（支持单个和批量并行）"""

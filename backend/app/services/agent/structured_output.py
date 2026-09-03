@@ -307,6 +307,9 @@ async def probe_backend_capabilities(
             api_key=api_key or "dummy",
             base_url=base_url,
             timeout=timeout,
+            # Task 6 承接项：SDK 默认 max_retries=2，死后端每次重试叠加超时
+            # （实测 15-30s 延迟）；探测本身已有缓存与降级，即时失败由外层兜底
+            max_retries=0,
         )
         tools_task = asyncio.create_task(_probe_tools(client, model))
         guided_task = asyncio.create_task(_probe_guided_json(client, model))

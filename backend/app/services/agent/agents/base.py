@@ -328,6 +328,9 @@ class BaseAgent(ABC):
         # LLM 输出截断标志：最近一轮 stream_llm_call 是否 finish_reason=length
         # （每轮调用开始时重置；Final Answer 解析失败路径据此归因"疑似 max_tokens 截断"）
         self._last_llm_truncated = False
+        # structured-output-protocol Task 7：最近一轮流式响应的原生 tool_calls
+        # （done chunk 聚合结果，None=该轮无 tool_calls；每轮调用开始时重置）
+        self._last_tool_calls: Optional[List[Dict[str, Any]]] = None
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -1112,6 +1115,7 @@ class BaseAgent(ABC):
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         auto_compress: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[str, int]:
         """
         统一的流式 LLM 调用方法
@@ -1123,6 +1127,9 @@ class BaseAgent(ABC):
             temperature: 温度（None 时使用用户配置）
             max_tokens: 最大 token 数（None 时使用用户配置）
             auto_compress: 是否自动压缩过长的消息历史
+            tools: OpenAI function-calling 工具定义（structured-output-protocol
+                Task 7；None=不传，走 ReAct 文本协议）。响应为 tool_calls 形态时
+                聚合结果落到 self._last_tool_calls（每轮重置），供调用方分发
 
         Returns:
             (完整响应内容, token数量)
@@ -1145,6 +1152,8 @@ class BaseAgent(ABC):
         total_tokens = 0
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
+        # Task 7：每轮重置 tool_calls 暴露槽（done chunk 聚合结果写入）
+        self._last_tool_calls = None
 
         # 🔥 在开始 LLM 调用前检查取消
         if self.is_cancelled:
@@ -1163,6 +1172,7 @@ class BaseAgent(ABC):
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                tools=tools,
             )
             # 兼容不同版本的 python async generator
             iterator = stream.__aiter__()
@@ -1234,6 +1244,10 @@ class BaseAgent(ABC):
                             stream_has_kind = True
                             accumulated_content = chunk["content"]
                             accumulated_reasoning = chunk["reasoning"]
+                        # Task 7：原生 tool_calls 聚合结果（adapter done 块携带）；
+                        # 无该键时保持开头重置的 None（文本协议轮）
+                        if chunk.get("tool_calls"):
+                            self._last_tool_calls = chunk["tool_calls"]
                         if chunk.get("usage"):
                             total_tokens = chunk["usage"].get("total_tokens", 0)
                         # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志

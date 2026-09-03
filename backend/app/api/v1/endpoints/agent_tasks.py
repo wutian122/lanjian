@@ -877,10 +877,11 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             # 多后端能力探测（structured-output-protocol Task 6）：任务启动时探测
             # tools/guided_json 能力并记录到事件流；探测失败/超时 → 全 False 降级
             # ReAct 文本协议，探测本身永不阻塞任务。
+            # Task 6 承接项：走 LLMService.get_backend_capabilities()，探测结果
+            # 同步写回 service 实例属性（backend_capabilities），Agent 循环
+            # （Task 7/8）据此选原生/文本协议。
             try:
-                from app.services.agent.structured_output import get_backend_capabilities
-
-                caps = await get_backend_capabilities(llm_service)
+                caps = await llm_service.get_backend_capabilities()
                 caps_summary = caps.capabilities_summary()
                 if caps.probe_error and not (caps.tools or caps.guided_json):
                     await event_emitter.emit_warning(

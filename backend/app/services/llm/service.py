@@ -600,12 +600,15 @@ Please analyze the following code:
                     "total_tokens": response.usage.total_tokens or 0,
                 }
             if not content:
-                yield {
+                done_chunk: Dict[str, Any] = {
                     "type": "done",
                     "content": "",
                     "usage": usage,
                     "finish_reason": response.finish_reason or "stop",
                 }
+                if response.tool_calls:
+                    done_chunk["tool_calls"] = response.tool_calls
+                yield done_chunk
             else:
                 accumulated = ""
                 chunk_size = 20
@@ -617,12 +620,15 @@ Please analyze the following code:
                         "content": part,
                         "accumulated": accumulated,
                     }
-                yield {
+                done_chunk = {
                     "type": "done",
                     "content": content,
                     "usage": usage,
                     "finish_reason": response.finish_reason or "stop",
                 }
+                if response.tool_calls:
+                    done_chunk["tool_calls"] = response.tool_calls
+                yield done_chunk
         else:
             from .adapters.litellm_adapter import LiteLLMAdapter
             adapter = LiteLLMAdapter(self.config)
