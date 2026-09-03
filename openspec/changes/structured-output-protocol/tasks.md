@@ -50,6 +50,7 @@
 ## Phase 4: 原生工具调用协议
 
 ### Task 7: Orchestrator 调度轮 tools 协议
+- [x] **Task 7 完成**（commit afe4fe4，review CLEAN——门禁链 hunk 级零触碰核实（finish 走同一条沙箱/覆盖率门禁链）、双形态分发等价（事件/迭代/token 统计）、流式 tool_calls 聚合正确（index 归槽/增量拼接/双 done 出口）、caps 时序正确（探测先于 orchestrator 构造）；tool_choice 不传（温和约束）；4 Minor 记账：①未知操作自愈轮历史丢正文 Thought（无功能破坏）；②同轮混合形态 tool_calls 优先的边界待 Task 8 文档化；③_step_from_tool_calls 扁平 dict 形态约定隐式耦合（Task 8 复用）；④**tests conftest 统一环境第三次记账，优先处理**）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（:961 调用点 + tool_calls 分发映射 + finish/summarize 语义保持）
 - Interfaces: tools=[dispatch_agent, finish, summarize]（get_tool_descriptions 改造复用）；tool_calls → 现有 action 分发等价映射；文本路径保留
 - TDD: 失败测试（mock tool_calls 响应 → dispatch/finish/summarize 三种分发等价于文本协议；探测不可用 → 文本路径回归）→ 实现 → 通过 → commit
