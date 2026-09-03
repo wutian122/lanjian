@@ -59,6 +59,121 @@ def _detect_max_tokens_error(error_str: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# 关思考护栏（structured-output-protocol / spec: thinking-stream-separation）
+#
+# 老板 2026-09-03 实测（Qwen3 thinking 模型，SGLang --reasoning-parser qwen3）：
+# 服务端 reasoning-parser 修正前，任何"关闭思考"的手段都会让模型正文被服务端
+# parser 整个吞进 reasoning_content、content 恒为空——比思考退化乱码更糟：
+#   * enable_thinking: false 请求参数被端点忽略（无害但无效）；
+#   * 提示词注入 <|think_off|>：思考真的关了，但 content 恒为空（有害）；
+#   * /no_think 是 Qwen3 官方软切换命令（/think 为开启），同属关闭方向。
+# 护栏在请求构造的最后出口（_send_request / stream_complete / _native_openai_call
+# 三处出站路径）剥除一切关思考参数与提示词标记，请求强制以思考模式发出。
+#
+# 解除条件：SGLang/vLLM 服务端 reasoning-parser 修正（关思考后 content 能正常
+# 返回）并经实测验证后，本护栏与其测试可一并移除。在此之前配置层（core/config.py、
+# 用户配置、前端设置页）SHALL NOT 新增任何关思考开关项。
+# ---------------------------------------------------------------------------
+
+# 关思考提示词标记：<|think_off|>（注入式 special token）与 /no_think（Qwen3 软开关）。
+# /think 为开启标记，不在拦截列。大小写不敏感（服务端模板匹配同样大小写宽容）。
+_THINK_OFF_MARKER_PATTERN = re.compile(r"<\|think_off\|>|/no_think", re.IGNORECASE)
+
+# 思考开关键名（SGLang/vLLM/Qwen  dashscope 三家统一为 enable_thinking），
+# 可出现在请求顶层、extra_body/extra_params、chat_template_kwargs 任意层级。
+_THINK_SWITCH_KEY = "enable_thinking"
+
+# enable_thinking 的"关"语义字符串值（bool False / int 0 单独判定）
+_THINK_OFF_STR_VALUES = frozenset({"false", "0", "no", "off", "disable", "disabled"})
+
+
+def _is_thinking_off_value(value: Any) -> bool:
+    """判定开关值是否为"关思考"语义。只拦关闭方向：True/1/"true"/"yes" 不拦。"""
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, int):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in _THINK_OFF_STR_VALUES
+    return False
+
+
+def _strip_thinking_off(node: Any, path: str, hits: List[str]) -> Any:
+    """递归剥除 dict/list/str 节点中的关思考参数与提示词标记（原地修改容器）。
+
+    - dict：键名（大小写不敏感）为 enable_thinking 且值为关语义 → 删键并记录；
+      其余值递归（覆盖 extra_body/extra_params/chat_template_kwargs/messages 等任意嵌套）；
+    - list：逐元素递归（messages 列表、多模态 content parts）；
+    - str：命中 <|think_off|> 或 /no_think 标记 → 替换为空串（正文其余部分原样保留）。
+    """
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            child_path = f"{path}.{key}" if path else str(key)
+            if (
+                isinstance(key, str)
+                and key.lower() == _THINK_SWITCH_KEY
+                and _is_thinking_off_value(node[key])
+            ):
+                hits.append(f"{child_path}={node[key]!r}（关思考参数已剥除）")
+                del node[key]
+            else:
+                node[key] = _strip_thinking_off(node[key], child_path, hits)
+        return node
+    if isinstance(node, list):
+        for idx, item in enumerate(node):
+            node[idx] = _strip_thinking_off(item, f"{path}[{idx}]", hits)
+        return node
+    if isinstance(node, str):
+        matched = _THINK_OFF_MARKER_PATTERN.findall(node)
+        if matched:
+            hits.append(
+                f"{path} 含关思考标记 {sorted(set(matched))}（标记已剥除，正文保留）"
+            )
+            return _THINK_OFF_MARKER_PATTERN.sub("", node)
+        return node
+    return node
+
+
+def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str, Any]:
+    """关思考护栏：在请求构造的最后出口对即将出站的 kwargs 调用，原地剥除一切
+    关思考参数/提示词标记，保证请求以思考模式发出。
+
+    背景：Qwen3 thinking 经 SGLang（--reasoning-parser qwen3）服务端在 parser
+    修正前，关思考会导致正文被吞进 reasoning_content、content 恒空（老板实测，
+    见本模块护栏注释）。拦截对象（大小写不敏感、递归检查）：
+      1. 顶层或 extra_body/extra_params/chat_template_kwargs 任意层级的
+         enable_thinking=关语义（False/0/"false"/"no"/"off"/"disable(d)"）；
+      2. messages 任意 content 内的 <|think_off|> 注入标记与 /no_think 软开关
+         （/think 开启标记不拦）。
+
+    命中处理：剥除该参数/标记 + logger.warning（含触发位置 source 与剥除明细）。
+    适配器层拿不到 event_emitter（llm 适配层无事件链路引用），故以 logger.warning
+    留痕；返回 {"stripped": [明细...]} 供调用方/未来事件链路发射 warning 事件。
+    零命中时不修改 params、不输出日志（正常请求零行为变化）。
+
+    解除条件：服务端 reasoning-parser 修正并实测验证后本护栏可移除。
+
+    Args:
+        params: 即将发往端点的请求 kwargs（litellm/acompletion 或 openai create 风格）。
+        source: 触发位置标识（"_send_request" / "stream_complete" / "_native_openai_call"）。
+
+    Returns:
+        {"stripped": [剥除项描述, ...]}；空列表表示零命中。
+    """
+    hits: List[str] = []
+    _strip_thinking_off(params, "", hits)
+    if hits:
+        logger.warning(
+            "关思考护栏拦截（位置=%s）：检测到 %d 处关思考参数/标记，已剥除并强制以思考模式"
+            "发出请求（服务端 reasoning-parser 修正前关思考会导致 content 恒空）。明细：%s",
+            source,
+            len(hits),
+            "；".join(hits),
+        )
+    return {"stripped": hits}
+
+
 class LiteLLMAdapter(BaseLLMAdapter):
     """
     LiteLLM 统一适配器
@@ -234,6 +349,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         适用于设置了自定义 base_url 的 OpenAI 兼容 API（如讯飞 MaaS）。
         """
+        # 关思考护栏（structured-output-protocol）：native 路径最后出口。
+        # 与 _send_request 出口那道幂等双保险——未来若有新调用方直接调本方法也绕不过。
+        _assert_no_thinking_off(kwargs, source="_native_openai_call")
+
         import openai
 
         # 提取模型名（去掉 openai/ 前缀）
@@ -358,6 +477,11 @@ class LiteLLMAdapter(BaseLLMAdapter):
         if self.config.provider == LLMProvider.OPENAI:
             kwargs["frequency_penalty"] = self.config.frequency_penalty
             kwargs["presence_penalty"] = self.config.presence_penalty
+
+        # 关思考护栏（structured-output-protocol）：非流式路径最后出口。
+        # kwargs 已完全成型，native/litellm 两个分支都在其后发出，统一在此清洗；
+        # native 分支内 _native_openai_call 还有一道幂等双保险。
+        _assert_no_thinking_off(kwargs, source="_send_request")
 
         try:
             # 当使用 OPENAI + 自定义 base_url 时，直接使用原生 OpenAI 客户端
@@ -517,6 +641,10 @@ class LiteLLMAdapter(BaseLLMAdapter):
             kwargs["frequency_penalty"] = self.config.frequency_penalty
         if self.config.presence_penalty:
             kwargs["presence_penalty"] = self.config.presence_penalty
+
+        # 关思考护栏（structured-output-protocol）：流式路径最后出口，
+        # kwargs 已完全成型，在 litellm.acompletion 发出前统一清洗
+        _assert_no_thinking_off(kwargs, source="stream_complete")
 
         accumulated_content = ""
         final_usage = None  # 🔥 存储最终的 usage 信息
