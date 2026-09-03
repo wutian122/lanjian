@@ -260,6 +260,18 @@ Action Input: {"scan_type": "security", "max_files": 50}
 现在开始你的安全分析！首先使用外部工具进行全面扫描。"""
 
 
+# structured-output-protocol Task 8：能力探测 tools=True 时，首轮注入一次的
+# submit_findings 协议说明。analysis 侧无代码级"先 Action 后 Final"门禁
+# （"禁止直接输出 Final Answer"仅在系统提示词中），故必须显式告知模型：
+# 函数工具只有 submit_findings、日常工作工具仍走文本协议、未审计前禁止交卷——
+# 防止模型首轮凭推测调用 submit_findings 产出未审计 findings 直接交卷。
+SUBMIT_FINDINGS_PROTOCOL_NOTE = """【工具协议说明】函数调用工具的使用规则
+当前环境支持函数调用（工具），但只有一个函数工具 submit_findings，专门用于提交最终漏洞报告：
+1. 日常工作工具仍走文本格式：semgrep_scan、bandit_scan、gitleaks_scan、read_file、search_code 等分析操作，必须继续按文本协议输出 "Action: <工具名>" 和 "Action Input: <JSON 参数>"，不要尝试调用不存在的函数；
+2. submit_findings 仅用于提交最终报告：禁止在完成安全扫描并用 read_file 实际阅读代码之前调用它——没有实际工具调用的分析无效，凭推测提交的漏洞属于幻觉；
+3. 完成审计后调用 submit_findings 提交报告；确认没有漏洞时，findings 传空数组，并在 summary 中说明分析过程与观察到的风险点。"""
+
+
 @dataclass
 class AnalysisStep:
     """分析步骤"""
@@ -415,9 +427,10 @@ class AnalysisAgent(BaseAgent):
     def _build_findings_schema(self) -> Dict[str, Any]:
         """findings 报告 JSON Schema（submit_findings 参数与 guided response_format 共用）。
 
-        字段与系统提示词 "Final Answer 格式" 契约逐项对应。file_path/source/sink
-        允许空串（非污点类发现/路径待回填场景），不列入 item required；其余契约
-        字段强制存在，guided 解码下模型必须填值，消除文本协议的缺字段/截断归零。
+        字段与系统提示词 "Final Answer 格式" 契约逐项对应。source/sink 为可选
+        上下文（不列入 item required）；file_path 在 required 中但允许空串值
+        （非污点类发现/路径待回填场景）；其余契约字段强制存在，guided 解码下
+        模型必须填值，消除文本协议的缺字段/截断归零。
         """
         return {
             "type": "object",
@@ -827,6 +840,8 @@ Final Answer:""",
         self._steps = []
         all_findings = []
         error_message = None  # 🔥 跟踪错误信息
+        # Task 8：submit_findings 协议说明段仅在能力可用时注入一次（首轮）
+        submit_findings_note_injected = False
         
         await self.emit_thinking("🔬 Analysis Agent 启动，LLM 开始自主安全分析...")
         
@@ -861,6 +876,14 @@ Final Answer:""",
                 backend_caps = getattr(self.llm_service, "backend_capabilities", None)
                 if backend_caps is not None and getattr(backend_caps, "tools", False):
                     analysis_tools = [self._build_submit_findings_tool_def()]
+                    # Task 8：首轮注入一次协议说明（降级模式模型看不到
+                    # submit_findings，故只在 tools 能力可用时注入，避免混淆）
+                    if not submit_findings_note_injected:
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": SUBMIT_FINDINGS_PROTOCOL_NOTE,
+                        })
+                        submit_findings_note_injected = True
 
                 # 调用 LLM 进行思考和决策（流式输出）
                 # 🔥 使用用户配置的 temperature 和 max_tokens

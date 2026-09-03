@@ -392,6 +392,22 @@ async def test_analysis_tools_injected_and_submit_findings_finalizes(monkeypatch
         "submit_findings 轮必须合成 Final Answer 文本入历史"
     )
 
+    # 协议说明段：能力 tools=True 时首轮 history 注入一次，告知模型提交规则，
+    # 防止凭推测在未扫描/未读文件前调用 submit_findings 直接交卷。
+    protocol_msgs = [
+        m for m in agent._conversation_history
+        if m["role"] == "user" and "【工具协议说明】" in m["content"]
+    ]
+    assert len(protocol_msgs) == 1, (
+        f"能力 tools=True 时必须注入一次【工具协议说明】到首轮 history；"
+        f"实际 {len(protocol_msgs)} 次"
+    )
+    body = protocol_msgs[0]["content"]
+    assert "submit_findings" in body
+    assert "工作工具仍走文本格式" in body
+    assert "read_file" in body
+    assert "findings" in body and "空数组" in body
+
 
 @pytest.mark.asyncio
 async def test_analysis_broken_arguments_degrade_to_text_path(monkeypatch):
@@ -426,6 +442,12 @@ async def test_analysis_no_tools_when_capability_unavailable_and_text_path(monke
     assert seen[0]["tools"] is None, "能力不可用时不得传 tools"
     assert seen[0]["response_format"] is None
     assert len(result.data["findings"]) == 1
+
+    # 降级模式模型看不到 submit_findings，协议说明段必须缺席（写入反而混淆）
+    assert not any(
+        "【工具协议说明】" in m["content"]
+        for m in agent._conversation_history if m["role"] == "user"
+    ), "能力 tools=False 时不得注入 submit_findings 协议说明段"
 
 
 @pytest.mark.asyncio
@@ -516,6 +538,19 @@ async def test_verification_tool_calls_submit_findings_passes_gate(monkeypatch):
     assistant_msgs = [m for m in agent._conversation_history if m["role"] == "assistant"]
     assert any("Final Answer:" in m["content"] for m in assistant_msgs)
 
+    # 协议说明段：能力 tools=True 时首轮注入一次，含"先沙箱验证后提交"门禁提示
+    protocol_msgs = [
+        m for m in agent._conversation_history
+        if m["role"] == "user" and "【工具协议说明】" in m["content"]
+    ]
+    assert len(protocol_msgs) == 1, (
+        f"Verification 能力 tools=True 时必须注入一次协议说明段；实际 {len(protocol_msgs)} 次"
+    )
+    body = protocol_msgs[0]["content"]
+    assert "submit_findings" in body
+    assert "sandbox_skip_reason" in body
+    assert "无证据提交会被系统拒绝" in body
+
 
 @pytest.mark.asyncio
 async def test_verification_tool_calls_gate_rejects_without_evidence(monkeypatch):
@@ -569,3 +604,9 @@ async def test_verification_text_final_answer_path_unchanged(monkeypatch):
     assert result.success, f"文本协议路径应收尾成功: {result.error}"
     assert seen[0]["tools"] is None
     assert len(result.data["findings"]) == 1
+
+    # 降级模式不注入 submit_findings 协议说明段
+    assert not any(
+        "【工具协议说明】" in m["content"]
+        for m in agent._conversation_history if m["role"] == "user"
+    ), "Verification 能力 tools=False 时不得注入协议说明段"

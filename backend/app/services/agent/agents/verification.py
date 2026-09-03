@@ -623,6 +623,16 @@ read_file 返回: "文件不存在"
 现在开始验证漏洞发现！"""
 
 
+# structured-output-protocol Task 8：能力探测 tools=True 时，首轮注入一次的
+# submit_findings 协议说明。与 analysis 版同理（函数工具只有 submit_findings、
+# 日常工作工具仍走文本协议），并额外强调沙箱证据门禁：无证据提交会被系统拒绝。
+SUBMIT_FINDINGS_PROTOCOL_NOTE = """【工具协议说明】函数调用工具的使用规则
+当前环境支持函数调用（工具），但只有一个函数工具 submit_findings，专门用于提交最终验证报告：
+1. 日常工作工具仍走文本格式：read_file、sandbox_exec 等验证操作，必须继续按文本协议输出 "Action: <工具名>" 和 "Action Input: <JSON 参数>"，不要尝试调用不存在的函数；
+2. submit_findings 仅用于提交最终报告：必须在完成沙箱验证（sandbox_exec 成功复现）或为无法沙箱验证的发现标注 sandbox_skip_reason 之后才调用；无证据提交会被系统拒绝并要求继续验证；
+3. findings 数量必须与输入发现完全一致，file_path/line_start 与输入逐字匹配。"""
+
+
 @dataclass
 class VerificationStep:
     """验证步骤"""
@@ -1185,6 +1195,8 @@ class VerificationAgent(BaseAgent):
         self._tool_call_counts = {}
         self._failed_tool_calls = {}
         final_result = None
+        # Task 8：submit_findings 协议说明段仅在能力可用时注入一次（首轮）
+        submit_findings_note_injected = False
         
         await self.emit_thinking("🔐 Verification Agent 启动，LLM 开始自主验证漏洞...")
         
@@ -1252,6 +1264,14 @@ class VerificationAgent(BaseAgent):
                 backend_caps = getattr(self.llm_service, "backend_capabilities", None)
                 if backend_caps is not None and getattr(backend_caps, "tools", False):
                     verification_tools = [self._build_submit_findings_tool_def()]
+                    # Task 8：首轮注入一次协议说明（含"先沙箱验证后交卷"门禁
+                    # 提示；降级模式模型看不到 submit_findings，不注入以免混淆）
+                    if not submit_findings_note_injected:
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": SUBMIT_FINDINGS_PROTOCOL_NOTE,
+                        })
+                        submit_findings_note_injected = True
 
                 # 调用 LLM 进行思考和决策（流式输出）
                 try:
