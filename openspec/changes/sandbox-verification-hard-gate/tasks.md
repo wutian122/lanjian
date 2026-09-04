@@ -11,6 +11,7 @@
 - TDD: 失败测试（mock 两种空响应形态 → 断言重试提示包含对应 nudge 文案且连续计数正确）→ 实现 → 通过 → commit
 
 ### Task 21: 空/无效 tool_calls 强 nudge 自愈
+- [x] **Task 21 完成**（实施 e31de50 + 回归测试补丁 759f11f，review 初审 NEEDS_FIX（Important：顺带修复的 else 分支回写无测试锁定——变异实证删除该行 580 测试全绿）→ 重审 CLEAN（新测试为回写行唯一精确守卫，变异独立复核）；**顺带修复实锤：旧 else 分支 observation 从未回写 step.observation，"Observation:\nNone" 喂回模型——旧泛化自愈从未生效，R2 退化持续的真根因之一**；Minor 记账：连续无效无上限暂停（max_iterations 兜底）、分类器与映射的解析重复）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（_step_from_tool_calls :2108-2205 与未知操作分支 :1532-1534）
 - Interfaces: 空 name/坏 JSON/空参数 tool_calls 的自愈 observation 强化——现状喂"未知操作: "泛化提示，改为：①空 name → 喂"工具调用缺少函数名，请重新输出，可用操作与参数 schema 如下：[完整三函数定义]"; ②dispatch_agent 空参数 → 喂"agent 参数缺失，必须为 recon/analysis/verification 之一，task 必须非空"; ③连续 2 次无效 tool_calls → 追加"请改用文本格式 Thought:/Action:/Action Input: 输出"（协议降级 nudge）
 - TDD: 失败测试（三种无效形态 → 断言 observation 含 schema 重喂与协议降级 nudge）→ 实现 → 通过 → commit
