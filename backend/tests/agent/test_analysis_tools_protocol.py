@@ -509,6 +509,38 @@ def _verification_input():
 
 
 @pytest.mark.asyncio
+async def test_verification_run_records_trace_verification_results(monkeypatch):
+    """sandbox-verification-hard-gate Task 14 review（Important）：验证收尾挂点守卫。
+
+    直调 _trace_verification_results 的单元测试抓不到"run() 收尾漏调挂点"的变异
+    （审查者实证：删除 verification.py 收尾的挂点行后写点测试全绿——两个验证写点
+    用例均直调 helper）。本用例驱动 run() 全流程，断言 trace 按 finding 数收到
+    add_verification_result 且参数形态正确。
+    """
+    caps = BackendCapabilities(tools=True, guided_json=False)
+    agent = _make_verification(monkeypatch, caps)
+    tm = MagicMock()
+    agent.trace_manager = tm
+    _install_stream(monkeypatch, agent, [
+        {"tool_calls": [_tool_call("submit_findings", json.dumps(VERIFICATION_PAYLOAD, ensure_ascii=False))],
+         "output": ""},
+    ])
+
+    result = await agent.run(_verification_input())
+
+    assert result.success, f"验证应收尾成功: {result.error}"
+    assert len(result.data["findings"]) == 1
+    tm.add_verification_result.assert_called_once()
+    kwargs = tm.add_verification_result.call_args.kwargs
+    assert kwargs["finding_id"], "finding_id 必须非空（id/_sandbox_finding_id 兜底链）"
+    assert isinstance(kwargs["verified"], bool)
+    assert "verification_status=" in kwargs["evidence"]
+    # 参数形态锁定（finding_title/sandbox_output 键存在；零尝试豁免时 sandbox_output=None）
+    assert kwargs["finding_title"]
+    assert "sandbox_output" in kwargs
+
+
+@pytest.mark.asyncio
 async def test_verification_tool_calls_submit_findings_passes_gate(monkeypatch):
     """Verification tool_calls 形态：tools 注入 + submit_findings 交卷；
 

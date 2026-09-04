@@ -180,6 +180,33 @@ def test_execute_tool_exception_recorded(tmp_path):
     assert "dummy_tool" in trace.entries[-1].content["tool"]
 
 
+def test_execute_tool_timeout_records_tool_call():
+    """M1（review 第 1 轮）：超时分支写点守卫——工具执行超过 tool_timeout 时，
+    trace 必须记一次 success=False 的工具调用（变异该分支写点即红）。"""
+    tm = MagicMock()
+    agent = _make_verification_agent()
+    agent.trace_manager = tm
+    # slow_tool 不在 tool_timeouts 特判表内，走 default_tool_timeout——压到 0.05s
+    agent._timeout_config = {"tool_timeout": 0.05}
+    tool = MagicMock()
+
+    async def _slow(**kwargs):
+        await asyncio.sleep(0.3)
+        return ToolResult(success=True, data="late")
+
+    tool.execute = _slow
+    agent.tools["slow_tool"] = tool
+
+    result = asyncio.run(agent.execute_tool("slow_tool", {}))
+
+    assert "超时" in result
+    tm.add_tool_call.assert_called_once()
+    kwargs = tm.add_tool_call.call_args.kwargs
+    assert kwargs["tool_name"] == "slow_tool"
+    assert kwargs["success"] is False
+    assert "超时" in str(kwargs["output"])
+
+
 # ---------- 2. LLM 写点 ----------
 
 def test_stream_llm_call_records_llm_call(tmp_path):
@@ -219,6 +246,38 @@ def test_stream_llm_call_truncated_flag_recorded(tmp_path):
     asyncio.run(agent.stream_llm_call([{"role": "user", "content": "hi"}]))
 
     assert trace.entries[-1].content["truncated"] is True
+
+
+def test_stream_llm_call_circuit_open_still_records_llm_call():
+    """M2（review 第 1 轮）：熔断 CircuitOpenError 兜底路径仍落 trace——
+    被熔断拒绝的 LLM 调用也计入 LLM 栏目（token 为 0），变异该路径记账即红。"""
+    circuit = get_llm_circuit()
+    threshold = circuit.config.failure_threshold
+
+    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+        yield {
+            "type": "error", "error_type": "connection", "error": "refused",
+            "user_message": "conn failed", "accumulated": "",
+        }
+
+    agent = _make_recon(_fail)
+    tm = MagicMock()
+    agent.trace_manager = tm
+    for _ in range(threshold):
+        asyncio.run(agent.stream_llm_call([{"role": "user", "content": "hi"}]))
+    assert circuit.is_open, "前置条件：熔断器必须已开启"
+
+    tm.reset_mock()  # 熔断开启前的失败调用记账与本断言无关
+    text, _tokens = asyncio.run(
+        agent.stream_llm_call([{"role": "user", "content": "hi"}])
+    )
+
+    assert "circuit_open" in text
+    tm.add_llm_call.assert_called_once()
+    kwargs = tm.add_llm_call.call_args.kwargs
+    assert kwargs["prompt_tokens"] == 0
+    assert kwargs["completion_tokens"] == 0
+    assert kwargs["truncated"] is False
 
 
 # ---------- 3. 验证写点 ----------
