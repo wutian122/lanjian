@@ -6,8 +6,9 @@ R2 服务端实测模型在 Orchestrator tools 协议下的三种退化形态：
 2. dispatch_agent 空参数（"调度 unknown Agent (任务: )"——agent/task 空，
    现状会真实触发一次子 Agent 调度失败）；
 3. 坏 JSON arguments（_step_from_tool_calls 吞成空参数，模型不知情）。
-现状自愈喂泛化 observation（且"未知操作"分支存在 step.observation 未赋值、
-历史喂回 "Observation:\\nNone" 的缺陷），R2 实测自愈后模型继续退化。
+现状自愈喂泛化 observation（且文本协议"未知操作"分支存在 step.observation
+未回写、历史实际喂回 "Observation:\\nNone" 的缺陷——由 Part 2 末条测试锁定），
+R2 实测自愈后模型继续退化。
 
 Task 21 行为：
 - 分类无效形态 → 强化 observation：空/未知 name 重喂三函数 schema；
@@ -22,7 +23,8 @@ Task 21 行为：
 覆盖：
 Part 1 分类与 nudge 文案（_classify_invalid_tool_call / _invalid_tool_call_nudge）
 Part 2 run 循环集成：三形态 observation、降级 nudge 阈值、有效轮复位、
-       与空响应计数独立、文本协议降级承接、空参不触发真实调度
+       与空响应计数独立、文本协议降级承接、空参不触发真实调度、
+       文本协议未知 Action 的 else 分支 observation 回写锁定
 """
 import sys
 from pathlib import Path
@@ -488,3 +490,49 @@ async def test_invalid_step_recorded_with_nudge_observation(monkeypatch):
     assert invalid_steps[0]["observation"] and "系统提示" in invalid_steps[0]["observation"], (
         "无效步的 observation 必须是强 nudge 文本，不得为 None（旧未知操作分支缺陷）"
     )
+
+
+@pytest.mark.asyncio
+async def test_text_protocol_unknown_action_writes_observation_to_history(monkeypatch):
+    """文本协议未知 Action（_parse_llm_response → else 分支）：observation 必须
+    回写 step.observation 并以 Observation 入历史。
+
+    锁定 Task 21 顺带修复的缺陷：else 分支局部 observation 旧代码未回写 step，
+    循环末尾统一追加的 f"Observation:\\n{step.observation}" 实际喂回的是
+    "Observation:\\nNone"——泛化自愈提示从未送达模型。tool_calls 形态的空/未知
+    name 已由分发前拦截块承接（continue 不触达 else），此分支只服务文本协议。
+    """
+    agent, emitter, dispatch_mock, _ = _make_orch(monkeypatch, caps=_caps_tools())
+    _install_stream(monkeypatch, agent, [
+        {"output": "Thought: 我想直接读个文件\nAction: read_file\nAction Input: {}",
+         "tokens": 9},
+        {"tool_calls": [_tool_call("finish", "{}")]},
+    ])
+
+    result = await agent.run({"project_info": {}, "config": {}})
+
+    assert result.success, f"finish 应收尾成功: {result.error}"
+    dispatch_mock.assert_not_awaited()
+
+    # 历史喂回的 Observation 必须是"未知操作"提示，而非 None
+    obs = _observations(agent)
+    assert not any(o.strip() == "None" for o in obs), (
+        "step.observation 未回写时历史会喂回 'Observation:\\nNone'，自愈提示从未送达模型"
+    )
+    unknown_obs = [o for o in obs if "未知操作" in o]
+    assert len(unknown_obs) == 1, (
+        f"文本协议未知 Action 必须喂回 1 条未知操作 observation，实际: {obs}"
+    )
+    assert "未知操作: read_file" in unknown_obs[0]
+    assert "可用操作: dispatch_agent, summarize, finish" in unknown_obs[0]
+
+    # steps 台账中该步 observation 同为回写文本（结果摘要截断 500 字内不受影响）
+    steps = result.data.get("steps", [])
+    unknown_steps = [s for s in steps if s["action"] == "read_file"]
+    assert len(unknown_steps) == 1
+    assert unknown_steps[0]["observation"] and "未知操作: read_file" in unknown_steps[0]["observation"]
+
+    # 决策事件照常发射（前端可见）
+    events = _emitted(emitter)
+    decisions = [md.get("reason", "") for et, md in events if et == "llm_decision"]
+    assert any("未知操作: read_file" in r for r in decisions)
