@@ -77,6 +77,7 @@
 - TDD: 失败测试（mock LLM 返回 confidence=0.4 + needs_verification=true 的 finding → 通过归一化不被 0.7 阈值丢弃且 is_strict_finding 放行；confidence=0.05 → 仍丢弃）→ 改提示词与 `_normalize_finding`/strict_finding 豁免逻辑 → 通过 → commit
 
 ### Task 10: 强制总结维度级下限
+- [x] **Task 10 完成**（实施 fbf884b + 修复 9717963，review 初审 NEEDS_FIX（Important：重试异常吞首轮 violated 信号）→ 重审 CLEAN（四路径推演 + 变异独立复核）；豁免解析三级容错（词边界防 auth 误归）、tuple 化全调用方适配、主循环路径裁决合理（violated 恒 False）；flaky 三证确认（test_allows_public_hostname 公网 DNS 依赖，10 连过 + 代码实证）；4 Minor 记账转账本）
 - Files: `backend/app/services/agent/agents/analysis.py`（:419-467）
 - Interfaces: data 新增 `dimension_gaps_reported`、`output_floor_violated`
 - TDD: 失败测试（0 候选 0 豁免 → violated=true 且有一次重试提示；有豁免 → violated=false）→ 实现 → 通过 → commit
