@@ -51,6 +51,7 @@
 - TDD: 失败测试（mock hardcoded_secret finding → 存在 attempt 且状态由 attempt+静态证据推导）→ 实现 → 通过 → commit
 
 ### Task 6: 软证据升级前置 attempts 非空
+- [x] **Task 6 完成**（commit cddae98，review CLEAN——b 条四项+附加两项（fabricated 不得凑数/xss STATIC_ONLY 不受影响）全 ✅，四件套齐备的 infra finding 不再被洗白（note 矛盾消除）、真实执行过升级保持；**_attempt_is_infra 提为模块级语义零漂移（状态引擎与软证据共用同一判定）**；既有测试改写是 spec 授权非弱化；三轮变异精准；Task 1 交接两项验收完成；2 Minor 记账：Task 5 短路块内联 infra 判定重复（后续收口为 _attempt_is_infra）、勾选本条即 R1 落账）
 - Files: `backend/app/services/agent/agents/verification.py`（:2296-2320）
 - Interfaces: 升级前置条件 `len(非 infra attempts)>0`
 - TDD: 失败测试（四件套齐备+0 attempts → needs_context；四件套+1 attempt → static_confirmed）→ 实现 → 通过 → commit
