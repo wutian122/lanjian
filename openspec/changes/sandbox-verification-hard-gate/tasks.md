@@ -45,6 +45,7 @@
 ## Phase 2: 沙箱硬门禁（豁免封堵）
 
 ### Task 5: Semgrep 静态短路先执行确定性 PoC
+- [x] **Task 5 完成**（commit d06c472，review CLEAN——a 条五项核实（attempt 推导/证伪 not_reproducible/infra needs_context/零 attempt 不得 is_verified/非四类不变）+ weak_crypto/xxe skip_reason 豁免 + CONCERN 裁决（infra 优先于豁免）确认正确；**架构发现复核属实**：短路四类本来就执行确定性 PoC，缺陷在归一化无视 attempt，改造点收窄到归一化分流执行流零改动；三轮独立变异均被抓；3 Minor 记账：M1 infra 判定内联重复建议抽 helper、M2 零 attempt 补轻量单测、M3 ruff 存量）
 - Files: `backend/app/services/agent/agents/verification.py`（:2271-2281）
 - Interfaces: 短路类型 finding 先产生 attempt；无模板类型写 `sandbox_skip_reason="no_poc_template"`
 - TDD: 失败测试（mock hardcoded_secret finding → 存在 attempt 且状态由 attempt+静态证据推导）→ 实现 → 通过 → commit
