@@ -309,6 +309,10 @@ class OrchestratorAgent(BaseAgent):
         self._finish_gate_rejections: int = 0
         # R6: 门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations
         self._gate_observations: list[dict[str, Any]] = []
+        # sandbox-verification-hard-gate Task 8: R4 达限放行时记录放行原因；
+        # _finish_accepted 标记主循环是否经 LLM finish 正常 break（否则为轮次耗尽退出）
+        self._gate_release_reason: str | None = None
+        self._finish_accepted: bool = False
 
         self._pause_requested: bool = False
         self._pause_future: asyncio.Future[str] | None = None
@@ -535,6 +539,68 @@ class OrchestratorAgent(BaseAgent):
             "task": "系统收口：验证剩余未验证漏洞",
             "context": f"{len(unverified)} 个未验证漏洞",
         })
+
+    # Task 8: 视为"已沙箱验证收口"的终态集合（与 finish 门禁口径一致）
+    _SANDBOX_TERMINAL_VERIFIED_STATUSES = (
+        "confirmed", "static_confirmed", "not_reproducible", "false_positive",
+    )
+
+    def _mark_released_unverified_findings(self, reason: str) -> int:
+        """sandbox-verification-hard-gate Task 8: 放行收尾时逐 finding 写
+        sandbox_skip_reason（显式豁免标记）。
+
+        仅标记仍满足"未沙箱验证"的 finding：非验证终态、is_verified 非 True、
+        零 sandbox_attempts、且无既有 sandbox_skip_reason。已有尝试（含全部
+        infra_error）属"沙箱执行过"，不属跳过；elastic_exit/no_poc_template 等
+        既有豁免不覆盖。标记不升级 verification_status/is_verified（与 Task 7
+        elastic_exit 同语义：硬门禁算豁免，状态机不升级）。
+        """
+        marked = 0
+        for finding in self._all_findings:
+            if not isinstance(finding, dict):
+                continue
+            if finding.get("sandbox_skip_reason"):
+                continue
+            if finding.get("is_verified") is True:
+                continue
+            if finding.get("verification_status") in self._SANDBOX_TERMINAL_VERIFIED_STATUSES:
+                continue
+            attempts = finding.get("sandbox_attempts")
+            if isinstance(attempts, list) and len(attempts) > 0:
+                continue
+            finding["sandbox_skip_reason"] = reason
+            marked += 1
+        return marked
+
+    def _apply_gate_release_marking(self) -> int:
+        """Task 8: 收口前对放行路径上仍未沙箱验证的 finding 强制写豁免标记。
+
+        两条放行路径收敛于此（补验结果合入后调用，补验已 confirmed 的不标记）：
+        - R4 达限放行（finish 门禁连续拒绝达上限，spec d 条）：
+          reason=gate_release_after_max_redispatch；
+        - 主循环轮次耗尽退出（不经过任何 finish 门禁，T6 注释 ec0985ad
+          生产回归：analysis 3 轮后轮次耗尽 5 finding 全零证据）：
+          reason=orchestrator_max_iterations_exhausted。
+        LLM 正常 finish 通过门禁链（无 R4 放行）不标记。标记数 > 0 时补一条
+        gate_release observation（含放行原因与未验证数量）。
+        """
+        reason = getattr(self, "_gate_release_reason", None)
+        if reason is None and not getattr(self, "_finish_accepted", False):
+            reason = "orchestrator_max_iterations_exhausted"
+        if not reason:
+            return 0
+        marked = self._mark_released_unverified_findings(reason)
+        if marked:
+            self._record_gate_observation(
+                "gate_release",
+                f"放行收口（{reason}）：{marked} 个 finding 未沙箱验证，"
+                "已强制标记 sandbox_skip_reason 并纳入报告未沙箱验证清单",
+            )
+            logger.warning(
+                f"[Orchestrator] Gate release ({reason}): {marked} findings marked "
+                f"sandbox_skip_reason without sandbox verification"
+            )
+        return marked
 
     def _evaluate_current_coverage(self) -> Any:
         """基于当前 findings 与文本证据评估软覆盖率。"""
@@ -1287,6 +1353,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     elif has_findings and self._finish_gate_rejections >= max_redispatch:
                         # R4 放行：达到上限后不再强制重派，fall-through 到后续门禁链并完成收尾。
                         # 不 continue，避免"再输出 finish → 再 +1 → 再放行"的二次循环。
+                        # Task 8: 记录放行原因，收尾标记在最终 return 前（补验结果合入后）执行。
+                        self._gate_release_reason = "gate_release_after_max_redispatch"
                         await self.emit_event(
                             "warning",
                             f"⚠️ 验证门禁已达最大重试次数（{max_redispatch} 次），不再强制重派 verification，按覆盖率收尾"
@@ -1536,6 +1604,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                         self._total_tokens
                     )
                     final_result = step.action_input
+                    self._finish_accepted = True  # Task 8: 区分正常 finish 与轮次耗尽退出
                     break
 
                 elif step.action == "dispatch_agent":
@@ -1744,6 +1813,11 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 await self._maybe_dispatch_force_verification()
             except Exception as e:
                 logger.warning(f"[Orchestrator] Force verification on finalize failed (non-fatal): {e}")
+
+            # sandbox-verification-hard-gate Task 8: 放行收口——R4 达限放行/轮次耗尽
+            # 退出两条路径上，补验后仍零沙箱尝试的未验证 finding 强制写
+            # sandbox_skip_reason（不升级验证状态），报告据此呈现"未沙箱验证清单"。
+            self._apply_gate_release_marking()
 
             # ✅ P1-1: 攻击链分析 - 评估漏洞组合风险
             attack_chains = []

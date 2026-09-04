@@ -2131,6 +2131,9 @@ async def _save_findings(
                 "verification_status": finding.get("verification_status"),
                 "verification_note": finding.get("verification_note"),
                 "failure_reason": finding.get("failure_reason"),
+                # sandbox-verification-hard-gate Task 8: 放行豁免标记持久化（无独立列，
+                # 随 verification_result JSON 落库），报告"未沙箱验证清单"据此读取
+                "sandbox_skip_reason": finding.get("sandbox_skip_reason"),
             }
             vr = {k: v for k, v in vr.items() if v is not None}
             if vr:
@@ -4685,6 +4688,62 @@ async def chat_with_agent_task(
 
 # ============ Report Generation API ============
 
+# sandbox-verification-hard-gate Task 8: 未沙箱验证清单——放行收口
+# （R4 达限/轮次耗尽/弹性退出/无模板）的显式豁免原因中文释义
+SANDBOX_SKIP_REASON_LABELS: dict[str, str] = {
+    "gate_release_after_max_redispatch": "验证门禁连续拒绝达上限后放行，未完成沙箱验证",
+    "orchestrator_max_iterations_exhausted": "审计轮次耗尽，收口时未完成沙箱验证",
+    "elastic_exit": "验证 Agent 弹性退出，豁免沙箱验证",
+    "no_poc_template": "该漏洞类型无确定性 PoC 模板，豁免沙箱验证",
+}
+
+
+def _finding_sandbox_skip_reason(finding: Any) -> str | None:
+    """读取 finding 的 sandbox_skip_reason（持久化在 verification_result JSON，无独立列）。"""
+    vr = getattr(finding, "verification_result", None)
+    if isinstance(vr, dict):
+        reason = vr.get("sandbox_skip_reason")
+        if reason:
+            return str(reason)
+    return None
+
+
+def _build_unverified_sandbox_section(findings: list) -> list[str]:
+    """sandbox-verification-hard-gate Task 8: 构造"未沙箱验证清单"报告段落。
+
+    列出所有 sandbox_skip_reason 非空的 finding（标题/位置/原因标记）；
+    无此类 finding 时返回空列表（报告不输出该段落）。
+    """
+    skipped = [
+        (f, reason)
+        for f in findings
+        if (reason := _finding_sandbox_skip_reason(f))
+    ]
+    if not skipped:
+        return []
+    lines = [
+        "## 未沙箱验证清单",
+        "",
+        f"以下 {len(skipped)} 个发现未经过沙箱验证即随审计收口，"
+        "其结论不作为已确认漏洞，请人工复核：",
+        "",
+    ]
+    for f, reason in skipped:
+        title = getattr(f, "title", None) or "未知漏洞"
+        file_path = getattr(f, "file_path", None)
+        line_start = getattr(f, "line_start", None)
+        if file_path and line_start:
+            location = f"{file_path}:{line_start}"
+        elif file_path:
+            location = file_path
+        else:
+            location = "位置未知"
+        label = SANDBOX_SKIP_REASON_LABELS.get(reason, reason)
+        lines.append(f"- **{title}** (`{location}`) — {label}（标记: `{reason}`）")
+    lines.append("")
+    return lines
+
+
 @router.get("/{task_id}/report")
 async def generate_audit_report(
     task_id: str,
@@ -4786,6 +4845,10 @@ async def generate_audit_report(
                     "verification_result": f.verification_result,
                     "verification_method": f.verification_method,
                     "sandbox_attempts": f.sandbox_attempts,
+                    "sandbox_skip_reason": (
+                        f.verification_result.get("sandbox_skip_reason")
+                        if isinstance(f.verification_result, dict) else None
+                    ),
                     "created_at": serialize_cst(f.created_at) if f.created_at else None,
                 } for f in findings
             ]
@@ -5031,6 +5094,10 @@ async def generate_audit_report(
 
                 md_lines.append("---")
                 md_lines.append("")
+
+    # sandbox-verification-hard-gate Task 8: 未沙箱验证清单（R4 达限放行/轮次耗尽/
+    # 弹性退出等显式豁免 finding 全量列出）；无此类 finding 时段落为空
+    md_lines.extend(_build_unverified_sandbox_section(findings))
 
     # Remediation Priority
     if critical > 0 or high > 0:
