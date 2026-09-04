@@ -331,6 +331,12 @@ class BaseAgent(ABC):
         # structured-output-protocol Task 7：最近一轮流式响应的原生 tool_calls
         # （done chunk 聚合结果，None=该轮无 tool_calls；每轮调用开始时重置）
         self._last_tool_calls: Optional[List[Dict[str, Any]]] = None
+        # sandbox-verification-hard-gate Task 20：最近一轮空响应形态分类
+        # None=非空（或 tool_calls 轮正文空，属正常）；"reasoning_only"=finish_reason=stop
+        # 但仅 reasoning 无正文（模型思考后自然停止零正文）；"truncated"=finish_reason=length
+        # 正文空（reasoning 吃光输出预算）；"other"=旧协议无 kind/API 恢复等其他空响应。
+        # 每轮调用开始时重置；上层空响应重试据此选 nudge 文案（见 _empty_response_nudge）
+        self._last_empty_kind: Optional[str] = None
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -1156,6 +1162,8 @@ class BaseAgent(ABC):
         total_tokens = 0
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
+        # Task 20：每轮重置空响应形态（与截断标志同生命周期）
+        self._last_empty_kind = None
         # Task 7：每轮重置 tool_calls 暴露槽（done chunk 聚合结果写入）
         self._last_tool_calls = None
 
@@ -1328,6 +1336,24 @@ class BaseAgent(ABC):
         # 🔥 记录空响应警告，帮助调试
         if not accumulated or not accumulated.strip():
             logger.warning(f"[{self.name}] Empty LLM response returned (total_tokens: {total_tokens})")
+            # sandbox-verification-hard-gate Task 20：空响应形态分类，供上层
+            # 空响应重试按形态选 nudge 文案（_empty_response_nudge）。
+            # tool_calls 轮正文空属正常（调用参数在 tool_calls 中），不判空响应。
+            if self._last_tool_calls:
+                self._last_empty_kind = None
+            elif self._last_llm_truncated:
+                # 形态 A：finish_reason=length 且正文空——reasoning 思考流吃光
+                # 输出预算（截断事实提示已由 _record_llm_truncation 注入历史）
+                self._last_empty_kind = "truncated"
+            elif stream_has_kind and accumulated_reasoning.strip() and not accumulated_content.strip():
+                # 形态 B：finish_reason=stop 且仅思考无正文——模型 reasoning 后
+                # 自然停止零正文（无截断无服务端错误，纯模型行为退化）
+                self._last_empty_kind = "reasoning_only"
+            else:
+                # 旧协议无 kind 分流 / API 错误恢复兜底文本等其他空响应
+                self._last_empty_kind = "other"
+        else:
+            self._last_empty_kind = None
 
         return accumulated, total_tokens
 
@@ -1364,6 +1390,37 @@ class BaseAgent(ABC):
         except Exception as e:
             # 截断可见化本身失败不得影响 LLM 调用主流程
             logger.error(f"[{self.name}] 截断提示处理失败（非致命）: {e}", exc_info=True)
+
+    def _empty_response_nudge(self, *, tool_hint: str = "") -> str:
+        """按最近一轮空响应形态返回针对性重试 nudge（sandbox-verification-hard-gate Task 20）。
+
+        信号由 stream_llm_call 在空响应时写入 self._last_empty_kind：
+        - "reasoning_only"：finish_reason=stop 且仅思考无正文（模型思考后自然停止，
+          纯模型行为退化）——明确告知"不要重复思考，直接输出 Action"；
+        - "truncated"：finish_reason=length 正文空（思考流耗尽输出预算）——截断事实
+          已由 _record_llm_truncation 的历史提示告知，此处只补归因与行动要求，
+          不重复"截断"字样；
+        - "other"/None：返回空串，调用方维持现有泛化重试提示。
+
+        Args:
+            tool_hint: tools 协议下的工具调用提示片段（如"或调用 submit_findings
+                提交报告"），拼入 Action 指引括号；文本协议传空串。
+        """
+        kind = getattr(self, "_last_empty_kind", None)
+        if kind == "reasoning_only":
+            action_guide = "直接输出下一步的 Action: 与 Action Input:"
+            if tool_hint:
+                action_guide += f"（{tool_hint}）"
+            return (
+                "[系统提示：你上一轮只输出了思考过程就结束了，没有给出任何行动或结论。"
+                f"请不要再重复思考，{action_guide}。]"
+            )
+        if kind == "truncated":
+            return (
+                "[系统提示：思考过程耗尽输出预算导致行动丢失。"
+                "请大幅精简思考，尽快给出 Action。]"
+            )
+        return ""
 
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """

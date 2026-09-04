@@ -467,6 +467,9 @@ class ReconAgent(BaseAgent):
                         break
                     
                     # 🔥 更有针对性的重试提示
+                    # Task 20：按空响应形态注入 nudge 前缀（recon 不传 tools，
+                    # 文本协议不提 submit_findings）；other 形态维持下方泛化提示
+                    nudge = self._empty_response_nudge()
                     retry_prompt = f"""收到空响应。请根据以下格式输出你的思考和行动：
 
 Thought: [你对当前情况的分析]
@@ -478,7 +481,10 @@ Action Input: {{"参数名": "参数值"}}
 如果你认为信息收集已经完成，请输出：
 Thought: [总结收集到的信息]
 Final Answer: [JSON格式的结果]"""
-                    
+
+                    if nudge:
+                        retry_prompt = f"{nudge}\n\n{retry_prompt}"
+
                     self._conversation_history.append({
                         "role": "user",
                         "content": retry_prompt,

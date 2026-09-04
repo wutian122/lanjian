@@ -923,6 +923,14 @@ Final Answer:""",
                         break
                     
                     # 🔥 更有针对性的重试提示
+                    # Task 20：按空响应形态注入 nudge 前缀（形态 B=只思考无正文 /
+                    # 形态 A=思考耗尽预算）；other 形态 nudge 为空，维持下方泛化提示
+                    nudge = self._empty_response_nudge(
+                        tool_hint=(
+                            "或调用 submit_findings 提交报告"
+                            if analysis_tools is not None else ""
+                        )
+                    )
                     retry_prompt = f"""收到空响应。请根据以下格式输出你的思考和行动：
 
 Thought: [你对当前安全分析情况的思考]
@@ -934,7 +942,10 @@ Action Input: {{"参数名": "参数值"}}
 如果你已完成分析，请输出：
 Thought: [总结所有发现]
 Final Answer: {{"findings": [...], "summary": "..."}}"""
-                    
+
+                    if nudge:
+                        retry_prompt = f"{nudge}\n\n{retry_prompt}"
+
                     self._conversation_history.append({
                         "role": "user",
                         "content": retry_prompt,

@@ -1295,9 +1295,17 @@ class VerificationAgent(BaseAgent):
                 if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     logger.warning(f"[{self.name}] Empty LLM response in iteration {self._iteration}")
                     await self.emit_llm_decision("收到空响应", "LLM 返回内容为空，尝试重试通过提示")
+                    # Task 20：按空响应形态注入针对性 nudge（tools 协议提示可调用
+                    # submit_findings）；other/未知形态 nudge 为空，维持原有泛化提示
+                    nudge = self._empty_response_nudge(
+                        tool_hint=(
+                            "或调用 submit_findings 提交报告"
+                            if verification_tools is not None else ""
+                        )
+                    )
                     self._conversation_history.append({
                         "role": "user",
-                        "content": "Received empty response. Please output your Thought and Action.",
+                        "content": nudge or "Received empty response. Please output your Thought and Action.",
                     })
                     continue
 

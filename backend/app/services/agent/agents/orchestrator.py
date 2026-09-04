@@ -997,6 +997,15 @@ class OrchestratorAgent(BaseAgent):
                     await asyncio.sleep(1.0)
 
                     # 🔥 更详细的重试提示
+                    # Task 20：按空响应形态注入 nudge 前缀（形态 B=只思考无正文 /
+                    # 形态 A=思考耗尽预算）；tools 协议提示可直接调用调度工具；
+                    # other 形态 nudge 为空，维持下方泛化提示。计数/上限/sleep 不变
+                    nudge = self._empty_response_nudge(
+                        tool_hint=(
+                            "或直接调用工具 dispatch_agent / summarize / finish"
+                            if orchestrator_tools is not None else ""
+                        )
+                    )
                     retry_prompt = f"""收到空响应（第 {empty_retry_count} 次）。请严格按照以下格式输出你的决策：
 
 Thought: [你对当前审计状态的思考]
@@ -1007,6 +1016,9 @@ Action Input: {{"参数": "值"}}
 当前已收集发现: {len(self._all_findings)} 个
 
 请立即输出你的下一步决策。"""
+
+                    if nudge:
+                        retry_prompt = f"{nudge}\n\n{retry_prompt}"
 
                     self._conversation_history.append({
                         "role": "user",
