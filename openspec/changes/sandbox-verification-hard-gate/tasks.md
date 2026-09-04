@@ -63,6 +63,7 @@
 - TDD: 失败测试×3（对应三场景）→ 实现 → 通过 → commit
 
 ### Task 8: R4 放行的未验证清单强制标记与报告呈现
+- [x] **Task 8 完成**（commit 0e32223，review CLEAN——d 条两项全满足 + 变异实证守卫；标记收口点五项过滤逐一核验（补验 confirmed 不标记/既有豁免不覆盖/四终态不标记/attempts 非空不标记）；**两路径扩展裁决接受**（轮次耗尽路径 orchestrator_max_iterations_exhausted——T6 注释 ec0985ad 生产回归背景，零证据收尾高发路径）；skip_reason 并入 verification_result JSON 持久化（AgentFinding 无独立列的合理方案）；3 Minor 记账：M1 deadline 路径豁免缺口转后续、M2 **前端展示承接归 Task 17**、M3 观测性）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（:1137-1207）、`backend/app/api/v1/endpoints/agent_tasks.py`（报告生成段）
 - Interfaces: 放行时逐 finding 写 `sandbox_skip_reason="gate_release_after_max_redispatch"`；报告含"未沙箱验证清单"段落
 - TDD: 失败测试（3 次拒绝后放行 → findings 带标记；报告文本含清单标题与 finding 标题）→ 实现 → 通过 → commit
