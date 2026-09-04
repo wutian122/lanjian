@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_FAILURE_MARKERS = ("工具执行失败", "Traceback", "Error:", "Exception:", "\n失败:", "\n错误:")
 
+# sandbox-verification-hard-gate Task 11: recon 侦察线索仅作上下文（承接
+# orchestrator :617 "高风险区不作 finding" 裁决）——source 为 recon/recon_high_risk
+# 的 finding 不进沙箱验证队列（即使 severity=high）；semgrep_fallback 兜底候选
+# 与 Analysis 产出正常入队。
+_CONTEXT_ONLY_SOURCES = ("recon", "recon_high_risk")
+
+
+def _is_verification_work_item(finding: Any) -> bool:
+    """findings_to_verify 入队口径：上下文线索（recon 来源）不入队。"""
+    if not isinstance(finding, dict):
+        return False
+    return finding.get("source") not in _CONTEXT_ONLY_SOURCES
+
 # V6 B2（REQ-VE-2）：子串级失败标记仅在特定条件下生效，与工具级/行级标记区分
 _SUB_FAILURE_MARKERS = ("Traceback", "Error:", "Exception:")
 
@@ -1071,7 +1084,11 @@ class VerificationAgent(BaseAgent):
 
         # 🔥 优先从交接信息获取发现
         if self._incoming_handoff and self._incoming_handoff.key_findings:
-            findings_to_verify = self._incoming_handoff.key_findings.copy()
+            # Task 11: recon 线索仅作上下文，不进验证队列
+            findings_to_verify = [
+                f for f in self._incoming_handoff.key_findings
+                if _is_verification_work_item(f)
+            ]
             logger.info(f"[Verification] 从交接信息获取 {len(findings_to_verify)} 个发现")
 
         # 🔥 FIX: 无论 handoff 有没有数据，都必须检查 previous_results.findings
@@ -1084,7 +1101,7 @@ class VerificationAgent(BaseAgent):
                     if isinstance(f, dict):
                         severity = str(f.get("severity", "")).lower()
                         needs_verify = f.get("needs_verification", True)
-                        if needs_verify or severity in ["critical", "high"]:
+                        if (needs_verify or severity in ["critical", "high"]) and _is_verification_work_item(f):
                             findings_to_verify.append(f)
             added = len(findings_to_verify) - before_count
             logger.info(f"[Verification] 从 previous_results.findings 补充了 {added} 个发现（共 {len(findings_to_verify)} 个）")
@@ -1106,7 +1123,7 @@ class VerificationAgent(BaseAgent):
                         if isinstance(f, dict):
                             severity = str(f.get("severity", "")).lower()
                             needs_verify = f.get("needs_verification", True)
-                            if needs_verify or severity in ["critical", "high"]:
+                            if (needs_verify or severity in ["critical", "high"]) and _is_verification_work_item(f):
                                 findings_to_verify.append(f)
 
             if findings_to_verify:
@@ -1129,6 +1146,8 @@ class VerificationAgent(BaseAgent):
                     if isinstance(hf, dict):
                         fp = hf.get("file_path", "")
                         if not fp or fp.lower() in ("unknown", "n/a", ""):
+                            continue
+                        if not _is_verification_work_item(hf):
                             continue
                         if hf not in findings_to_verify:
                             findings_to_verify.append(hf)

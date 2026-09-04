@@ -2134,6 +2134,9 @@ async def _save_findings(
                 # sandbox-verification-hard-gate Task 8: 放行豁免标记持久化（无独立列，
                 # 随 verification_result JSON 落库），报告"未沙箱验证清单"据此读取
                 "sandbox_skip_reason": finding.get("sandbox_skip_reason"),
+                # sandbox-verification-hard-gate Task 11: finding 来源持久化
+                # （semgrep_fallback=静态扫描兜底候选，报告/前端据此与人工级发现区分）
+                "source": finding.get("source"),
             }
             vr = {k: v for k, v in vr.items() if v is not None}
             if vr:
@@ -4744,6 +4747,48 @@ def _build_unverified_sandbox_section(findings: list) -> list[str]:
     return lines
 
 
+def _finding_source(finding: Any) -> str | None:
+    """读取 finding 来源（持久化在 verification_result JSON，无独立列）。"""
+    vr = getattr(finding, "verification_result", None)
+    if isinstance(vr, dict):
+        source = vr.get("source")
+        if source:
+            return str(source)
+    return None
+
+
+def _build_semgrep_fallback_section(findings: list) -> list[str]:
+    """sandbox-verification-hard-gate Task 11: 构造"静态扫描兜底候选"报告段落。
+
+    Analysis 0 产出时 Semgrep 预扫发现兜底落库的候选（source=semgrep_fallback）
+    与 Analysis 高置信发现区分标注；无此类候选时返回空列表。
+    """
+    fallback = [f for f in findings if _finding_source(f) == "semgrep_fallback"]
+    if not fallback:
+        return []
+    lines = [
+        "## 静态扫描兜底候选",
+        "",
+        f"以下 {len(fallback)} 个发现来自 Semgrep 静态扫描兜底"
+        "（Analysis 阶段未产出候选，系统将静态扫描发现转为待验证候选），"
+        "其置信度低于人工分析发现，请人工复核：",
+        "",
+    ]
+    for f in fallback:
+        title = getattr(f, "title", None) or "未知漏洞"
+        file_path = getattr(f, "file_path", None)
+        line_start = getattr(f, "line_start", None)
+        if file_path and line_start:
+            location = f"{file_path}:{line_start}"
+        elif file_path:
+            location = file_path
+        else:
+            location = "位置未知"
+        lines.append(f"- **{title}** (`{location}`) — 静态扫描兜底候选")
+    lines.append("")
+    return lines
+
+
 @router.get("/{task_id}/report")
 async def generate_audit_report(
     task_id: str,
@@ -5098,6 +5143,10 @@ async def generate_audit_report(
     # sandbox-verification-hard-gate Task 8: 未沙箱验证清单（R4 达限放行/轮次耗尽/
     # 弹性退出等显式豁免 finding 全量列出）；无此类 finding 时段落为空
     md_lines.extend(_build_unverified_sandbox_section(findings))
+
+    # sandbox-verification-hard-gate Task 11: 静态扫描兜底候选清单（Analysis 0
+    # 产出时 Semgrep 发现转待验证候选，与人工级发现区分标注）
+    md_lines.extend(_build_semgrep_fallback_section(findings))
 
     # Remediation Priority
     if critical > 0 or high > 0:

@@ -277,6 +277,10 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_force_verified: bool = False  # P3: Semgrep 发现是否已强制通过验证门禁
         self._semgrep_hot_files: list[str] = []
         self._semgrep_findings: list[dict[str, Any]] = []
+        # Task 11 (finding-output-floor): Analysis 强制总结产出下限违规（粘滞，
+        # 任一轮 0 候选 0 豁免即置位）；Semgrep 兜底落库一次性标志
+        self._output_floor_violated: bool = False
+        self._semgrep_fallback_applied: bool = False
         self._full_verification_dispatched: bool = False
         # T6 (REQ-VC-2): R4 放行前程序化补验的一次性标志（防重复调度）
 
@@ -380,6 +384,8 @@ class OrchestratorAgent(BaseAgent):
             "semgrep_force_verified": bool(getattr(self, "_semgrep_force_verified", False)),
             "semgrep_hot_files": list(getattr(self, "_semgrep_hot_files", []) or []),
             "semgrep_findings": list(getattr(self, "_semgrep_findings", []) or []),
+            "output_floor_violated": bool(getattr(self, "_output_floor_violated", False)),
+            "semgrep_fallback_applied": bool(getattr(self, "_semgrep_fallback_applied", False)),
         }
 
     def load_resume_state(self, state: dict[str, Any]) -> int:
@@ -413,6 +419,8 @@ class OrchestratorAgent(BaseAgent):
         self._semgrep_force_verified = bool(state.get("semgrep_force_verified") or False)
         self._semgrep_hot_files = list(state.get("semgrep_hot_files") or [])
         self._semgrep_findings = list(state.get("semgrep_findings") or [])
+        self._output_floor_violated = bool(state.get("output_floor_violated") or False)
+        self._semgrep_fallback_applied = bool(state.get("semgrep_fallback_applied") or False)
 
         return int(state.get("iteration_index") or 0)
 
@@ -528,9 +536,12 @@ class OrchestratorAgent(BaseAgent):
             return
         unverified = [
             f for f in self._all_findings
-            if f.get("verification_status")
-            not in ("confirmed", "static_confirmed", "not_reproducible", "false_positive")
-            or not self._has_valid_sandbox_evidence()
+            if not self._is_context_only_finding(f)
+            and (
+                f.get("verification_status")
+                not in ("confirmed", "static_confirmed", "not_reproducible", "false_positive")
+                or not self._has_valid_sandbox_evidence()
+            )
         ]
         if not unverified:
             return
@@ -559,6 +570,9 @@ class OrchestratorAgent(BaseAgent):
         marked = 0
         for finding in self._all_findings:
             if not isinstance(finding, dict):
+                continue
+            # Task 11: recon 上下文线索从来不是验证对象，不写"放行未验证"标记
+            if self._is_context_only_finding(finding):
                 continue
             if finding.get("sandbox_skip_reason"):
                 continue
@@ -612,11 +626,160 @@ class OrchestratorAgent(BaseAgent):
             json.dumps(result, ensure_ascii=False)
             for result in self._agent_results.values()
         )
-        return evaluate_coverage(self._all_findings, text_evidence)
+        # Task 11: recon 上下文线索不计覆盖维度（避免侦察线索冒充已覆盖产出）
+        return evaluate_coverage(self._actionable_findings(), text_evidence)
 
     def _convert_recon_high_risk_area_to_finding(self, area: Any) -> dict[str, Any] | None:
         """Recon 高风险区是 Analysis 的上下文线索，不作为漏洞 findings。"""
         return None
+
+    # sandbox-verification-hard-gate Task 11（Task 9 Important 交接）：
+    # recon 侦察线索（initial_findings 字符串 finding / high_risk_areas 转换项）
+    # 虽经 Task 9 候选豁免流入 _all_findings，但承接本方法既有裁决——它们是
+    # Analysis 的上下文线索，不是漏洞 finding：保留在报告中作上下文标注，
+    # 不进 Verification 验证队列、不计门禁未验证口径。
+    _CONTEXT_ONLY_SOURCES = ("recon", "recon_high_risk")
+
+    def _is_context_only_finding(self, finding: Any) -> bool:
+        """recon 来源的侦察线索仅作上下文，不占验证/门禁产出口径。"""
+        return isinstance(finding, dict) and finding.get("source") in self._CONTEXT_ONLY_SOURCES
+
+    def _actionable_findings(self) -> list[dict[str, Any]]:
+        """可验证产出口径：_all_findings 排除 recon 上下文线索。
+
+        Semgrep 兜底候选（source=semgrep_fallback）与 Analysis 产出均计入。
+        """
+        return [
+            f for f in (self._all_findings or [])
+            if isinstance(f, dict) and not self._is_context_only_finding(f)
+        ]
+
+    def _build_semgrep_fallback_candidates(self) -> list[dict[str, Any]]:
+        """Task 11: Semgrep 预扫发现映射为待验证候选。
+
+        预扫存储格式见 _run_semgrep_prescan：title 存 check_id（规则 ID），
+        description 存规则 message，severity/vulnerability_type 已映射。
+        去重键 file_path + rule_id（spec：同文件同规则只落一条候选）。
+        """
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for sf in self._semgrep_findings or []:
+            if not isinstance(sf, dict):
+                continue
+            file_path = sf.get("file_path", "") or ""
+            rule_id = str(sf.get("semgrep_rule_id") or sf.get("check_id") or sf.get("title", "") or "")
+            key = (file_path, rule_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            message = sf.get("description") or rule_id or "Semgrep 静态扫描发现"
+            title = message if len(message) <= 120 else message[:120]
+            candidates.append({
+                "title": title or rule_id,
+                "description": f"[静态扫描兜底候选] {message}（Semgrep 规则: {rule_id}）",
+                "file_path": file_path,
+                "line_start": sf.get("line_start", 0),
+                "line_end": sf.get("line_end", 0),
+                "severity": sf.get("severity") or "medium",
+                "vulnerability_type": sf.get("vulnerability_type") or _map_semgrep_to_vuln_type(rule_id),
+                "code_snippet": sf.get("code_snippet", ""),
+                "confidence": 0.5,
+                "needs_verification": True,
+                "source": "semgrep_fallback",
+                "semgrep_rule_id": rule_id,
+                "is_verified": False,
+            })
+        return candidates
+
+    async def _apply_semgrep_fallback(self) -> int:
+        """Task 11: Analysis 全部派发后 0 可验证产出 → Semgrep 发现兜底落库。
+
+        幂等（_semgrep_fallback_applied）；已有可验证产出（含已落库候选）时不
+        触发。候选走既有 _normalize_finding + _merge_or_append_finding 管线
+        （幻觉文件过滤、去重、合并），落库后由既有 finish/全量验证门禁强制送
+        沙箱验证。返回新增候选数；任何异常 warning 后保持现状（非致命）。
+        """
+        if self._semgrep_fallback_applied:
+            return 0
+        self._semgrep_fallback_applied = True
+        try:
+            if self._actionable_findings():
+                return 0
+            candidates = self._build_semgrep_fallback_candidates()
+            added = 0
+            for candidate in candidates:
+                normalized = self._normalize_finding(candidate)
+                if normalized is None:
+                    continue
+                # 直接追加：兜底仅在 0 可验证产出时触发，候选已按 file_path+
+                # rule_id 去重；走模糊合并反而会把不同规则的同位置命中吞并，
+                # 或把 source 覆盖进 recon 上下文线索（使其脱离 context-only 口径）
+                self._all_findings.append(normalized)
+                added += 1
+            if added:
+                self._record_gate_observation(
+                    "semgrep_fallback",
+                    f"Analysis 全部派发后 0 产出，{added} 条 Semgrep 预扫发现作为兜底候选"
+                    "落库（source=semgrep_fallback，confidence=0.5），交沙箱验证",
+                )
+                logger.warning(
+                    f"[Orchestrator] Semgrep fallback: {added} static findings persisted "
+                    "as verification candidates after zero Analysis output"
+                )
+            return added
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Semgrep fallback failed (non-fatal): {e}")
+            return 0
+
+    def _ingest_analysis_floor_signal(self, data: Any) -> None:
+        """Task 11: 读取 Analysis 强制总结的产出下限信号（Task 10 data 字段）。
+
+        output_floor_violated=true 粘滞置位（任一轮强制总结 0 候选 0 豁免即
+        留证）；收口判定在 max_dispatch/finish 处结合"最终是否仍 0 可验证产出"。
+        """
+        if isinstance(data, dict) and data.get("output_floor_violated"):
+            if not self._output_floor_violated:
+                logger.warning(
+                    "[Orchestrator] Analysis output floor violated: forced summary "
+                    "produced 0 candidates and 0 exemptions"
+                )
+            self._output_floor_violated = True
+
+    def _apply_output_floor_closeout(self) -> bool:
+        """Task 11: 产出下限违规且兜底后仍 0 可验证产出 → 覆盖不足语义收口。
+
+        记 gate="output_floor" observation，置 coverage_bypassed（reason=
+        output_floor_violated，completed_with_gaps）并放开覆盖率拦截让 LLM 能
+        finish（否则 0 findings 下软/硬覆盖率门禁与 analysis max_dispatch 形成
+        死循环）。有兜底候选可送沙箱验证时不收口，返回 False 由验证门禁接管。
+        """
+        if not self._output_floor_violated:
+            return False
+        if self._actionable_findings():
+            return False
+        if not any(o.get("gate") == "output_floor" for o in self._gate_observations):
+            self._record_gate_observation(
+                "output_floor",
+                "Analysis 强制总结 0 候选 0 豁免（产出下限违规），Semgrep 兜底亦无发现，"
+                "按覆盖不足收口（completed_with_gaps），报告呈现"
+                "“分析未按要求产出候选”",
+            )
+        if not self._coverage_bypassed:
+            self._coverage_bypassed = True
+            self._coverage_bypass_info = self._build_coverage_bypass_info(
+                reason="output_floor_violated",
+                covered_count=0,
+                total_dimensions=10,
+                gaps=[],
+                block_count=self._hard_coverage_block_count,
+            )
+        if self._hard_coverage_block_count < 3:
+            self._hard_coverage_block_count = 3
+        logger.warning(
+            "[Orchestrator] Output floor violated with no verifiable output, "
+            "closing with coverage gaps (completed_with_gaps)"
+        )
+        return True
 
     def register_sub_agent(self, name: str, agent: BaseAgent) -> None:
         """注册子 Agent"""
@@ -875,6 +1038,8 @@ class OrchestratorAgent(BaseAgent):
             self._all_findings = []
             self._semgrep_hot_files: list[str] = []
             self._semgrep_findings: list[dict[str, Any]] = []
+            self._output_floor_violated = False
+            self._semgrep_fallback_applied = False
             self._agent_results = {}
             self._sub_agent_total_iterations = 0
             self._sub_agent_total_tool_calls = 0
@@ -1295,8 +1460,18 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                 # 执行 LLM 决定的操作
                 if step.action == "finish":
+                    # Task 11 (finding-output-floor): finish 前兜底——Analysis 达调度
+                    # 上限或产出下限违规时，Semgrep 预扫发现兜底落库（幂等）；仍无
+                    # 可验证产出则按覆盖不足语义收口（completed_with_gaps）。
+                    if self._dispatched_tasks.get("analysis", 0) >= 3 or self._output_floor_violated:
+                        try:
+                            await self._apply_semgrep_fallback()
+                        except Exception as e:
+                            logger.warning(f"[Orchestrator] Semgrep fallback on finish failed (non-fatal): {e}")
+                        self._apply_output_floor_closeout()
                     # 🔥 弹性终止门禁：三层门禁保障审计质量
-                    has_findings = len(self._all_findings) > 0
+                    # Task 11: has_findings 按可验证产出口径（recon 上下文线索不算）
+                    has_findings = len(self._actionable_findings()) > 0
                     verification_dispatched = "verification" in self._dispatched_tasks
                     verification_count = self._dispatched_tasks.get("verification", 0)
                     has_sandbox_evidence = self._has_valid_sandbox_evidence()
@@ -1430,7 +1605,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     UNVERIFIED_TERMINAL = {"confirmed", "static_confirmed", "not_reproducible", "false_positive"}
                     unverified_findings = [
                         f for f in self._all_findings
-                        if f.get("verification_status") not in UNVERIFIED_TERMINAL
+                        if not self._is_context_only_finding(f)
+                        and f.get("verification_status") not in UNVERIFIED_TERMINAL
                         and f.get("is_verified") is not True
                     ]
                     if unverified_findings and verification_count > 0 and not self._full_verification_dispatched:
@@ -1506,7 +1682,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                     # 硬性覆盖率门禁 - 不可被 LLM 跳过（带逃逸路径）
                     coverage_matrix = CoverageMatrix()
-                    for finding in self._all_findings:
+                    for finding in self._actionable_findings():
                         dim = CoverageMatrix.map_finding_to_dimension(finding.get("vulnerability_type", ""))
                         if dim:
                             coverage_matrix.mark_covered(dim, evidence=finding.get("title", ""))
@@ -1516,7 +1692,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                             coverage_matrix.mark_shallow(dim, evidence=f"grep: {pattern}")
                     hard_coverage = coverage_matrix.to_report()
 
-                    if len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 3:
+                    if len(self._actionable_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 3:
                         self._hard_coverage_block_count += 1
                         try:
                             await self.emit_event(
@@ -1573,7 +1749,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                             ),
                         })
                         continue
-                    elif len(self._all_findings) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 3:
+                    elif len(self._actionable_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 3:
                         logger.warning(
                             f"Coverage gate bypassed after {self._hard_coverage_block_count} blocks: "
                             f"{hard_coverage.covered_count}/10 covered"
@@ -2438,11 +2614,47 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         # 动态调度上限：覆盖率门禁拦截 ≥3 次时提升上限到 4，给 LLM 补漏机会
         max_dispatch = 3
         if dispatch_count >= max_dispatch:
-            # ✅ FIX: 当重复调度时，自动提升 _hard_coverage_block_count 到 5，放行 finish
-            if agent_name == "analysis" and self._hard_coverage_block_count < 3:
-                self._hard_coverage_block_count = 3
-                logger.info(f"[Orchestrator] Analysis dispatched {dispatch_count} times, auto-bypassing coverage gate")
-            return f"""## ⚠️ 重复调度警告
+            if agent_name == "analysis":
+                # Task 11 (finding-output-floor): Analysis 达调度上限 = "全部派发
+                # 完成"——先做 Semgrep 兜底落库（0 产出时静态扫描发现转待验证候选），
+                # 再按产出下限信号决定收口方式（历史行为是无条件自动放行 finish）。
+                fallback_added = await self._apply_semgrep_fallback()
+                if self._output_floor_violated:
+                    if self._apply_output_floor_closeout():
+                        return f"""## ⚠️ 重复调度警告
+
+你已经调度 analysis Agent {dispatch_count} 次。Analysis 强制总结未按要求产出任何候选或书面豁免（**产出下限违规**），Semgrep 静态扫描兜底也没有可落库的发现。
+
+请直接使用 finish 操作结束审计。任务将按**覆盖不足（completed_with_gaps）**收口，报告中会呈现"分析未按要求产出候选"。
+
+当前已收集的发现数量: {len(self._all_findings)}"""
+                    # 违规但 Semgrep 兜底候选已落库：不自动放行，强制先沙箱验证
+                    if not any(o.get("gate") == "output_floor" for o in self._gate_observations):
+                        self._record_gate_observation(
+                            "output_floor",
+                            f"Analysis 产出下限违规，{fallback_added} 条 Semgrep 兜底候选已落库，"
+                            "须经沙箱验证后方可收口",
+                        )
+                    return f"""## ⚠️ 重复调度警告
+
+你已经调度 analysis Agent {dispatch_count} 次。Analysis 强制总结未按要求产出候选（**产出下限违规**），系统已将 **{fallback_added} 条 Semgrep 静态扫描发现作为兜底候选落库**（静态扫描兜底候选，confidence=0.5，必须沙箱验证）。
+
+请立即调度 verification Agent 对这些兜底候选执行沙箱验证，验证完成前不得收口：
+Action: dispatch_agent
+Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Semgrep 兜底候选，使用 sandbox_exec 在沙箱中执行 PoC", "context": "兜底候选 source=semgrep_fallback，共 {fallback_added} 个"}}
+
+当前已收集的发现数量: {len(self._all_findings)}"""
+                # 未违规：维持历史自动放行语义
+                if self._hard_coverage_block_count < 3:
+                    self._hard_coverage_block_count = 3
+                    logger.info(f"[Orchestrator] Analysis dispatched {dispatch_count} times, auto-bypassing coverage gate")
+                fallback_note = ""
+                if fallback_added:
+                    fallback_note = (
+                        f"\n\n📋 系统已将 {fallback_added} 条 Semgrep 静态扫描发现作为兜底候选落库"
+                        "（source=semgrep_fallback），请调度 verification Agent 沙箱验证后再 finish。"
+                    )
+                return f"""## ⚠️ 重复调度警告
 
 你已经调度 {agent_name} Agent {dispatch_count} 次了。
 
@@ -2452,7 +2664,17 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
 当前已收集的发现数量: {len(self._all_findings)}
 注意：覆盖率门禁已自动放行，你可以直接 finish。
-{"（提示：低置信可疑点也应作为候选（needs_verification=true）计入产出并交沙箱验证，不要因为 Analysis 没有给出'确认漏洞'就反复重派——候选本身就是有效产出。）" if agent_name == "analysis" else ""}"""
+{"（提示：低置信可疑点也应作为候选（needs_verification=true）计入产出并交沙箱验证，不要因为 Analysis 没有给出'确认漏洞'就反复重派——候选本身就是有效产出。）" if agent_name == "analysis" else ""}{fallback_note}"""
+            return f"""## ⚠️ 重复调度警告
+
+你已经调度 {agent_name} Agent {dispatch_count} 次了。
+
+如果之前的调度没有返回有用的结果，请考虑：
+1. 直接使用 finish 操作结束审计并汇总已有发现（覆盖率门禁已自动放行）
+2. 提供更具体的任务描述
+
+当前已收集的发现数量: {len(self._all_findings)}
+注意：覆盖率门禁已自动放行，你可以直接 finish。"""
 
         self._dispatched_tasks[agent_name] = dispatch_count + 1
 
@@ -2716,6 +2938,12 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 # 🔥 FIX: 保存 Agent 的完整结果，供后续 Agent 使用
                 self._agent_results[agent_name] = data
                 logger.info(f"[Orchestrator] Saved {agent_name} result with keys: {list(data.keys())}")
+
+                # Task 11 (finding-output-floor): Analysis 强制总结产出下限信号
+                # （Task 10 data.output_floor_violated）粘滞摄入，max_dispatch/
+                # finish 门禁据此决定兜底落库与覆盖不足收口。
+                if agent_name == "analysis":
+                    self._ingest_analysis_floor_signal(data)
 
                 # Accumulate sub-agent stats
                 self._sub_agent_total_iterations += result.iterations or 0
@@ -3440,8 +3668,10 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 work_completed=analysis_handoff.work_completed,
                 # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
                 # 按严重程度排序；analysis_handoff 仍提供 summary/insights 等其余信息
+                # Task 11: recon 上下文线索不进 Verification 交接（semgrep_fallback 候选保留）
                 key_findings=sorted(
-                    self._all_findings,
+                    [f for f in self._all_findings
+                     if isinstance(f, dict) and not self._is_context_only_finding(f)],
                     key=lambda f: severity_order.get(f.get("severity", "low"), 3),
                 ),
                 insights=analysis_handoff.insights,
@@ -3533,20 +3763,21 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                     # T5 (REQ-VC-1): key_findings 改用 _all_findings 全量（含早期轮 finding），
                     # 按严重程度排序，去掉 [:15] 截断
+                    # Task 11: recon 上下文线索不进 Verification 交接
                     sorted_findings = sorted(
-                        self._all_findings,
+                        [f for f in self._all_findings
+                         if isinstance(f, dict) and not self._is_context_only_finding(f)],
                         key=lambda x: severity_order.get(x.get("severity", "low"), 3)
                     )
 
                     for f in sorted_findings:
-                        if isinstance(f, dict):
-                            key_findings.append(f)
-                            suggested_actions.append({
-                                "action": "verify",
-                                "target": f.get("file_path", ""),
-                                "vulnerability_type": f.get("vulnerability_type", "unknown"),
-                                "priority": "high" if f.get("severity") in ["critical", "high"] else "normal"
-                            })
+                        key_findings.append(f)
+                        suggested_actions.append({
+                            "action": "verify",
+                            "target": f.get("file_path", ""),
+                            "vulnerability_type": f.get("vulnerability_type", "unknown"),
+                            "priority": "high" if f.get("severity") in ["critical", "high"] else "normal"
+                        })
 
                     # 统计严重程度分布
                     severity_counts: dict[str, int] = {}
