@@ -142,24 +142,42 @@ LANGUAGE_TEST_TOOL_NAMES = {"python_test", "php_test", "javascript_test", "java_
 
 # Task 1（Phase 1 基础设施语义修复）：沙箱基础设施故障签名——小写匹配。
 # 命中即视为沙箱环境自身故障（不是漏洞/PoC 问题），不冒充"漏洞未复现"。
-INFRA_ERROR_SIGNATURES = (
+# docker/宿主机层专有签名：容器内 PoC 不可能产出（镜像拉取/挂载/daemon 缺席发生在
+# 容器创建之前），命中即基础设施故障。
+_INFRA_SIGNATURES_DOCKER_LAYER = (
     "docker not available",
     "沙箱环境不可用",
     "imagenotfound",
     "no such image",
     "pull access denied",
     "error while creating mount source path",
+)
+# daemon 连接签名：容器内网络 PoC 同样可能产出（如 SSRF 探测在 none 网络下得到
+# "Connection refused"——那是真实执行未复现，不是基础设施故障）。仅当命令未在容器内
+# 执行（observation 无退出码，说明容器根本没起来）时才归为 infra_error。
+_INFRA_SIGNATURES_CONNECTION = (
     "connection aborted",
     "connection refused",
 )
+INFRA_ERROR_SIGNATURES = _INFRA_SIGNATURES_DOCKER_LAYER + _INFRA_SIGNATURES_CONNECTION
 
 
-def _is_infra_error(text: str) -> bool:
-    """Task 1：识别 attempt 的错误/输出文本是否命中沙箱基础设施故障签名。"""
+def _is_infra_error(text: str, *, ran_in_container: Optional[bool] = None) -> bool:
+    """Task 1：识别文本是否命中沙箱基础设施故障签名。
+
+    ran_in_container: 命令是否已在容器内真实执行（有退出码）。None/False 时
+    connection 类签名才生效——容器内 PoC 的网络报错（SSRF 探测被拒等）不得误判。
+    """
     if not text:
         return False
     lower = text.lower()
-    return any(sig in lower for sig in INFRA_ERROR_SIGNATURES)
+    if any(sig in lower for sig in _INFRA_SIGNATURES_DOCKER_LAYER):
+        return True
+    if ran_in_container is not True and any(
+        sig in lower for sig in _INFRA_SIGNATURES_CONNECTION
+    ):
+        return True
+    return False
 
 
 # R1 确定性验证状态引擎：由运行时沙箱证据推导验证结论，不信任 LLM 自述 verdict
@@ -217,16 +235,36 @@ def compute_verification_status(
     # Task 1：沙箱基础设施故障（MUST NOT 伪装成漏洞未复现）。
     # 全部真实 attempt 均为 infra_error（Docker 缺席/镜像缺失/连接失败）→ needs_context
     # 并附诊断说明，partial-infra（部分 infra_error + 部分真实执行过）维持 not_reproducible。
-    if real_attempts and all(a.get("infra_error") for a in real_attempts):
-        infra_sigs = sorted({
-            sig for a in real_attempts
-            for sig in INFRA_ERROR_SIGNATURES
-            if sig in (str(a.get("evidence_summary") or "") + str(a.get("command") or "")).lower()
-        })
+    # defense-in-depth：infra_error 键缺失时（旧数据/其他 attempt 构造路径）实时扫描文本兜底；
+    # connection 类签名仅在命令未进容器执行（无退出码）时生效，避免把容器内 PoC 的网络报错
+    # （如 SSRF 探测被拒、真实执行未复现）误判为基础设施故障。
+    def _attempt_is_infra(a: dict) -> bool:
+        if a.get("infra_error"):
+            return True
+        ran = a.get("exit_code") is not None
+        return _is_infra_error(
+            str(a.get("evidence_summary") or "") + "\n" + str(a.get("command") or ""),
+            ran_in_container=ran,
+        )
+
+    if real_attempts and all(_attempt_is_infra(a) for a in real_attempts):
+        infra_sigs = set()
+        for a in real_attempts:
+            ran = a.get("exit_code") is not None
+            blob = (
+                str(a.get("evidence_summary") or "") + "\n" + str(a.get("command") or "")
+            ).lower()
+            for sig in _INFRA_SIGNATURES_DOCKER_LAYER:
+                if sig in blob:
+                    infra_sigs.add(sig)
+            if not ran:
+                for sig in _INFRA_SIGNATURES_CONNECTION:
+                    if sig in blob:
+                        infra_sigs.add(sig)
         return VerificationStatus.NEEDS_CONTEXT, False, {
             "reason": (
                 "沙箱环境故障，未能执行验证："
-                + (", ".join(infra_sigs) if infra_sigs else "sandbox unavailable")
+                + (", ".join(sorted(infra_sigs)) if infra_sigs else "sandbox unavailable")
             ),
             "infra_error": True,
         }
@@ -1715,6 +1753,10 @@ class VerificationAgent(BaseAgent):
                                 f"{verified_findings[0].get('file_path', '')}:"
                                 f"{verified_findings[0].get('line_start', 0)}"
                             ),
+                            # Task 1：兜底执行路径同样标记基础设施故障
+                            "infra_error": _is_infra_error(
+                                obs_str, ran_in_container=fb_exit is not None
+                            ),
                         }]
                     await self.emit_event(
                         "warning",
@@ -1926,7 +1968,11 @@ class VerificationAgent(BaseAgent):
         target_ref = target_match.group(1).strip() if target_match else None
         # Task 1：沙箱基础设施故障标记——命令文本或 observation 命中 INFRA_ERROR_SIGNATURES
         # 即视为沙箱自身故障（Docker 缺席/镜像缺失/连接失败），与 PoC 失败语义分离。
-        infra_error = _is_infra_error(command) or _is_infra_error(obs_text)
+        # exit_code 为 None 说明命令未进容器执行，connection 类签名才归为 infra。
+        ran_in_container = exit_code is not None
+        infra_error = _is_infra_error(
+            command, ran_in_container=ran_in_container
+        ) or _is_infra_error(obs_text, ran_in_container=ran_in_container)
 
         attempt = {
             "tool": "sandbox_exec",
@@ -2052,6 +2098,13 @@ class VerificationAgent(BaseAgent):
                 "network_enabled": False,
                 "evidence_summary": self._truncate_evidence_summary(observation),
                 "finding_id": finding_id,
+                # Task 1：language_test 同样经 Docker 沙箱执行，基础设施故障须打 infra_error，
+                # 否则该路径下沙箱缺席仍会被分支 4 伪装成 not_reproducible。
+                "infra_error": _is_infra_error(
+                    code, ran_in_container=exit_code is not None
+                ) or _is_infra_error(
+                    str(observation or ""), ran_in_container=exit_code is not None
+                ),
             }
         )
 

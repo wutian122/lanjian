@@ -117,6 +117,54 @@ def test_record_sandbox_attempt_normal_poc_error_not_infra():
     assert attempt.get("poc_error") is True
 
 
+def test_in_container_connection_refused_not_infra_error():
+    """变异守卫：PoC 在容器内真实执行（退出码 0）但探测目标 Connection refused
+    （SSRF 在 none 网络模式下的预期降级输出）→ 不是基础设施故障，仍判 not_reproducible。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_ssrf.py"},
+        "Sandbox result\n退出码: 0\n"
+        "requests.exceptions.ConnectionError: HTTPConnectionPool(host='169.254.169.254', port=80): "
+        "Failed to establish a new connection: [Errno 111] Connection refused",
+    )
+    attempt = agent._sandbox_attempts[0]
+    assert attempt.get("infra_error") in (None, False), (
+        "容器内 PoC 的网络报错不得误判为 infra_error"
+    )
+
+    finding = _finding(sandbox_attempts=[attempt])
+    status, is_verified, _ = compute_verification_status(
+        finding,
+        [attempt],
+        attempt_has_vuln_evidence_fn=lambda a: False,
+        attempt_matches_finding_fn=lambda a, f: False,
+    )
+    assert status == "not_reproducible", f"真实执行未复现应判 not_reproducible，got {status}"
+    assert is_verified is False
+
+
+def test_daemon_connection_aborted_without_exit_code_is_infra_error():
+    """docker daemon 连接中断（observation 无退出码，容器未创建）→ infra_error=True → needs_context。"""
+    agent = _make_agent()
+    agent._record_sandbox_attempt(
+        {"command": "python3 /tmp/poc_4.py"},
+        "工具执行失败: docker.errors.DockerException: Error while fetching server API version: "
+        "('Connection aborted.', FileNotFoundError(2, 'No such file or directory'))",
+    )
+    attempt = agent._sandbox_attempts[0]
+    assert attempt.get("infra_error") is True
+
+    finding = _finding(sandbox_attempts=[attempt])
+    status, is_verified, notes = compute_verification_status(
+        finding,
+        [attempt],
+        attempt_has_vuln_evidence_fn=lambda a: False,
+        attempt_matches_finding_fn=lambda a, f: False,
+    )
+    assert status == "needs_context"
+    assert notes.get("infra_error") is True
+
+
 # ============ Scenario 2: 真实执行未复现仍为 not_reproducible ============
 
 
@@ -234,6 +282,35 @@ def test_fabricated_attempt_excluded_from_infra_error_judgement():
     # real_attempts（排除 fabricated 后）只剩 1 个 infra_error → needs_context
     assert status == "needs_context"
     assert is_verified is False
+
+
+def test_record_language_test_attempt_marks_infra_error():
+    """language_test（python_test/php_test/...）路径沙箱不可用同样打 infra_error。
+
+    language_test 工具由 sandbox_language.py 执行，Docker 缺失时返回
+    error="沙箱环境不可用 (Docker Unavailable)"；_record_language_test_attempt
+    若不落 infra_error 键，分支 3.6 不命中，language_test 路径仍会伪装成 not_reproducible。
+    """
+    agent = _make_agent()
+    agent._record_language_test_attempt(
+        "python_test",
+        {"code": "print('poc')"},
+        "⚠️ 工具执行失败: 沙箱环境不可用 (Docker Unavailable)",
+    )
+    assert len(agent._sandbox_attempts) == 1
+    attempt = agent._sandbox_attempts[0]
+    assert attempt.get("infra_error") is True, "language_test 路径的沙箱故障未打 infra_error"
+
+    # 经状态机：language_test 全 infra → needs_context 而非 not_reproducible
+    finding = _finding(sandbox_attempts=[attempt])
+    status, is_verified, notes = compute_verification_status(
+        finding,
+        [attempt],
+        attempt_has_vuln_evidence_fn=lambda a: False,
+        attempt_matches_finding_fn=lambda a, f: False,
+    )
+    assert status == "needs_context", f"language_test 全 infra 应判 needs_context，got {status}"
+    assert notes.get("infra_error") is True
 
 
 # ============ 签名清单确认 ============
