@@ -1446,6 +1446,10 @@ class VerificationAgent(BaseAgent):
                             f"[{self.name}] Elastic exit: {total_attempts} sandbox attempts for {total_to_verify} findings, allowing finish"
                         )
                         await self.emit_event("info", f"沙箱验证已达弹性上限（{total_attempts} 次尝试），允许完成")
+                        # Task 7（豁免路径 f）：放行 finish 时为剩余未验证 finding 写
+                        # elastic_exit 显式豁免（硬门禁条件 2），零尝试 finding 终态
+                        # needs_context 并带原因，不再零证据静默收尾。
+                        self._mark_elastic_exit_exemptions(findings_to_verify, verified_indices)
                     if effective_unverified > 0 and (success_calls < total_to_verify or len(verified_indices) < total_to_verify) and self._iteration < self.config.max_iterations and not elastic_exhausted:
                         logger.warning(
                             f"[{self.name}] LLM tried to finish with only {success_calls}/{total_to_verify} successful sandbox_exec "
@@ -1621,7 +1625,22 @@ class VerificationAgent(BaseAgent):
                         "role": "user",
                         "content": "请继续验证。你输出了 Thought 但没有输出 Action。请**立即**选择一个工具执行，或者如果验证完成，输出 Final Answer 汇总所有验证结果。",
                     })
-            
+
+            # Task 7（豁免路径 g）：预算耗尽（token 预算 break / 迭代上限自然结束）
+            # 导致 LLM 未交卷（final_result 为 None）时，收口前补跑剩余未执行的确定性
+            # PoC——初始确定性执行中抛异常/中断而未落 attempt 的命令由此补齐证据，
+            # 与 cancel 路径的中断证据收口对齐（cancel 路径保持现状，不在此补跑）。
+            # runner 幂等：已落账命令按 finding_id 跳过，绝不重复执行。
+            if not self.is_cancelled and final_result is None and sandbox_commands:
+                try:
+                    await self._run_deterministic_sandbox_commands(
+                        sandbox_commands, sandbox_project_root
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        f"[{self.name}] Budget-exit deterministic PoC catch-up failed: {_e}"
+                    )
+
             # 处理结果
             duration_ms = int((time.time() - start_time) * 1000)
             
@@ -1701,85 +1720,29 @@ class VerificationAgent(BaseAgent):
                     self._finalize_findings_without_final_answer(findings_to_verify)
                 )
 
-            # === FIX P0-1: 兜底沙箱验证 ===
-            # 如果循环自然结束（LLM 始终未调用 sandbox_exec），
-            # 对第一个 finding 强制执行一次 sandbox_exec，确保证据链完整
+            # === FIX P0-1: 兜底沙箱验证（Task 7 豁免路径 h 收口）===
+            # 循环结束仍 0 次沙箱执行（LLM 拒调且初始确定性执行全部异常未落账）时，
+            # 程序化兜底遍历**全部** sandbox_commands（旧实现只跑 [0]，其余 finding
+            # 仍零证据）。复用确定性 runner——幂等：已落账命令按 finding_id 跳过；
+            # 证据经 _record_sandbox_attempt 入运行时索引，由下方
+            # _bind_runtime_evidence_to_all 绑定到全部 finding（含 LLM 自注
+            # skip_reason 的条目——程序化证据优先于 LLM 的"无法验证"声明）。
             if self._sandbox_exec_attempts == 0 and findings_to_verify and sandbox_commands:
                 logger.warning(
                     f"[{self.name}] Loop ended without any sandbox_exec, "
-                    f"forcing fallback sandbox for first finding"
+                    f"running fallback deterministic PoCs for all {len(sandbox_commands)} commands"
                 )
                 try:
-                    fallback_cmd = sandbox_commands[0]["input"]
-                    sandbox_mgr = self._get_sandbox_manager()
-                    if sandbox_mgr and sandbox_project_root:
-                        result_dict = await sandbox_mgr.execute_with_files(
-                            command=fallback_cmd.get("command", ""),
-                            host_project_dir=sandbox_project_root,
-                            timeout=fallback_cmd.get("timeout", 60),
-                            # Task 3：兜底入口与确定性路径同一映射，network_enabled 不丢弃
-                            network_mode=self._network_mode_for_command(fallback_cmd),
-                        )
-                        result = self._format_sandbox_result(result_dict)
-                    else:
-                        result = await self.execute_tool("sandbox_exec", fallback_cmd)
-                    self._sandbox_exec_calls += 1
-                    # 根因3: 同步更新新计数器
-                    self._sandbox_exec_attempts += 1
-                    if self._is_sandbox_success(str(result)):
-                        self._sandbox_exec_success += 1
-                        self._verified_finding_indices.add(0)
-                    self._record_sandbox_attempt(fallback_cmd, result)
-                    # 将沙箱证据附加到第一个 finding
-                    # Bug2-fix: 不再硬编码 success=True/exit_code=0，从实际结果读取，
-                    # 避免失败的兜底验证被记录为成功导致 _normalize_verification_outcome 误判
-                    # Bug2b-fix: fb_success 用与 _record_sandbox_attempt 一致的严判定
-                    # （has_vuln_evidence OR has_output），而非偏宽的 _is_sandbox_success
-                    # （后者把"Verification Complete"等"PoC 跑完"标记也算成功，会让兜底
-                    # 路径下"仅 exit 0 无漏洞证据"误判为 confirmed，违反 B3 严标准）
-                    if verified_findings:
-                        obs_str = str(result)
-                        obs_lower_fb = obs_str.lower()
-                        fb_has_failure = any(m in obs_str for m in SANDBOX_FAILURE_MARKERS)
-                        fb_has_vuln = (
-                            "vulnerability_confirmed(static)" not in obs_lower_fb
-                            and any(m.lower() in obs_lower_fb for m in VULN_EVIDENCE_MARKERS)
-                        )
-                        fb_has_output = len(obs_lower_fb.strip()) >= 50
-                        fb_exit = None
-                        _exit_match = re.search(r"退出码:\s*(-?\d+)", obs_str)
-                        if _exit_match:
-                            try:
-                                fb_exit = int(_exit_match.group(1))
-                            except ValueError:
-                                fb_exit = None
-                        # Task 2：exit_code 持久化 None（未进容器）而非合成 -1，
-                        # 与沙箱函数退出码语义一致；状态机 _attempt_is_infra 以
-                        # exit_code is None 判 ran_in_container。fb_success 的 ==0
-                        # 比较对 None 安全（None == 0 为 False，与 -1 行为一致）
-                        fb_success = (not fb_has_failure) and (fb_exit == 0) and (fb_has_vuln or fb_has_output)
-                        verified_findings[0]["sandbox_attempts"] = (
-                            verified_findings[0].get("sandbox_attempts") or []
-                        ) + [{
-                            "success": fb_success,
-                            "exit_code": fb_exit,
-                            "evidence_summary": obs_str[:500],
-                            "target_ref": (
-                                f"{verified_findings[0].get('file_path', '')}:"
-                                f"{verified_findings[0].get('line_start', 0)}"
-                            ),
-                            # Task 1：兜底执行路径同样标记基础设施故障
-                            "infra_error": _is_infra_error(
-                                obs_str, ran_in_container=fb_exit is not None
-                            ),
-                        }]
+                    await self._run_deterministic_sandbox_commands(
+                        sandbox_commands, sandbox_project_root
+                    )
                     await self.emit_event(
                         "warning",
-                        f"兜底沙箱验证已执行: {sandbox_commands[0].get('label', 'fallback')}"
+                        f"兜底沙箱验证已程序化执行: {len(sandbox_commands)} 条预生成 PoC"
                     )
                 except Exception as fallback_err:
                     logger.error(
-                        f"[{self.name}] Fallback sandbox_exec failed: {fallback_err}"
+                        f"[{self.name}] Fallback deterministic sandbox run failed: {fallback_err}"
                     )
 
             # R2 全量证据强制绑定：LLM 漏报的 finding 也必须获得运行时沙箱证据。
@@ -1866,10 +1829,17 @@ class VerificationAgent(BaseAgent):
         return None
 
     def _init_sandbox_counters(self) -> None:
-        """根因3: 初始化计数器（attempts/success/verified_finding_indices）"""
+        """根因3: 初始化计数器（calls/attempts/success/verified_finding_indices）"""
+        # Task 7：_sandbox_exec_calls 一并在此初始化（run() 另有赋值兜底）——
+        # 确定性 runner 自增该计数器，直接调用（补跑/兜底单测或复用）时也必须就绪
+        self._sandbox_exec_calls = 0
         self._sandbox_exec_attempts = 0
         self._sandbox_exec_success = 0
         self._verified_finding_indices = set()
+        # Task 7（豁免路径 g/h）：确定性 runner 幂等台账——已成功落 attempt 的
+        # 命令按 finding_id 登记，收口前补跑/兜底遍历复用同一 runner 时跳过，
+        # 不重复执行。异常未落 attempt 的命令不登记，留给补跑重试。
+        self._deterministic_done_finding_ids = set()
 
     def _is_sandbox_success(self, observation: str) -> bool:
         """根因3: 判断 sandbox_exec 是否成功（observation 含成功标记且无致命失败标记）。
@@ -1910,6 +1880,35 @@ class VerificationAgent(BaseAgent):
             1 for f in findings
             if isinstance(f, dict) and f.get("sandbox_skip_reason")
         )
+
+    def _mark_elastic_exit_exemptions(
+        self, findings_to_verify: list[dict], verified_indices: set
+    ) -> int:
+        """Task 7（豁免路径 f）：弹性退出放行时，为剩余未验证 finding 写
+        sandbox_skip_reason="elastic_exit" 显式豁免标记。
+
+        标记写在原始 finding 上：LLM 漏报的 finding 由
+        _bind_runtime_evidence_to_all 以原 dict 兜底承接；LLM 报告的 finding 由
+        _backfill_original_metadata 精确匹配回填时传播（LLM 自注原因优先不覆盖）。
+        终态语义：零尝试 finding 经 compute_verification_status 分支 5 落
+        needs_context（notes 带 elastic_exit）；有真实 attempt 的 finding 状态
+        仍由证据推导（not_reproducible/infra needs_context），标记不升级验证状态。
+        已有 skip_reason（上游/系统标注）的 finding 不覆盖。
+        """
+        marked = 0
+        for i, orig in enumerate(findings_to_verify):
+            if i in verified_indices:
+                continue
+            if not isinstance(orig, dict) or orig.get("sandbox_skip_reason"):
+                continue
+            orig["sandbox_skip_reason"] = "elastic_exit"
+            marked += 1
+        if marked:
+            logger.info(
+                f"[{self.name}] Elastic exit: {marked} unverified findings marked "
+                f"sandbox_skip_reason=elastic_exit"
+            )
+        return marked
 
 
     def _record_sandbox_attempt(
@@ -2477,6 +2476,14 @@ class VerificationAgent(BaseAgent):
                 strict = self._normalize_verification_outcome(target)
                 target.clear()
                 target.update(strict)
+            elif not target.get("verification_status"):
+                # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
+                # 归一化经 compute_verification_status 分支 5 给 needs_context，
+                # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
+                # 不得留无状态 finding 出 Agent。
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
 
     def _attempt_has_vuln_evidence(self, attempt: dict[str, Any]) -> bool:
         """B3 严标准：判断沙箱 attempt 是否含真正的漏洞触发证据（VULNERABILITY_CONFIRMED 等）。
@@ -2716,6 +2723,10 @@ class VerificationAgent(BaseAgent):
                         and (orig.get("line_start") or 0) == (llm_finding.get("line_start") or 0)
                         and str(orig.get("vulnerability_type") or "").strip().lower() == llm_type):
                     llm_finding["_sandbox_finding_id"] = orig.get("_sandbox_finding_id")
+                    # Task 7（豁免路径 f）：弹性退出等系统豁免标记写在原始 finding 上，
+                    # 精确匹配时传播给 LLM 报告条目（LLM 自注原因优先，不覆盖）
+                    if not llm_finding.get("sandbox_skip_reason") and orig.get("sandbox_skip_reason"):
+                        llm_finding["sandbox_skip_reason"] = orig["sandbox_skip_reason"]
                     break
 
         needs_backfill = (
@@ -2856,11 +2867,21 @@ class VerificationAgent(BaseAgent):
 
         确保每个 finding 都有运行时沙箱证据，不依赖 LLM 是否主动调用 sandbox_exec。
         单条命令失败不影响整体（证据如实记录）；超时受预生成命令自带 timeout 控制。
+
+        Task 7（豁免路径 g/h）：幂等——已成功落 attempt 的命令按 finding_id 登记在
+        _deterministic_done_finding_ids，收口前补跑（预算耗尽）/ 兜底遍历（0 次
+        sandbox_exec）复用本方法时只跑尚未落账的命令，绝不重复执行；执行中抛异常
+        （未走 _record_sandbox_attempt）的命令不登记，留给补跑一次重试机会。
         """
         if not sandbox_commands:
             return
         sandbox_mgr = self._get_sandbox_manager()
         executed = 0
+        skipped = 0
+        done_ids = getattr(self, "_deterministic_done_finding_ids", None)
+        if done_ids is None:
+            done_ids = set()
+            self._deterministic_done_finding_ids = done_ids
         for sc in sandbox_commands:
             if self.is_cancelled:
                 break
@@ -2868,9 +2889,13 @@ class VerificationAgent(BaseAgent):
             command = cmd_input.get("command", "")
             if not command:
                 continue
+            finding_id = sc.get("finding_id") or ""
+            if finding_id and finding_id in done_ids:
+                # 幂等：初始确定性执行已落账的命令，补跑/兜底不重复执行
+                skipped += 1
+                continue
             try:
                 timeout = cmd_input.get("timeout", 60)
-                finding_id = sc.get("finding_id") or ""
                 # REQ-VP-2: 执行前发射 sandbox_start，前端可见 PoC 命令
                 await self.emit_event(
                     "sandbox_start",
@@ -2906,6 +2931,9 @@ class VerificationAgent(BaseAgent):
                     if finding_idx is not None:
                         self._verified_finding_indices.add(finding_idx)
                 self._record_sandbox_attempt(cmd_input, result, finding_id=finding_id)
+                # Task 7：成功落账后登记幂等台账（异常路径不登记，补跑可重试）
+                if finding_id:
+                    done_ids.add(finding_id)
                 executed += 1
                 # REQ-CM-4: ssrf 网络受限，确定性 sink 检测完成后登记 capped 路径，
                 # 阻止 LLM 循环对同一文件重复执行（nginx 7b76b3a8 实证 106 次死循环）
@@ -2940,6 +2968,7 @@ class VerificationAgent(BaseAgent):
             await self.emit_event(
                 "info",
                 f"✅ 确定性沙箱执行完成: {executed} 条预生成 PoC 已运行"
+                + (f"（{skipped} 条已落账跳过）" if skipped else "")
             )
 
     async def _block_network_capped(self, tool_input: Dict) -> Optional[str]:
