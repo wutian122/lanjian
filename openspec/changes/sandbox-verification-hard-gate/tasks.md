@@ -97,6 +97,7 @@
 ## Phase 4: audit_trace 闭环
 
 ### Task 13: trace 持久化与路径配置
+- [x] **Task 13 完成**（实施 df8f6c6 + 闭合 1a96942，review CLEAN——spec 三项亲验（env 链路/默认不变/四份 compose YAML 独立解析）、计划外闭合变异实证（orchestrator 显式传参屏蔽新 env 的缺口，AgentConfig env 前缀 AGENT_ 死配置实锤）；3 Minor 记账：AgentConfig.audit_trace_dir 死字段（后续清理）、**v6.4.1 镜像不含新 env 字段——挂载持久化现网已生效但 env 覆盖能力要等 Phase 6 重建**（时序知悉）、部署机容器未 recreate（Phase 6 统一））
 - Files: `docker-compose.yml`（backend volumes）、`backend/app/services/agent/audit_trace.py`（:50-52 路径 env 化）
 - Interfaces: env `AUDIT_TRACE_DIR` 覆盖默认 `./audit_traces`
 - TDD: 失败测试（env 设置后目录切换）→ compose 修改（本地验证 volume 生效）→ commit
