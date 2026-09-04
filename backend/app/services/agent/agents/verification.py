@@ -2578,17 +2578,51 @@ class VerificationAgent(BaseAgent):
         # Semgrep deterministic findings: 静态分析确认（无动态沙箱复现）
         # Bug4-fix: 改为 STATIC_CONFIRMED 而非 CONFIRMED，符合 B3 严标准
         # （confirmed 必须有动态复现铁证；Semgrep 这类是确定性静态分析，属代码推理确认）
+        # Task 5（豁免路径 a 收口）：四类 semgrep finding 不再无条件短路——
+        # R3 确定性执行（_run_deterministic_sandbox_commands）本就对全部 finding
+        # 预生成并执行 PoC，attempt 已在归一化前经 _attach_runtime_sandbox_attempts
+        # 绑定；短路块此前无视这些 attempt。现按类型分流：
+        # - hardcoded_secret/deserialization 有专用确认模板（输出
+        #   VULNERABILITY_STATIC_ONLY → attempt.static_evidence）：不短路，落下方
+        #   compute_verification_status 由 attempt + 静态证据共同推导（PoC 证伪 →
+        #   not_reproducible；全 infra_error → needs_context，承接 Task 1）；
+        # - weak_crypto/xxe 无专用确认模板（default 通用模板不产出该类型确认标记）：
+        #   标 sandbox_skip_reason="no_poc_template" 显式豁免（spec Requirement
+        #   条件 2：skip_reason 非空即合规），保持 static_confirmed 现行为；
+        #   但已有 attempt 且全部 infra_error 时不豁免——落状态引擎报沙箱环境故障，
+        #   不得用豁免标记掩盖基础设施故障。
         if finding.get("source") == "semgrep":
-            deterministic_types = ["hardcoded_secret", "weak_crypto", "deserialization", "xxe"]
-            if finding.get("vulnerability_type") in deterministic_types:
-                finding["is_verified"] = True
-                normalized = dict(finding)
-                normalized["verification_status"] = VerificationStatus.STATIC_CONFIRMED
-                normalized["verdict"] = VerificationStatus.STATIC_CONFIRMED
-                normalized["is_verified"] = True
-                normalized["verification_method"] = "semgrep_static_analysis"
-                normalized["verified_at"] = datetime.now(timezone.utc).isoformat()
-                return normalized
+            semgrep_poc_types = {"hardcoded_secret", "deserialization"}
+            semgrep_no_poc_types = {"weak_crypto", "xxe"}
+            semgrep_shortcut_types = semgrep_poc_types | semgrep_no_poc_types
+            vuln_type = finding.get("vulnerability_type")
+            if vuln_type in semgrep_shortcut_types:
+                shortcut_attempts = [
+                    a
+                    for a in (finding.get("sandbox_attempts") or [])
+                    if isinstance(a, dict) and not a.get("fabricated")
+                ]
+                all_infra = bool(shortcut_attempts) and all(
+                    a.get("infra_error")
+                    or _is_infra_error(
+                        str(a.get("evidence_summary") or "") + "\n" + str(a.get("command") or ""),
+                        ran_in_container=a.get("exit_code") is not None,
+                    )
+                    for a in shortcut_attempts
+                )
+                if vuln_type in semgrep_no_poc_types and not all_infra:
+                    finding["sandbox_skip_reason"] = (
+                        finding.get("sandbox_skip_reason") or "no_poc_template"
+                    )
+                    normalized = dict(finding)
+                    normalized["verification_status"] = VerificationStatus.STATIC_CONFIRMED
+                    normalized["verdict"] = VerificationStatus.STATIC_CONFIRMED
+                    normalized["is_verified"] = True
+                    normalized["verification_method"] = "semgrep_static_analysis"
+                    normalized["verified_at"] = datetime.now(timezone.utc).isoformat()
+                    return normalized
+                # hardcoded_secret/deserialization（或豁免类全 infra_error）：
+                # 不短路，状态由沙箱 attempt 推导
 
         attempts = finding.get("sandbox_attempts") or []
         status, is_verified, notes = compute_verification_status(
