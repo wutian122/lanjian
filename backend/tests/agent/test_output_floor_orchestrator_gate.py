@@ -9,13 +9,14 @@
   无任何可验证产出则记 gate="output_floor" observation 并按覆盖不足收口
   （completed_with_gaps，coverage_bypass reason=output_floor_violated）；
 - Task 9 Important 交接：recon 侦察线索（source="recon"/"recon_high_risk"）
-  仅作报告上下文，不进验证队列、不计入门禁未验证口径（承接 :617 既有裁决
-  "高风险区不作 finding"）。
+  是上下文线索而非漏洞发现：不进报告/落库/验证队列、不计门禁口径
+  （承接 :617 既有裁决"高风险区不作 finding"；Task 12 起三处消费者共用
+  strict_finding.is_verification_work_item 谓词）。
 """
 import pytest
 
 from app.services.agent.agents.orchestrator import OrchestratorAgent
-from app.services.agent.agents.verification import _is_verification_work_item
+from app.services.agent.strict_finding import is_verification_work_item
 
 
 def _make_orch():
@@ -267,15 +268,15 @@ def test_verification_queue_accepts_fallback_rejects_recon():
     """Verification 验证队列口径：semgrep_fallback 候选必须入队；
     recon 线索（含 severity=high 的 recon_high_risk）不得入队。"""
     fallback = {"source": "semgrep_fallback", "severity": "medium", "needs_verification": True}
-    assert _is_verification_work_item(fallback) is True
+    assert is_verification_work_item(fallback) is True
 
     recon_str = {"source": "recon", "severity": "medium", "needs_verification": True}
     recon_high = {"source": "recon_high_risk", "severity": "high", "needs_verification": True}
-    assert _is_verification_work_item(recon_str) is False
-    assert _is_verification_work_item(recon_high) is False
+    assert is_verification_work_item(recon_str) is False
+    assert is_verification_work_item(recon_high) is False
 
     normal = {"source": "analysis", "severity": "high", "needs_verification": False}
-    assert _is_verification_work_item(normal) is True
+    assert is_verification_work_item(normal) is True
 
 
 def test_verification_handoff_excludes_recon_leads():

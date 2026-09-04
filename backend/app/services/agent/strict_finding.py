@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 # confidence 阈值：低于此值的发现视为低置信度，过滤掉
 MIN_CONFIDENCE_THRESHOLD: float = 0.7
@@ -8,6 +9,29 @@ MIN_CONFIDENCE_THRESHOLD: float = 0.7
 # 分层候选下界（spec finding-output-floor）：needs_verification=true 的候选
 # 在 [0.1, 0.7) 区间放行交沙箱证实/证伪；低于 0.1 视为无依据噪声仍丢弃
 MIN_CANDIDATE_CONFIDENCE: float = 0.1
+
+# sandbox-verification-hard-gate Task 12：recon 侦察线索口径唯一真相源。
+# recon 来源（Recon initial_findings 字符串线索 / high_risk_areas 转换项）是
+# Analysis 的上下文线索而非漏洞发现：不进 Verification 验证队列、不计门禁
+# 产出口径、不进 handoff key_findings、不落库（报告/前端不呈现为漏洞）。
+# 三处消费者（orchestrator 门禁/交接、verification 入队、agent_tasks 落库）
+# SHALL 共用下面两个谓词，禁止再各写一份 source 元组副本（漂移风险）。
+CONTEXT_ONLY_SOURCES: tuple[str, ...] = ("recon", "recon_high_risk")
+
+
+def is_context_only_finding(finding: Any) -> bool:
+    """recon 侦察线索仅作上下文：不是可验证产出/验证对象，不计门禁口径。"""
+    return isinstance(finding, Mapping) and finding.get("source") in CONTEXT_ONLY_SOURCES
+
+
+def is_verification_work_item(finding: Any) -> bool:
+    """验证队列/门禁产出口径：上下文线索（recon 来源）不是验证对象。
+
+    is_context_only_finding 的逆谓词（非 Mapping 输入两者皆为 False）；
+    needs_verification=true 候选（Analysis 低置信候选 / semgrep_fallback
+    兜底候选）正常计入。
+    """
+    return isinstance(finding, Mapping) and finding.get("source") not in CONTEXT_ONLY_SOURCES
 
 
 def _is_verification_candidate(finding: Mapping[str, Any], conf_value: float | None) -> bool:

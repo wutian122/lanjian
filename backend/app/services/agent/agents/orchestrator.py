@@ -26,7 +26,12 @@ from ..coverage import CoverageStatus, evaluate_coverage
 from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, MULTI_AGENT_RULES, build_enhanced_prompt
 from ..round_strategy import RoundContext
-from ..strict_finding import MIN_CANDIDATE_CONFIDENCE, MIN_CONFIDENCE_THRESHOLD
+from ..strict_finding import (
+    MIN_CANDIDATE_CONFIDENCE,
+    MIN_CONFIDENCE_THRESHOLD,
+    is_context_only_finding,
+    is_verification_work_item,
+)
 from .base import AgentConfig, AgentPattern, AgentResult, AgentType, BaseAgent, TaskHandoff
 from app.services.agent.config import get_agent_config
 
@@ -492,10 +497,11 @@ class OrchestratorAgent(BaseAgent):
         Bug C fix: removed is_verified=True bypass. Only accept:
         1. confirmed with actual sandbox_attempts evidence, or
         2. static_confirmed (code reasoning, B3 strict standard)
+
+        Task 12: 遍历口径与门禁统一用 _actionable_findings（recon 上下文线索
+        不参与证据判定——它们从不进验证队列，不可能携带验证状态）。
         """
-        for finding in self._all_findings:
-            if not isinstance(finding, dict):
-                continue
+        for finding in self._actionable_findings():
             if finding.get("verification_status") == "confirmed":
                 sandbox_attempts = finding.get("sandbox_attempts", [])
                 if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
@@ -536,7 +542,7 @@ class OrchestratorAgent(BaseAgent):
             return
         unverified = [
             f for f in self._all_findings
-            if not self._is_context_only_finding(f)
+            if is_verification_work_item(f)
             and (
                 f.get("verification_status")
                 not in ("confirmed", "static_confirmed", "not_reproducible", "false_positive")
@@ -572,7 +578,7 @@ class OrchestratorAgent(BaseAgent):
             if not isinstance(finding, dict):
                 continue
             # Task 11: recon 上下文线索从来不是验证对象，不写"放行未验证"标记
-            if self._is_context_only_finding(finding):
+            if is_context_only_finding(finding):
                 continue
             if finding.get("sandbox_skip_reason"):
                 continue
@@ -633,25 +639,23 @@ class OrchestratorAgent(BaseAgent):
         """Recon 高风险区是 Analysis 的上下文线索，不作为漏洞 findings。"""
         return None
 
-    # sandbox-verification-hard-gate Task 11（Task 9 Important 交接）：
+    # sandbox-verification-hard-gate Task 11（Task 9 Important 交接）/ Task 12 口径统一：
     # recon 侦察线索（initial_findings 字符串 finding / high_risk_areas 转换项）
     # 虽经 Task 9 候选豁免流入 _all_findings，但承接本方法既有裁决——它们是
-    # Analysis 的上下文线索，不是漏洞 finding：保留在报告中作上下文标注，
-    # 不进 Verification 验证队列、不计门禁未验证口径。
-    _CONTEXT_ONLY_SOURCES = ("recon", "recon_high_risk")
-
-    def _is_context_only_finding(self, finding: Any) -> bool:
-        """recon 来源的侦察线索仅作上下文，不占验证/门禁产出口径。"""
-        return isinstance(finding, dict) and finding.get("source") in self._CONTEXT_ONLY_SOURCES
+    # Analysis 的上下文线索，不是漏洞发现：不进 Verification 验证队列与 handoff
+    # key_findings、不计门禁产出口径、不落库（agent_tasks._save_findings 用同一
+    # 谓词过滤）——报告与前端不呈现为漏洞；仅保留在本次编排的内存状态中作上下文。
+    # 口径谓词统一由 strict_finding 承载（三处消费者共用，禁止另写 source 元组副本）。
 
     def _actionable_findings(self) -> list[dict[str, Any]]:
         """可验证产出口径：_all_findings 排除 recon 上下文线索。
 
-        Semgrep 兜底候选（source=semgrep_fallback）与 Analysis 产出均计入。
+        Semgrep 兜底候选（source=semgrep_fallback）与 Analysis 产出
+        （含 needs_verification=true 低置信候选）均计入。
         """
         return [
             f for f in (self._all_findings or [])
-            if isinstance(f, dict) and not self._is_context_only_finding(f)
+            if is_verification_work_item(f)
         ]
 
     def _build_semgrep_fallback_candidates(self) -> list[dict[str, Any]]:
@@ -1487,8 +1491,12 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                             logger.warning(f"[Orchestrator] Semgrep fallback on finish failed (non-fatal): {e}")
                         self._apply_output_floor_closeout()
                     # 🔥 弹性终止门禁：三层门禁保障审计质量
-                    # Task 11: has_findings 按可验证产出口径（recon 上下文线索不算）
-                    has_findings = len(self._actionable_findings()) > 0
+                    # Task 11: has_findings 按可验证产出口径（recon 上下文线索不算）；
+                    # Task 12: 门禁拦截消息/observation 的计数同口径（候选计入、
+                    # recon 不计），避免向 LLM 与 observations 报含 recon 的虚高数量。
+                    actionable_findings = self._actionable_findings()
+                    actionable_count = len(actionable_findings)
+                    has_findings = actionable_count > 0
                     verification_dispatched = "verification" in self._dispatched_tasks
                     verification_count = self._dispatched_tasks.get("verification", 0)
                     has_sandbox_evidence = self._has_valid_sandbox_evidence()
@@ -1504,25 +1512,25 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                         self._finish_gate_rejections += 1
                         self._record_gate_observation(
                             "verification_evidence_gate",
-                            f"发现 {len(self._all_findings)} 个漏洞但无有效沙箱证据（第 {self._finish_gate_rejections} 次拒绝）",
+                            f"发现 {actionable_count} 个漏洞但无有效沙箱证据（第 {self._finish_gate_rejections} 次拒绝）",
                         )
                     if has_findings and (not verification_dispatched or (verification_count > 0 and not has_sandbox_evidence)) and self._finish_gate_rejections < max_redispatch:
                         if not verification_dispatched:
                             await self.emit_event(
                                 "warning",
-                                f"⚠️ 系统强制干预：发现 {len(self._all_findings)} 个漏洞但未调度沙箱验证，拒绝完成审计"
+                                f"⚠️ 系统强制干预：发现 {actionable_count} 个漏洞但未调度沙箱验证，拒绝完成审计"
                             )
                             await self.emit_llm_decision("拒绝完成", "系统强制要求先调度 verification Agent 进行沙箱验证")
                             prompt_suffix = (
                                 "请立即调度 verification Agent:\n"
                                 "Thought: [我需要调度 verification Agent 进行沙箱验证]\n"
                                 "Action: dispatch_agent\n"
-                                f"Action Input: {{\"agent\": \"verification\", \"task\": \"验证所有发现的漏洞，使用 sandbox_exec 在沙箱中执行 PoC\", \"context\": \"共有 {len(self._all_findings)} 个漏洞需要验证\"}}"
+                                f"Action Input: {{\"agent\": \"verification\", \"task\": \"验证所有发现的漏洞，使用 sandbox_exec 在沙箱中执行 PoC\", \"context\": \"共有 {actionable_count} 个漏洞需要验证\"}}"
                             )
                         else:
                             await self.emit_event(
                                 "warning",
-                                f"⚠️ 系统强制干预：发现 {len(self._all_findings)} 个漏洞，已调度 {verification_count} 次验证但无有效沙箱证据（0/{len(self._all_findings)} 通过验证），拒绝完成审计"
+                                f"⚠️ 系统强制干预：发现 {actionable_count} 个漏洞，已调度 {verification_count} 次验证但无有效沙箱证据（0/{actionable_count} 通过验证），拒绝完成审计"
                             )
                             await self.emit_llm_decision("拒绝完成", f"已调度 {verification_count} 次验证但无有效沙箱证据，必须再次调度并确保 sandbox_exec 执行")
                             prompt_suffix = (
@@ -1530,12 +1538,12 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                                 "请再次调度 verification Agent，并确保使用 sandbox_exec 工具执行 PoC。\n"
                                 "仅凭代码分析判断漏洞是不够的，必须在沙箱中实际验证。\n\n"
                                 "Action: dispatch_agent\n"
-                                f"Action Input: {{\"agent\": \"verification\", \"task\": \"再次验证所有发现的漏洞，必须使用 sandbox_exec 在沙箱中执行 PoC\", \"context\": \"已调度 {verification_count} 次但无沙箱证据，共 {len(self._all_findings)} 个漏洞\"}}"
+                                f"Action Input: {{\"agent\": \"verification\", \"task\": \"再次验证所有发现的漏洞，必须使用 sandbox_exec 在沙箱中执行 PoC\", \"context\": \"已调度 {verification_count} 次但无沙箱证据，共 {actionable_count} 个漏洞\"}}"
                             )
                         self._conversation_history.append({
                             "role": "user",
                             "content": (
-                                f"⚠️ **系统强制干预**: 你发现了 {len(self._all_findings)} 个漏洞但还没有有效的沙箱验证证据！\n\n"
+                                f"⚠️ **系统强制干预**: 你发现了 {actionable_count} 个漏洞但还没有有效的沙箱验证证据！\n\n"
                                 "这是不可跳过的步骤。每个漏洞必须通过沙箱验证才能确认其真实性。\n"
                                 "仅凭代码分析判断漏洞是不够的，必须使用 sandbox_exec 在 Docker 沙箱中实际验证。\n\n"
                                 f"{prompt_suffix}\n\n"
@@ -1620,10 +1628,17 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     # 原逻辑 `not verification_status` 被 analysis 默认写入的 needs_context 击穿，
                     # 导致"确保所有 finding 都送去验证"永不触发（生产任务 4/5 发现从未送验）。
                     UNVERIFIED_TERMINAL = {"confirmed", "static_confirmed", "not_reproducible", "false_positive"}
+                    # 用 _all_findings 现取值（不得用本轮初的 actionable_findings
+                    # 快照）：R4 放行分支的 _maybe_dispatch_force_verification 在
+                    # 此之前 await 完成并把验证结果 merge 回 _all_findings
+                    # （_merge_or_append_finding 以新 dict 替换索引位置），快照会
+                    # 滞留合并前的旧 verification_status 造成误判未验证。
+                    actionable_now = [
+                        f for f in self._all_findings if is_verification_work_item(f)
+                    ]
                     unverified_findings = [
-                        f for f in self._all_findings
-                        if not self._is_context_only_finding(f)
-                        and f.get("verification_status") not in UNVERIFIED_TERMINAL
+                        f for f in actionable_now
+                        if f.get("verification_status") not in UNVERIFIED_TERMINAL
                         and f.get("is_verified") is not True
                     ]
                     if unverified_findings and verification_count > 0 and not self._full_verification_dispatched:
@@ -1640,7 +1655,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                         self._conversation_history.append({
                             "role": "user",
                             "content": (
-                                f"⚠️ **全量验证门禁**: 你已发现 {len(self._all_findings)} 个漏洞，"
+                                f"⚠️ **全量验证门禁**: 你已发现 {len(actionable_now)} 个漏洞，"
                                 f"但其中 {len(unverified_findings)} 个尚未经过沙箱验证。\n\n"
                                 f"未验证的漏洞:\n{unverified_summary}\n\n"
                                 "请立即调度 verification Agent 验证这些未验证的漏洞。\n"
@@ -1957,10 +1972,19 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
             # 🔥 CRITICAL: Log final findings count before returning
 
-            # 🔥 Semgrep findings 仅作为线索注入子 Agent 上下文，不直接合并到最终结果
-            # 避免 Semgrep 原始规则 ID 直接作为 findings 灌水（问题三修复）
+            # Semgrep 预扫发现默认仅作线索注入子 Agent 上下文，不直接合并到最终
+            # 结果（避免规则 ID 直接灌水，问题三修复）；Task 11 兜底例外：
+            # Analysis 全部派发后 0 可验证产出时，去重后的预扫发现以候选
+            # （source=semgrep_fallback）落库交沙箱验证，已合并数见 fallback_n。
             if self._semgrep_findings:
-                logger.info(f"[Orchestrator] {len(self._semgrep_findings)} Semgrep findings kept as leads only (not merged into final results)")
+                fallback_n = sum(
+                    1 for f in self._all_findings
+                    if isinstance(f, dict) and f.get("source") == "semgrep_fallback"
+                )
+                logger.info(
+                    f"[Orchestrator] {len(self._semgrep_findings)} Semgrep prescan findings "
+                    f"used as context leads ({fallback_n} merged as verification candidates)"
+                )
             logger.info(f"[Orchestrator] Final result: {len(self._all_findings)} findings collected")
             if len(self._all_findings) == 0:
                 logger.warning(f"[Orchestrator] ⚠️ No findings collected! Dispatched agents: {list(self._dispatched_tasks.keys())}, Iterations: {self._iteration}")
@@ -2634,7 +2658,10 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
         # 🔥 检查是否重复调度同一个 Agent
         dispatch_count = self._dispatched_tasks.get(agent_name, 0)
-        # 动态调度上限：覆盖率门禁拦截 ≥3 次时提升上限到 4，给 LLM 补漏机会
+        # 调度上限固定 3 次（达限不增加调度次数；analysis 达限走下方 Semgrep
+        # 兜底/产出下限收口分支）。覆盖率门禁的"3 次拦截后自动放行"由
+        # _hard_coverage_block_count 独立控制，不提升调度上限——旧注释
+        # "提升上限到 4" 为陈旧表述，无对应代码。
         max_dispatch = 3
         if dispatch_count >= max_dispatch:
             if agent_name == "analysis":
@@ -3696,7 +3723,7 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                 # Task 11: recon 上下文线索不进 Verification 交接（semgrep_fallback 候选保留）
                 key_findings=sorted(
                     [f for f in self._all_findings
-                     if isinstance(f, dict) and not self._is_context_only_finding(f)],
+                     if is_verification_work_item(f)],
                     key=lambda f: severity_order.get(f.get("severity", "low"), 3),
                 ),
                 insights=analysis_handoff.insights,
@@ -3791,7 +3818,7 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                     # Task 11: recon 上下文线索不进 Verification 交接
                     sorted_findings = sorted(
                         [f for f in self._all_findings
-                         if isinstance(f, dict) and not self._is_context_only_finding(f)],
+                         if is_verification_work_item(f)],
                         key=lambda x: severity_order.get(x.get("severity", "low"), 3)
                     )
 

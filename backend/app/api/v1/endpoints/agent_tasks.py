@@ -45,7 +45,11 @@ from app.models.project import Project
 from app.models.user import User
 from app.services.agent.agents.base import AgentResult
 from app.services.agent.event_manager import EventManager
-from app.services.agent.strict_finding import is_strict_finding, _to_int
+from app.services.agent.strict_finding import (
+    is_context_only_finding,
+    is_strict_finding,
+    _to_int,
+)
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.git_ssh_service import GitSSHOperations
 from app.services.llm.service import LLMService
@@ -1978,12 +1982,15 @@ async def _save_findings(
             logger.debug(f"[SaveFindings] Skipping non-dict finding: {type(finding)}")
             continue
 
-        # sandbox-verification-hard-gate Task 11（修复轮 1 I3）：recon 侦察线索
-        # （source=recon/recon_high_risk）是 Analysis 的上下文线索而非漏洞发现
-        # （承接 orchestrator"高风险区不作 finding"裁决），不落库——否则会以
-        # 普通高危漏洞身份出现在报告与前端；其上下文价值由 recon high_risk_areas
-        # 既有展示承载。semgrep_fallback 兜底候选正常落库（须沙箱验证）。
-        if finding.get("source") in ("recon", "recon_high_risk"):
+        # sandbox-verification-hard-gate Task 11（修复轮 1 I3）/ Task 12 口径统一：
+        # recon 侦察线索（source=recon/recon_high_risk）是 Analysis 的上下文线索
+        # 而非漏洞发现（承接 orchestrator"高风险区不作 finding"裁决），不落库——
+        # 否则会以普通高危漏洞身份出现在报告与前端。其上下文价值仅存在于当次
+        # 编排的内存状态（会话历史/handoff 上下文），持久化层不存在"recon 高风险
+        # 区展示"承载（旧注释所称为不实表述）。谓词与 orchestrator 门禁/verification
+        # 入队共用 strict_finding.is_context_only_finding。semgrep_fallback 兜底候选
+        # 正常落库（须沙箱验证）。
+        if is_context_only_finding(finding):
             logger.info(
                 f"[SaveFindings] Skipping context-only recon lead: "
                 f"{str(finding.get('title', 'N/A'))[:60]}"
