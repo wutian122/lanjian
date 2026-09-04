@@ -21,6 +21,24 @@ from ..utils.path_safety import resolve_safe_path, UnsafePathError
 logger = logging.getLogger(__name__)
 
 
+def _sandbox_failure(error: str, *, exit_code: Optional[int] = None) -> Dict[str, Any]:
+    """沙箱命令未获得真实容器退出状态时的统一返回结构（三通道共用，防键集漂移——
+    曾因 execute_tool_command 异常返回漏 "stdout" 键致消费方 KeyError）。
+
+    exit_code=None（默认）：命令未在容器内执行或退出状态不可得（Docker 不可用、
+    容器创建失败、daemon 中断），渲染层不输出"退出码"行，下游据此判
+    ran_in_container=False，connection 类基础设施签名方可生效；
+    超时（容器已创建、命令执行后被 kill）传 exit_code=-1，表示"进过容器但无退出码"。
+    """
+    return {
+        "success": False,
+        "error": error,
+        "stdout": "",
+        "stderr": "",
+        "exit_code": exit_code,
+    }
+
+
 @dataclass
 class SandboxConfig:
     """沙箱配置"""
@@ -143,14 +161,8 @@ class SandboxManager:
             执行结果
         """
         if not self.is_available:
-            return {
-                "success": False,
-                "error": "Docker 不可用",
-                "stdout": "",
-                "stderr": "",
-                "exit_code": -1,
-            }
-        
+            return _sandbox_failure("Docker 不可用")
+
         timeout = timeout or self.config.timeout
 
         # 禁用代理环境变量：从宿主机环境显式剔除代理变量，避免空字符串干扰 pip/curl
@@ -233,28 +245,16 @@ class SandboxManager:
                     
                 except asyncio.TimeoutError:
                     await asyncio.to_thread(container.kill)
-                    return {
-                        "success": False,
-                        "error": f"执行超时 ({timeout}秒)",
-                        "stdout": "",
-                        "stderr": "",
-                        "exit_code": -1,
-                    }
-                    
+                    return _sandbox_failure(f"执行超时 ({timeout}秒)", exit_code=-1)
+
                 finally:
                     # 清理容器
                     await asyncio.to_thread(container.remove, force=True)
-                    
+
         except Exception as e:
             logger.error(f"Sandbox execution error: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "stdout": "",
-                "stderr": "",
-                "exit_code": -1,
-            }
-    
+            return _sandbox_failure(str(e))
+
     async def execute_tool_command(
         self,
         command: str,
@@ -277,14 +277,8 @@ class SandboxManager:
             执行结果
         """
         if not self.is_available:
-            return {
-                "success": False,
-                "error": "Docker 不可用",
-                "stdout": "",
-                "stderr": "",
-                "exit_code": -1,
-            }
-        
+            return _sandbox_failure("Docker 不可用")
+
         timeout = timeout or self.config.timeout
 
         # read network mode from config if not specified
@@ -310,21 +304,9 @@ class SandboxManager:
         try:
             host_workdir = os.path.abspath(host_workdir)
             if not os.path.isdir(host_workdir):
-                return {
-                    "success": False,
-                    "error": f"项目目录不存在: {host_workdir}",
-                    "stdout": "",
-                    "stderr": "",
-                    "exit_code": -1,
-                }
+                return _sandbox_failure(f"项目目录不存在: {host_workdir}")
             if len(host_workdir) < 2 or host_workdir == os.path.abspath(os.sep):
-                return {
-                    "success": False,
-                    "error": f"无效的工作目录: {host_workdir}",
-                    "stdout": "",
-                    "stderr": "",
-                    "exit_code": -1,
-                }
+                return _sandbox_failure(f"无效的工作目录: {host_workdir}")
 
             # 清除代理环境变量：在命令前添加 unset（双重保险）
             unset_proxy_prefix = "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy 2>/dev/null; "
@@ -391,26 +373,15 @@ class SandboxManager:
                 
             except asyncio.TimeoutError:
                 await asyncio.to_thread(container.kill)
-                return {
-                    "success": False,
-                    "error": f"执行超时 ({timeout}秒)",
-                    "stdout": "",
-                    "stderr": "",
-                    "exit_code": -1,
-                }
-                
+                return _sandbox_failure(f"执行超时 ({timeout}秒)", exit_code=-1)
+
             finally:
                 # 清理容器
                 await asyncio.to_thread(container.remove, force=True)
-                
+
         except Exception as e:
             logger.error(f"Tool execution error: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "stderr": "",
-                "exit_code": -1,
-            }
+            return _sandbox_failure(str(e))
 
     async def execute_with_files(
         self,
@@ -428,10 +399,7 @@ class SandboxManager:
           /workspace/poc/ -> 临时目录（可读写，用于写 PoC 脚本）
         """
         if not self.is_available:
-            return {
-                "success": False, "error": "Docker not available",
-                "stdout": "", "stderr": "", "exit_code": -1,
-            }
+            return _sandbox_failure("Docker not available")
 
         timeout = timeout or self.config.timeout
         # 禁用代理环境变量：从宿主机环境剔除代理变量
@@ -450,11 +418,7 @@ class SandboxManager:
         try:
             host_project_dir = os.path.abspath(host_project_dir)
             if not os.path.isdir(host_project_dir):
-                return {
-                    "success": False,
-                    "error": "Project dir not found: " + host_project_dir,
-                    "stdout": "", "stderr": "", "exit_code": -1,
-                }
+                return _sandbox_failure("Project dir not found: " + host_project_dir)
 
             with tempfile.TemporaryDirectory() as poc_dir:
                 unset_proxy = "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy 2>/dev/null; "
@@ -509,19 +473,13 @@ class SandboxManager:
                     }
                 except asyncio.TimeoutError:
                     await asyncio.to_thread(container.kill)
-                    return {
-                        "success": False, "error": "Timeout (" + str(timeout) + "s)",
-                        "stdout": "", "stderr": "", "exit_code": -1,
-                    }
+                    return _sandbox_failure("Timeout (" + str(timeout) + "s)", exit_code=-1)
                 finally:
                     await asyncio.to_thread(container.remove, force=True)
 
         except Exception as e:
             logger.error("Sandbox execute_with_files error: " + str(e))
-            return {
-                "success": False, "error": str(e),
-                "stdout": "", "stderr": "", "exit_code": -1,
-            }
+            return _sandbox_failure(str(e))
 
     async def execute_poc(
         self,
@@ -835,7 +793,11 @@ class SandboxTool(AgentTool):
             # Format result the same way as non-python path
             _output_parts = ["Sandbox result (python -c, base64 encoded)\n"]
             _output_parts.append(f"SandboxTool python -c (base64 encoded)")
-            _output_parts.append(f"\u9000\u51fa\u7801: {_py_result['exit_code']}")
+            # Skip exit-code line when exit_code is None (infra failure, command
+            # never ran in container) \u2014 matches _format_sandbox_result: downstream
+            # _record_sandbox_attempt infers ran_in_container from "\u9000\u51fa\u7801: N" presence
+            if _py_result.get("exit_code") is not None:
+                _output_parts.append(f"\u9000\u51fa\u7801: {_py_result['exit_code']}")
             if _py_result["stdout"]:
                 _output_parts.append(f"\n\u6807\u51c6\u8f93\u51fa:\n```\n{_py_result['stdout']}\n```")
             if _py_result["stderr"]:
@@ -883,7 +845,12 @@ class SandboxTool(AgentTool):
         output_parts = ["🐳 沙箱执行结果\n"]
         output_parts.append(f"命令: {command}")
         output_parts.append(f"网络模式: {'bridge (允许网络)' if network_enabled else 'none (隔离)'}")
-        output_parts.append(f"退出码: {result['exit_code']}")
+        # exit_code=None 表示命令未进容器（Docker 不可用/容器创建失败/daemon 中断）：
+        # 不渲染退出码行——下游 _record_sandbox_attempt 以"退出码: N"存在与否判
+        # ran_in_container，渲染 -1 会把 infra 失败误判为"容器内执行过"，抑制
+        # connection 类基础设施签名（超时 -1 仍渲染，那是进过容器后被 kill）
+        if result.get("exit_code") is not None:
+            output_parts.append(f"退出码: {result['exit_code']}")
         
         if result["stdout"]:
             output_parts.append(f"\n标准输出:\n```\n{result['stdout']}\n```")

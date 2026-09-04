@@ -3472,7 +3472,14 @@ class VerificationAgent(BaseAgent):
     def _format_sandbox_result(self, result_dict: Dict[str, Any]) -> str:
         """将 execute_with_files 的结果格式化为与 execute_tool 一致的字符串"""
         parts = ["沙箱执行结果\n"]
-        parts.append(f"退出码: {result_dict.get('exit_code', -1)}")
+        # Task 2：exit_code=None 表示命令未进容器（Docker 不可用/容器创建失败/
+        # daemon 中断），此时不渲染"退出码"行——_record_sandbox_attempt 以
+        # "退出码: N" 能否解析到判定 ran_in_container，渲染 -1 会把基础设施故障
+        # 误判为"容器内执行过"，抑制 connection 类 infra 签名（daemon 中断窄时序
+        # 漏判）。超时（进过容器被 kill）仍为 -1，正常渲染。
+        exit_code = result_dict.get("exit_code")
+        if exit_code is not None:
+            parts.append(f"退出码: {exit_code}")
         if result_dict.get("stdout"):
             parts.append(f"\n标准输出:\n```\n{result_dict['stdout'][:5000]}\n```")
         if result_dict.get("stderr"):
