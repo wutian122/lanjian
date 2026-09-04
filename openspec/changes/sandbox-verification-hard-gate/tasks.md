@@ -83,6 +83,7 @@
 - TDD: 失败测试（0 候选 0 豁免 → violated=true 且有一次重试提示；有豁免 → violated=false）→ 实现 → 通过 → commit
 
 ### Task 11: orchestrator 产出下限门禁与 Semgrep 兜底
+- [x] **Task 11 完成**（实施 3e4365d + 修复 e138424，review 初审 FAIL（3 Important：I1 violated 粘滞信号矛盾文案实证/I2 轮次耗尽缺兜底收口/I3 recon 落库无标注以高危漏洞身份呈现）→ 重审 CLEAN（三修复核验 + 双变异自证 + 回归 1073/4 一致）；I3 裁决：recon 线索不落库（排除验证队列+报告呈现双重达成）；**残留注释类 Minor 并入 Task 12 顺手修正**（:639/:1984 两处注释依据不实、M4 门禁计数含 recon、M8 finish 兜底缺集成测试、M9 陈旧注释）；Task 12 边界交接：候选口径统一、轮次耗尽第三路径 observation）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（max_dispatch 自动放行 :2091-2107、主循环收尾）、`backend/app/services/agent/agents/orchestrator.py`（归一化豁免联动 Task 9）
 - Interfaces: 兜底候选 `{source:"semgrep_fallback", confidence:0.5, needs_verification:true}`；observations 记 `{gate:"output_floor"}`
 - TDD: 失败测试（0 findings + 假 semgrep_findings 3 条 → 落库候选带标记进验证队列；output_floor_violated → 收口记 observations）→ 实现 → 通过 → commit
