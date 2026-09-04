@@ -781,6 +781,23 @@ class OrchestratorAgent(BaseAgent):
         )
         return True
 
+    async def _finalize_output_floor_gate(self) -> None:
+        """Task 11（修复轮 1 I2）：轮次耗尽收尾路径的兜底/收口统一入口。
+
+        主循环 20 轮耗尽退出不经过 finish 门禁与 max_dispatch 分支，收尾段须
+        幂等补跑 Semgrep 兜底落库与产出下限收口（两者各自带幂等守卫），杜绝
+        "0 findings 收尾时兜底候选未落库、output_floor 违规未置 coverage_bypassed"
+        的路径漏洞。
+        """
+        try:
+            await self._apply_semgrep_fallback()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Semgrep fallback on finalize failed (non-fatal): {e}")
+        try:
+            self._apply_output_floor_closeout()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Output floor closeout on finalize failed (non-fatal): {e}")
+
     def register_sub_agent(self, name: str, agent: BaseAgent) -> None:
         """注册子 Agent"""
         self.sub_agents[name] = agent
@@ -1959,8 +1976,14 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             # 🔥 fix-audit-time-budget-2026-08: 收口统一预算 metadata（reason 优先级链）
             self._finalize_budget_metadata()
 
+            # Task 11（修复轮 1 I2）：轮次耗尽路径不经过 finish 门禁与 max_dispatch
+            # 分支，收尾段幂等补跑 Semgrep 兜底落库与产出下限收口——否则 0 findings
+            # 耗尽退出时兜底候选不落库、output_floor 违规不置 coverage_bypassed。
+            await self._finalize_output_floor_gate()
 
             # 🔥 覆盖率兜底检查：20轮耗尽时安全阀可能未触发，需在此兜底
+            # （条件保持 _all_findings 真值：recon 线索在场时仍进入评估，
+            # 评估口径由 _evaluate_current_coverage 内部排除 recon）
             if not self._coverage_bypassed and self._all_findings:
                 final_coverage = self._evaluate_current_coverage()
                 if not final_coverage.is_sufficient:
@@ -2619,16 +2642,17 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 # 完成"——先做 Semgrep 兜底落库（0 产出时静态扫描发现转待验证候选），
                 # 再按产出下限信号决定收口方式（历史行为是无条件自动放行 finish）。
                 fallback_added = await self._apply_semgrep_fallback()
-                if self._output_floor_violated:
-                    if self._apply_output_floor_closeout():
-                        return f"""## ⚠️ 重复调度警告
+                if self._output_floor_violated and self._apply_output_floor_closeout():
+                    # 违规且兜底后仍 0 可验证产出：覆盖不足收口（completed_with_gaps）
+                    return f"""## ⚠️ 重复调度警告
 
 你已经调度 analysis Agent {dispatch_count} 次。Analysis 强制总结未按要求产出任何候选或书面豁免（**产出下限违规**），Semgrep 静态扫描兜底也没有可落库的发现。
 
 请直接使用 finish 操作结束审计。任务将按**覆盖不足（completed_with_gaps）**收口，报告中会呈现"分析未按要求产出候选"。
 
 当前已收集的发现数量: {len(self._all_findings)}"""
-                    # 违规但 Semgrep 兜底候选已落库：不自动放行，强制先沙箱验证
+                if self._output_floor_violated and fallback_added > 0:
+                    # 违规但本轮 Semgrep 兜底候选刚落库：不自动放行，强制先沙箱验证
                     if not any(o.get("gate") == "output_floor" for o in self._gate_observations):
                         self._record_gate_observation(
                             "output_floor",
@@ -2644,7 +2668,8 @@ Action: dispatch_agent
 Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Semgrep 兜底候选，使用 sandbox_exec 在沙箱中执行 PoC", "context": "兜底候选 source=semgrep_fallback，共 {fallback_added} 个"}}
 
 当前已收集的发现数量: {len(self._all_findings)}"""
-                # 未违规：维持历史自动放行语义
+                # 未违规，或违规信号粘滞但后续轮次已产出可验证发现（closeout
+                # 返回 False 且本轮无新增兜底）：维持历史自动放行语义
                 if self._hard_coverage_block_count < 3:
                     self._hard_coverage_block_count = 3
                     logger.info(f"[Orchestrator] Analysis dispatched {dispatch_count} times, auto-bypassing coverage gate")

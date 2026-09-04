@@ -1978,6 +1978,18 @@ async def _save_findings(
             logger.debug(f"[SaveFindings] Skipping non-dict finding: {type(finding)}")
             continue
 
+        # sandbox-verification-hard-gate Task 11（修复轮 1 I3）：recon 侦察线索
+        # （source=recon/recon_high_risk）是 Analysis 的上下文线索而非漏洞发现
+        # （承接 orchestrator"高风险区不作 finding"裁决），不落库——否则会以
+        # 普通高危漏洞身份出现在报告与前端；其上下文价值由 recon high_risk_areas
+        # 既有展示承载。semgrep_fallback 兜底候选正常落库（须沙箱验证）。
+        if finding.get("source") in ("recon", "recon_high_risk"):
+            logger.info(
+                f"[SaveFindings] Skipping context-only recon lead: "
+                f"{str(finding.get('title', 'N/A'))[:60]}"
+            )
+            continue
+
         # B1-fix: strict finding validation - reject findings without file_path, line, or low confidence
         if not is_strict_finding(finding):
             _f_title = str(finding.get("title", "N/A"))[:60]

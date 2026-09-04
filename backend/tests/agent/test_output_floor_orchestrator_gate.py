@@ -357,3 +357,139 @@ def test_report_section_empty_without_fallback():
         types.SimpleNamespace(title="x", file_path="a.py", line_start=1, verification_result={}),
     ]) == []
     assert _build_semgrep_fallback_section([]) == []
+
+
+# ============ 修复轮 1：I1 粘滞违规但后续轮次已产出 → 不放"验证 0 个"矛盾文案 ============
+
+@pytest.mark.asyncio
+async def test_violated_sticky_with_later_output_uses_normal_release():
+    """粘滞 output_floor_violated 信号下，后续轮次 Analysis 已产出真发现
+    （fallback_added=0 且 actionable 非空）：max_dispatch 分支不得输出
+    "验证 0 个 Semgrep 兜底候选"矛盾文案，走正常自动放行收口。"""
+    agent = _make_orch()
+    agent.sub_agents = {"analysis": object()}
+    agent._dispatched_tasks = {"analysis": 3}
+    agent._output_floor_violated = True
+    agent._all_findings = [{
+        "title": "后续轮真发现",
+        "source": "analysis",
+        "severity": "high",
+        "file_path": "app/x.py",
+        "line_start": 1,
+        "confidence": 0.9,
+        "vulnerability_type": "sql_injection",
+    }]
+    agent._semgrep_findings = []
+
+    message = await agent._dispatch_agent({"agent": "analysis", "task": "再扫", "context": ""})
+
+    # 走正常自动放行（与未违规同路径）
+    assert "覆盖率门禁已自动放行" in message
+    assert agent._hard_coverage_block_count >= 3
+    # 不得出现矛盾文案
+    assert "0 个 Semgrep 兜底候选" not in message
+    assert "验证 0 个" not in message
+    assert "产出下限违规" not in message
+    # 违规已被后续产出恢复，不记 output_floor observation
+    assert not [o for o in agent._gate_observations if o.get("gate") == "output_floor"]
+
+
+# ============ 修复轮 1：I2 轮次耗尽路径兜底/收口 ============
+
+@pytest.mark.asyncio
+async def test_iteration_exhaustion_zero_output_sets_output_floor_bypass():
+    """轮次耗尽收尾（未经 finish/max_dispatch）：0 findings + violated + Semgrep
+    无发现 → 兜底幂等执行 + closeout 置 coverage_bypassed(reason=output_floor_violated)。"""
+    agent = _make_orch()
+    agent._semgrep_findings = []
+    agent._output_floor_violated = True
+
+    await agent._finalize_output_floor_gate()
+
+    assert agent._coverage_bypassed is True
+    assert agent._coverage_bypass_info.get("reason") == "output_floor_violated"
+    assert [o for o in agent._gate_observations if o.get("gate") == "output_floor"]
+
+
+@pytest.mark.asyncio
+async def test_iteration_exhaustion_fallback_candidates_persisted():
+    """轮次耗尽收尾：0 findings + Semgrep 有发现 → 兜底候选落库（幂等）。"""
+    agent = _make_orch()
+    agent._semgrep_findings = [
+        _semgrep_finding(path=f"app/f{i}.py", line=10 + i, rule=f"p.rule-{i}", message=f"m{i}")
+        for i in range(3)
+    ]
+    agent._output_floor_violated = False
+
+    await agent._finalize_output_floor_gate()
+    # 幂等：再调一次不重复落库
+    await agent._finalize_output_floor_gate()
+
+    assert len(agent._actionable_findings()) == 3
+    assert agent._semgrep_fallback_applied is True
+
+
+# ============ 修复轮 1：I3 recon 线索不落库 ============
+
+@pytest.mark.asyncio
+async def test_save_findings_skips_recon_context_leads(tmp_path):
+    """source∈(recon, recon_high_risk) 的侦察线索不落库（上下文线索不是漏洞）；
+    Analysis 产出与 semgrep_fallback 候选正常落库。"""
+    from app.api.v1.endpoints.agent_tasks import _save_findings
+
+    (tmp_path / "app.py").write_text("print('x')\n", encoding="utf-8")
+
+    class FakeDB:
+        def __init__(self):
+            self.added = []
+
+        def add(self, obj):
+            self.added.append(obj)
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    db = FakeDB()
+    findings = [
+        {
+            "title": "侦察高风险区线索",
+            "source": "recon_high_risk",
+            "severity": "high",
+            "file_path": str(tmp_path / "app.py"),
+            "line_start": 1,
+            "confidence": 0.6,
+            "needs_verification": True,
+            "vulnerability_type": "potential_issue",
+            "description": "auth 相关代码",
+        },
+        {
+            "title": "侦察字符串线索",
+            "source": "recon",
+            "severity": "medium",
+            "file_path": str(tmp_path / "app.py"),
+            "line_start": 1,
+            "confidence": 0.5,
+            "needs_verification": True,
+            "vulnerability_type": "potential_issue",
+            "description": "可疑点",
+        },
+        {
+            "title": "Analysis 确认 SQLi",
+            "source": "analysis",
+            "severity": "high",
+            "file_path": str(tmp_path / "app.py"),
+            "line_start": 1,
+            "confidence": 0.9,
+            "vulnerability_type": "sql_injection",
+            "description": "真实漏洞",
+        },
+    ]
+
+    saved = await _save_findings(db, "task-1", findings, project_root=str(tmp_path))
+
+    assert saved == 1
+    assert len(db.added) == 1
+    assert "SQLi" in db.added[0].title
