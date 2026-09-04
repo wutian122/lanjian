@@ -1,5 +1,19 @@
 # Tasks: sandbox-verification-hard-gate
 
+## Phase 0: LLM 调用韧性（2026-09-04 服务端排查结论吸收）
+
+> 排查结论：①R1 空响应=reasoning 吃光 max_tokens 预算（已由 32768 修复，护栏保留）；②R2 残余空响应=模型 reasoning 后自然停止零正文（finish_reason=stop、无截断、无服务端错误，纯模型行为）；③Orchestrator 空 name/空参数 tool_calls（模型退化，Task 7 自愈路径喂回后仍可能连续退化）；④10.129.2.101 服务端 mm 崩溃（32 Traceback）对应老板下午任务时段，触发器精确复现未完成、**服务端零操作**（老板指令），mm 触发器二分诊断挂起。
+
+### Task 20: 空响应强化重试（reasoning-后-无正文 nudge）
+- Files: `backend/app/services/agent/agents/base.py`（stream_llm_call 空响应判定处 :1330 附近）、`backend/app/services/agent/agents/{analysis,recon,verification}.py`（空响应重试提示词 :706-730/:955-959 等各处）
+- Interfaces: 空响应重试提示词升级——区分两种形态并分别 nudge：①finish_reason=stop 且正文空（"你上一轮只输出了思考没有给出行动，请直接输出 Action 或调用工具，不要重复思考"）；②finish_reason=length 且正文空（提示由 B 变更截断机制已有，此处补充"输出预算被思考耗尽，请精简思考"）。连续空响应达上限后的收口行为保持现状
+- TDD: 失败测试（mock 两种空响应形态 → 断言重试提示包含对应 nudge 文案且连续计数正确）→ 实现 → 通过 → commit
+
+### Task 21: 空/无效 tool_calls 强 nudge 自愈
+- Files: `backend/app/services/agent/agents/orchestrator.py`（_step_from_tool_calls :2108-2205 与未知操作分支 :1532-1534）
+- Interfaces: 空 name/坏 JSON/空参数 tool_calls 的自愈 observation 强化——现状喂"未知操作: "泛化提示，改为：①空 name → 喂"工具调用缺少函数名，请重新输出，可用操作与参数 schema 如下：[完整三函数定义]"; ②dispatch_agent 空参数 → 喂"agent 参数缺失，必须为 recon/analysis/verification 之一，task 必须非空"; ③连续 2 次无效 tool_calls → 追加"请改用文本格式 Thought:/Action:/Action Input: 输出"（协议降级 nudge）
+- TDD: 失败测试（三种无效形态 → 断言 observation 含 schema 重喂与协议降级 nudge）→ 实现 → 通过 → commit
+
 ## Phase 1: 基础设施语义修复
 
 ### Task 1: infra_error 标记与状态机分离

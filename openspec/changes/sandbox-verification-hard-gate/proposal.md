@@ -4,6 +4,8 @@
 
 老板硬需求"**每个审计到的漏洞必须被沙箱验证**"在当前代码下不成立：存在十条可绕过沙箱直达终态的路径（Semgrep 四类静态短路、软证据四件套升级不要求 attempts 非空、skip_reason 豁免、R4 三次放行、弹性退出、预算耗尽不补跑、兜底只跑第一个等）；确定性 PoC 天花板是 static_confirmed 且三个模板（path_traversal/hardcoded_secret/deserialization）根本没有确认输出分支；SSRF 模板的 network_enabled 参数在确定性执行路径被丢弃；基础设施故障（镜像缺失/Docker 缺席）被 `compute_verification_status` 分支 4 伪装成 `not_reproducible` 终态。同时 nginx 任务暴露的行为性 0 findings 根因未解决：Analysis 提示词"宁可漏报不可误报"+自验可利用性导致 LLM 主动放弃产出，系统无产出下限机制。audit_trace 机制写侧已接线但 AI 零读点、容器内不持久化（两次任务的 trace 已随容器重建物理丢失）。OpenSpec 台账漂移（fix-sandbox-evidence-and-recovery 0/33 in-progress 但部分代码已实施）。
 
+**2026-09-04 增补（Task 10 端到端双轮验证 + 10.129.2.101 服务端排查结论）**：结构化输出变更（structured-output-protocol）上线后协议层机制全部生效（格式熔断归零、截断可见化、能力探测/参数摘要/三字段分流），但 findings 仍 0——剩余根因三层：①R1 空响应=reasoning 吃光 8192 输出预算（已由 32768 修复）；②R2 残余空响应=模型 reasoning 后自然停止零正文（finish_reason=stop 无截断无服务端错误，纯模型行为，工程需 nudge 兜底）；③Orchestrator 空 name/空参数 tool_calls 退化（自愈 observation 需强化）；另服务端 10.129.2.101 存在 mm 崩溃（32 Traceback，Qwen3.5 VL 架构 multimodal 误触发，老板下午任务时段），**老板指令服务端零操作**，触发器精确复现挂起——蓝鉴侧本变更不加 mm 相关处理，仅保留既有服务端错误重试语义。
+
 ## What Changes
 
 - **产出下限（分层候选制）**：Analysis 提示词从"宁可漏报"改为"高置信直接报告、低置信转候选"——每个 finding 带 confidence 分级与 `needs_verification` 标记；强制总结要求每个未覆盖维度至少输出 1 个候选或书面豁免；orchestrator 覆盖率门禁不再在 max_dispatch=3 后无条件放行 0 候选
