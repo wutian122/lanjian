@@ -1741,13 +1741,16 @@ class VerificationAgent(BaseAgent):
                                 fb_exit = int(_exit_match.group(1))
                             except ValueError:
                                 fb_exit = None
-                        fb_exit_val = fb_exit if fb_exit is not None else -1
-                        fb_success = (not fb_has_failure) and (fb_exit_val == 0) and (fb_has_vuln or fb_has_output)
+                        # Task 2：exit_code 持久化 None（未进容器）而非合成 -1，
+                        # 与沙箱函数退出码语义一致；状态机 _attempt_is_infra 以
+                        # exit_code is None 判 ran_in_container。fb_success 的 ==0
+                        # 比较对 None 安全（None == 0 为 False，与 -1 行为一致）
+                        fb_success = (not fb_has_failure) and (fb_exit == 0) and (fb_has_vuln or fb_has_output)
                         verified_findings[0]["sandbox_attempts"] = (
                             verified_findings[0].get("sandbox_attempts") or []
                         ) + [{
                             "success": fb_success,
-                            "exit_code": fb_exit_val,
+                            "exit_code": fb_exit,
                             "evidence_summary": obs_str[:500],
                             "target_ref": (
                                 f"{verified_findings[0].get('file_path', '')}:"

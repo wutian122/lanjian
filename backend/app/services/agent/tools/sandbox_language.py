@@ -172,7 +172,11 @@ class BaseLanguageTestTool(AgentTool):
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败、命令未进容器）不渲染退出码行，与
+        # sandbox_tool 渲染层一致：_record_language_test_attempt 以"退出码: N"
+        # 能否解析到判定 ran_in_container
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             stdout = result["stdout"][:3000]
@@ -181,6 +185,12 @@ class BaseLanguageTestTool(AgentTool):
         if result["stderr"]:
             stderr = result["stderr"][:1000]
             output_parts.append(f"\n错误:\n```\n{stderr}\n```")
+
+        # infra 失败时 stderr 为空但 error 键携带 docker/daemon 报错，必须渲染进
+        # observation："\n错误:" 行使 _has_sandbox_failure_marker 命中（success 翻转
+        # 闭环），错误文本使 _is_infra_error 命中 connection/docker 层签名
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")
@@ -427,12 +437,18 @@ class MockRequest:
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败未进容器）不渲染退出码行，与基类/sandbox_tool 一致
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             output_parts.append(f"\n输出:\n```\n{result['stdout'][:3000]}\n```")
         if result["stderr"]:
             output_parts.append(f"\n错误:\n```\n{result['stderr'][:1000]}\n```")
+        # error 键（daemon/docker 报错）必须进 observation：failure marker 与
+        # infra 签名靠"\n错误:"行和错误文本命中（stderr 为空时的唯一失败信号）
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")
@@ -575,12 +591,18 @@ const res = {{
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败未进容器）不渲染退出码行，与基类/sandbox_tool 一致
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             output_parts.append(f"\n输出:\n```\n{result['stdout'][:3000]}\n```")
         if result["stderr"]:
             output_parts.append(f"\n错误:\n```\n{result['stderr'][:1000]}\n```")
+        # error 键（daemon/docker 报错）必须进 observation：failure marker 与
+        # infra 签名靠"\n错误:"行和错误文本命中（stderr 为空时的唯一失败信号）
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")
@@ -705,12 +727,18 @@ public class Test {{
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败未进容器）不渲染退出码行，与基类/sandbox_tool 一致
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             output_parts.append(f"\n输出:\n```\n{result['stdout'][:3000]}\n```")
         if result["stderr"]:
             output_parts.append(f"\n错误:\n```\n{result['stderr'][:1000]}\n```")
+        # error 键（daemon/docker 报错）必须进 observation：failure marker 与
+        # infra 签名靠"\n错误:"行和错误文本命中（stderr 为空时的唯一失败信号）
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")
@@ -841,12 +869,18 @@ func main() {{
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败未进容器）不渲染退出码行，与基类/sandbox_tool 一致
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             output_parts.append(f"\n输出:\n```\n{result['stdout'][:3000]}\n```")
         if result["stderr"]:
             output_parts.append(f"\n错误:\n```\n{result['stderr'][:1000]}\n```")
+        # error 键（daemon/docker 报错）必须进 observation：failure marker 与
+        # infra 签名靠"\n错误:"行和错误文本命中（stderr 为空时的唯一失败信号）
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")
@@ -993,12 +1027,18 @@ request = Request.new(params)
         if params:
             output_parts.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
 
-        output_parts.append(f"\n退出码: {result['exit_code']}")
+        # exit_code=None（infra 失败未进容器）不渲染退出码行，与基类/sandbox_tool 一致
+        if result.get("exit_code") is not None:
+            output_parts.append(f"\n退出码: {result['exit_code']}")
 
         if result["stdout"]:
             output_parts.append(f"\n输出:\n```\n{result['stdout'][:3000]}\n```")
         if result["stderr"]:
             output_parts.append(f"\n错误:\n```\n{result['stderr'][:1000]}\n```")
+        # error 键（daemon/docker 报错）必须进 observation：failure marker 与
+        # infra 签名靠"\n错误:"行和错误文本命中（stderr 为空时的唯一失败信号）
+        if result.get("error"):
+            output_parts.append(f"\n错误: {result['error']}")
 
         if analysis["is_vulnerable"]:
             output_parts.append(f"\n🔴 **漏洞确认**: {analysis['evidence']}")

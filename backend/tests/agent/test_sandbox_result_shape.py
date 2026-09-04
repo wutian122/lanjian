@@ -19,7 +19,11 @@ import os
 import pytest
 
 from app.services.agent.tools.sandbox_tool import SandboxManager, SandboxTool
-from app.services.agent.agents.verification import VerificationAgent
+from app.services.agent.tools.sandbox_language import ShellTestTool, PythonTestTool
+from app.services.agent.agents.verification import (
+    VerificationAgent,
+    compute_verification_status,
+)
 
 
 # ---------- 测试夹具 ----------
@@ -331,3 +335,126 @@ async def test_timeout_keeps_exit_code_minus_one(tmp_path, monkeypatch):
     attempt = agent._sandbox_attempts[-1]
     assert attempt["exit_code"] == -1, "超时路径进过容器，ran_in_container 应为 True"
     assert attempt["infra_error"] in (None, False), "超时不是基础设施故障"
+
+# ---------- 语言测试工具（sandbox_language.py）渲染对齐 ----------
+# review 第 1 轮 Important：六个语言工具渲染块（基类 Shell/PHP 继承 + Python/
+# JavaScript/Java/Go/Ruby 重写）在 exit_code=None 时曾渲染 "退出码: None" 泄漏，
+# 且 error 键（daemon 报错）从不渲染——stderr 为空时 observation 既无 "\n错误:"
+# 行（_has_sandbox_failure_marker 不命中 → success 误翻 True）也无 connection
+# 签名文本（_is_infra_error 漏判）。修复：None 不渲染退出码行 + 补 "错误:" 行。
+
+_DAEMON_DOWN_ERROR = (
+    "Error while fetching server API version: ('Connection aborted.', "
+    "FileNotFoundError(2, 'No such file or directory'))"
+)
+
+
+def _lang_finding(**overrides):
+    f = {
+        "title": "RCE in eval",
+        "vulnerability_type": "rce",
+        "file_path": "app/main.py",
+        "line_start": 10,
+        "verification_method": "sandbox_exec",
+    }
+    f.update(overrides)
+    return f
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_cls,tool_name,code",
+    [
+        (ShellTestTool, "shell_test", "id"),       # 基类 _execute（Shell/PHP 继承）
+        (PythonTestTool, "python_test", "print('x')"),  # 重写 _execute
+    ],
+)
+async def test_language_tools_infra_failure_renders_error_without_exit_code(
+    tool_cls, tool_name, code, tmp_path
+):
+    """daemon 中断（is_available=True 后 containers.run 抛 Connection aborted）：
+    observation 不得含退出码行（None 不渲染），必须含"错误:"行 + connection 签名；
+    经 _record_language_test_attempt 录得 exit_code=None/success=False/infra_error=True，
+    状态机判 needs_context。"""
+    fake_client = _FakeDockerClient(_FakeContainers(run_raises=Exception(_DAEMON_DOWN_ERROR)))
+    mgr = _manager_with_client(fake_client)
+    tool = tool_cls(mgr, str(tmp_path))
+
+    result = await tool._execute(code=code, timeout=5)
+
+    # 语言工具硬编码 ToolResult(success=True)，base.py 以 data 原文为 observation
+    observation = str(result.data)
+    assert "退出码" not in observation, "exit_code=None 不得渲染退出码行（防'退出码: None'泄漏）"
+    assert "错误:" in observation, "error 键必须渲染为'错误:'行，failure marker 才能命中"
+    assert "Connection aborted" in observation, (
+        "daemon 报错文本必须进 observation，connection 类 infra 签名才能命中"
+    )
+    assert result.metadata["exit_code"] is None
+
+    agent = _make_verification_agent()
+    agent._record_language_test_attempt(tool_name, {"code": code}, observation)
+    attempt = agent._sandbox_attempts[-1]
+    assert attempt["exit_code"] is None
+    assert attempt["success"] is False, "无'错误:'行时 success 误翻 True——错误行渲染是闭环关键"
+    assert attempt["infra_error"] is True, "daemon 中断必须判 infra_error"
+
+    finding = _lang_finding(sandbox_attempts=[attempt])
+    status, is_verified, notes = compute_verification_status(
+        finding,
+        [attempt],
+        attempt_has_vuln_evidence_fn=lambda a: False,
+        attempt_matches_finding_fn=lambda a, f: False,
+    )
+    assert status == "needs_context", f"全 infra 应判 needs_context，got {status}"
+    assert is_verified is False
+    assert notes.get("infra_error") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_cls", [ShellTestTool, PythonTestTool])
+async def test_language_tools_unavailable_early_return_chain(tool_cls, tmp_path):
+    """is_available=False 早退回归：ToolResult(success=False, error 含'沙箱环境不可用')，
+    经 base.py observation 形态（工具执行失败 + 错误文本）录得 infra_error=True。"""
+    mgr = _unavailable_manager()
+    tool = tool_cls(mgr, str(tmp_path))
+
+    result = await tool._execute(code="id", timeout=5)
+
+    assert result.success is False
+    assert "沙箱环境不可用" in (result.error or "")
+
+    # 复现 base.py:1576 失败 observation 形态
+    observation = f"⚠️ 工具执行失败\n\n**工具**: {tool.name}\n**错误**: {result.error}"
+    agent = _make_verification_agent()
+    agent._record_language_test_attempt(tool.name, {"code": "id"}, observation)
+    attempt = agent._sandbox_attempts[-1]
+    assert attempt["infra_error"] is True
+    assert attempt["success"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_cls,tool_name,code",
+    [
+        (ShellTestTool, "shell_test", "id"),
+        (PythonTestTool, "python_test", "print('x')"),
+    ],
+)
+async def test_language_tools_normal_path_renders_exit_code_zero(
+    tool_cls, tool_name, code, tmp_path
+):
+    """正常执行（StatusCode=0 + stdout）：退出码行正常渲染"退出码: 0"，语义不变。"""
+    container = _FakeContainer(status_code=0, stdout=b"uid=0(root) gid=0(root)\n", stderr=b"")
+    mgr = _manager_with_client(_FakeDockerClient(_FakeContainers(container=container)))
+    tool = tool_cls(mgr, str(tmp_path))
+
+    result = await tool._execute(code=code, timeout=5)
+
+    observation = str(result.data)
+    assert "退出码: 0" in observation
+    assert result.metadata["exit_code"] == 0
+
+    agent = _make_verification_agent()
+    agent._record_language_test_attempt(tool_name, {"code": code}, observation)
+    attempt = agent._sandbox_attempts[-1]
+    assert attempt["exit_code"] == 0
