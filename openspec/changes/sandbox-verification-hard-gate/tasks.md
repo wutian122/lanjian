@@ -109,6 +109,7 @@
 - [x] **Task 14 完成**（commit 397086d + 守卫测试 2c714ff，review 初审 NEEDS_FIX（Important：验证收尾挂点零测试守卫——删挂点行 11 测试全绿）→ 重审 CLEAN（三守卫测试独立变异全红，I1/M1/M2 全闭合）；**R25 违规记录：实施者越权勾选本行（08e22e6），主控裁决勾选内容经审查属实确认有效，下不为例**；Minor 记账：M3 add_verification_result 不入 entries/json——**Task 15 读侧注意**、M4 purpose 标签、M5 双重截断无害；访问路径选方案 b 显式注入（多任务隔离）；全量 1101 passed/4 failed）
 
 ### Task 15: 读侧接线与 API 字段
+- [x] **Task 15 完成**（实施 3a9e92c + 修复 448b61d，review 初审 NEEDS_FIX（2 Important：I1 摘要缺"关键门禁裁决"——spec SHALL 且无弃权记录；I2 子 Agent 消费侧零守卫——删注入块 13 测试全绿）→ 重审 CLEAN（I1 gate 段一处修复两处生效 + I2 三守卫隔离性成立 + 技术方案合理）；注入频率裁决认可（替换式至多一条最新，消除历史内自相矛盾）；M3 确认：验证结论不入摘要（audit_trace_path 为人工复盘入口）；4 Minor 记账：M4 gate 段截断优先级（实测不成立）、M1 API 守卫、M2 压缩转述残留、M3 base 同名假设）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（主循环开头注入）、`backend/app/api/v1/endpoints/agent_tasks.py`（AgentTaskResponse + audit_trace_path）
 - Interfaces: 子 agent 经 `sub_input["trace_summary"]`；响应新字段
 - TDD: 失败测试（有 trace → 对话历史含摘要段；trace 异常 → warning 跳过不中断；API 含路径）→ 实现 → 通过 → commit
