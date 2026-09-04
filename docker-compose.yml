@@ -63,6 +63,10 @@ services:
       https_proxy: ""
       NO_PROXY: "*"
       no_proxy: "*"
+      # Task 13（sandbox-verification-hard-gate）：审计追踪文件持久化。
+      # 容器内写 /app/audit_traces（WORKDIR=/app，默认 ./audit_traces 等价），
+      # bind mount 到宿主机 ./audit_traces，容器重建不丢历史任务 trace。
+      AUDIT_TRACE_DIR: /app/audit_traces
     ports:
       - "8000:8000"
     volumes:
@@ -74,6 +78,8 @@ services:
       # 解压 ZIP（不同步到宿主机），沙箱看到的是空目录，验证失败。
       # 加这条 bind mount 让容器内解压 = 宿主机可见。
       - /tmp/lanjian:/tmp/lanjian:rw
+      # Task 13: audit_trace 持久化（bind mount，与 /tmp/lanjian 同模式）
+      - ./audit_traces:/app/audit_traces
     depends_on:
       db:
         condition: service_healthy

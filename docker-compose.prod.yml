@@ -77,6 +77,8 @@ services:
       https_proxy: ""
       NO_PROXY: "*"
       no_proxy: "*"
+      # Task 13（sandbox-verification-hard-gate）：审计追踪文件持久化。
+      AUDIT_TRACE_DIR: /app/audit_traces
     expose:
       - "8000"
     volumes:
@@ -86,6 +88,8 @@ services:
       # 原因：backend 通过 docker.sock 让 daemon 起沙箱容器，daemon 是宿主机进程，
       # 挂载"源路径"时去宿主机找 /tmp/lanjian/xxx。不加这条，验证全空跑。
       - /tmp/lanjian:/tmp/lanjian:rw
+      # Task 13: audit_trace 持久化（bind mount，与 /tmp/lanjian 同模式）
+      - ./audit_traces:/app/audit_traces
     depends_on:
       db:
         condition: service_healthy

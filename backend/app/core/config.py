@@ -192,6 +192,11 @@ class Settings(BaseSettings):
 
     # C2: LLM 连通性测试允许放行的内网代理主机（逗号分隔），其余回环/内网地址一律拒绝（防 SSRF）
     LLM_TEST_ALLOWED_HOSTS: str = ""
+
+    # Task 13（sandbox-verification-hard-gate）：审计追踪文件存储目录。
+    # 生产 compose 通过 bind mount 把容器内 /app/audit_traces 挂到宿主机，
+    # 容器重建不丢失；env AUDIT_TRACE_DIR 覆盖（默认 ./audit_traces 相对路径保持不变）。
+    AUDIT_TRACE_DIR: str = "./audit_traces"
     
     # RAG 閰嶇疆
     RAG_CHUNK_SIZE: int = 1500  # 浠ｇ爜鍧楀ぇ灏忥紙Token锛?

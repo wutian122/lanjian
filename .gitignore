@@ -54,6 +54,9 @@ logs/
 tmp/
 temp/
 backend/agent_checkpoints/
+# Task 13: audit_trace 运行产物（容器内 /app/audit_traces 由 compose bind mount 到宿主机）
+audit_traces/
+backend/audit_traces/
 frontend/audit_remote.log
 
 # Build / runtime outputs

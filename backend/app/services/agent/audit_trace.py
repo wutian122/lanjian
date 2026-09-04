@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field, asdict
 import logging
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,10 +41,17 @@ class TraceEntry:
 class AuditTraceManager:
     """审计追踪管理器"""
 
-    def __init__(self, task_id: str, project_name: str, base_dir: str = "./audit_traces"):
+    def __init__(
+        self,
+        task_id: str,
+        project_name: str,
+        base_dir: Optional[str] = None,
+    ):
         self.task_id = task_id
         self.project_name = project_name
-        self.base_dir = Path(base_dir)
+        # Task 13：base_dir 默认从 core settings 读（env AUDIT_TRACE_DIR 可覆盖），
+        # 显式入参优先生效以保持向后兼容（orchestrator 等已有调用方）。
+        self.base_dir = Path(base_dir if base_dir is not None else settings.AUDIT_TRACE_DIR)
         self.task_dir = self.base_dir / task_id[:8]
         self.task_dir.mkdir(parents=True, exist_ok=True)
 
