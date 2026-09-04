@@ -57,6 +57,7 @@
 - TDD: 失败测试（四件套齐备+0 attempts → needs_context；四件套+1 attempt → static_confirmed）→ 实现 → 通过 → commit
 
 ### Task 7: 弹性退出/预算耗尽/兜底遍历
+- [x] **Task 7 完成**（commit c13a1d0，review CLEAN——f/g/h 三条全符合 + 5 组变异实证守卫；skip_reason 消费裁决实现一致（elastic_exit 硬门禁算豁免/orchestrator 仍算未验证可重派，UNVERIFIED_TERMINAL 不含 needs_context 核实）；幂等台账 _deterministic_done_finding_ids 生命周期正确（单次 run、异常不登记可重试）；**顺带修复实锤：零证据漏报 finding verification_status=None 出 Agent 的旧缺陷（变异守卫）；3 Minor 记账：台账登记无成功返回值校验（防御性）、g/h 失败重试语义日志连发、补跑成功后 infra_error 断言缺）
 - Files: `backend/app/services/agent/agents/verification.py`（弹性退出 :1142-1148、预算耗尽 :1046-1048 与 :1329-1350、兜底 :1404-1474）
 - Interfaces: 弹性退出写 `sandbox_skip_reason="elastic_exit"`；预算耗尽收口前补跑剩余确定性 PoC；兜底遍历全部 sandbox_commands
 - TDD: 失败测试×3（对应三场景）→ 实现 → 通过 → commit
