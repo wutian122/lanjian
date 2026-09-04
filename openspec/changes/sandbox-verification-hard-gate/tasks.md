@@ -31,6 +31,7 @@
 - TDD: 失败测试（mock containers.run 抛异常 → 返回 dict 含 "stdout" 键，SandboxTool._execute :860 不 KeyError）→ 实现 → 通过 → commit
 
 ### Task 3: SSRF 确定性 PoC network_mode 传递
+- [x] **Task 3 完成**（commit 95e951e，review CLEAN——两 Scenario 达成（bridge 断言 + none 行为不变）、None 传参裁决复核正确（execute_with_files 裸透传 SDK，None=默认 bridge 反而开网）、两个调用点传递、RED 亲验（旧代码缺陷真实性确认）；**双门禁 sandbox_tool.py 超出声明范围但同 kill-switch 安全语义（R17 记账），修复了 LLM 自授网络的反向缺陷**；F1 Important 转后续任务：**sandbox_http/VulnerabilityVerifyTool 经 execute_http_request 无条件 bridge 且变异共享配置——kill-switch 全入口绕过未收口**；F4 建议后续对齐 AND 判定；F5 死配置核实为真（前端 sandboxNetworkEnabled 开关无后端消费者，仅 env 生效——后续接线或隐藏））
 - Files: `backend/app/services/agent/agents/verification.py`（:2502-2507）
 - Interfaces: Consumes 模板 `network_enabled` 与 `settings.SANDBOX_NETWORK_ENABLED`；Produces `execute_with_files(..., network_mode=...)` 实参
 - TDD: 失败测试（network_enabled=True 且开关开 → execute_with_files 收到 bridge；开关关 → 收到 None/none）→ 实现 → 通过 → commit
