@@ -300,6 +300,11 @@ class OrchestratorAgent(BaseAgent):
                 project_name="unknown",  # 将在 run() 中更新
             )
             logger.info(f"[{self.name}] 审计追踪已启用")
+            # sandbox-verification-hard-gate Task 14：trace_manager 注入子 Agent——
+            # 工具/LLM/验证三类写点（execute_tool/stream_llm_call/验证收尾）共享
+            # 同一任务追踪文件；子 Agent 先于 Orchestrator 构造，故在此回填。
+            for _sub in self.sub_agents.values():
+                _sub.trace_manager = self.trace_manager
 
         # 🔥 v3.0: 智能上下文管理器
         self.context_manager = None
@@ -806,6 +811,9 @@ class OrchestratorAgent(BaseAgent):
     def register_sub_agent(self, name: str, agent: BaseAgent) -> None:
         """注册子 Agent"""
         self.sub_agents[name] = agent
+        # Task 14：后注册的子 Agent 同步注入 trace_manager（与 __init__ 注入闭环）
+        if getattr(self, "trace_manager", None):
+            agent.trace_manager = self.trace_manager
 
     def cancel(self) -> None:
         """

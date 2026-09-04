@@ -275,6 +275,7 @@ class BaseAgent(ABC):
         knowledge_modules: Optional[List[str]] = None,
         task_id: Optional[str] = None,
         llm_rate_per_minute: Optional[int] = None,
+        trace_manager: Optional[Any] = None,
     ):
         """
         初始化 Agent
@@ -288,6 +289,8 @@ class BaseAgent(ABC):
             knowledge_modules: 要加载的知识模块
             task_id: 所属 Agent 审计任务 ID（用于 task-scoped LLM 限流器隔离）
             llm_rate_per_minute: 该任务每分钟 LLM 请求次数（来自 task.agent_config 快照）
+            trace_manager: 审计追踪管理器（sandbox-verification-hard-gate Task 14：
+                OrchestratorAgent 创建后注入子 Agent；None=审计追踪关闭，写点静默跳过）
         """
         self.config = config
         self.config.system_prompt = inject_agent_contract(
@@ -301,6 +304,9 @@ class BaseAgent(ABC):
         self.knowledge_modules = knowledge_modules or []
         self.task_id = task_id
         self.llm_rate_per_minute = llm_rate_per_minute
+        # sandbox-verification-hard-gate Task 14：审计追踪写点（工具/LLM/验证）。
+        # 子 Agent 由 OrchestratorAgent 创建 trace_manager 后注入；None=静默跳过。
+        self.trace_manager = trace_manager
         
         # 🔥 生成唯一ID
         self._agent_id = f"agent_{uuid.uuid4().hex[:8]}"
@@ -1160,6 +1166,12 @@ class BaseAgent(ABC):
         stream_has_kind = False
         content_emitted = False
         total_tokens = 0
+        # Task 14：prompt/completion token 拆分（done chunk usage 携带），供 trace 落账
+        prompt_tokens = 0
+        completion_tokens = 0
+        # Task 14：本轮 LLM 调用计时（trace duration_ms；取消提前 return 不记账）
+        import time
+        llm_start = time.monotonic()
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
         # Task 20：每轮重置空响应形态（与截断标志同生命周期）
@@ -1179,6 +1191,7 @@ class BaseAgent(ABC):
         async def _consume() -> Tuple[str, int]:
             nonlocal accumulated, accumulated_content, accumulated_reasoning
             nonlocal stream_has_kind, content_emitted, total_tokens
+            nonlocal prompt_tokens, completion_tokens
             # 获取流式迭代器（传入 None 时使用用户配置）
             stream = self.llm_service.chat_completion_stream(
                 messages=messages,
@@ -1263,6 +1276,9 @@ class BaseAgent(ABC):
                             self._last_tool_calls = chunk["tool_calls"]
                         if chunk.get("usage"):
                             total_tokens = chunk["usage"].get("total_tokens", 0)
+                            # Task 14：token 拆分落 trace（usage 缺失时保持 0）
+                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
+                            completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
                         # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
                         if chunk.get("finish_reason") == "length":
                             self._last_llm_truncated = True
@@ -1279,6 +1295,8 @@ class BaseAgent(ABC):
 
                         if chunk.get("usage"):
                             total_tokens = chunk["usage"].get("total_tokens", 0)
+                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
+                            completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
 
                         # 使用特殊前缀标记 API 错误，让调用方能够识别
                         # 格式：[API_ERROR:error_type] user_message
@@ -1354,6 +1372,15 @@ class BaseAgent(ABC):
                 self._last_empty_kind = "other"
         else:
             self._last_empty_kind = None
+
+        # sandbox-verification-hard-gate Task 14：每轮 LLM 调用落 trace
+        # （每轮一次而非每 chunk；取消路径 re-raise 不经过此处，不记账）。
+        self._trace_llm_call(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            duration_ms=int((time.monotonic() - llm_start) * 1000),
+            truncated=self._last_llm_truncated,
+        )
 
         return accumulated, total_tokens
 
@@ -1442,6 +1469,8 @@ class BaseAgent(ABC):
         if not tool:
             return f"错误: 工具 '{tool_name}' 不存在。可用工具: {list(self.tools.keys())}"
 
+        import time
+        start = time.time()
         try:
             self._tool_calls += 1
             # REQ-CM-4: sandbox_exec 网络受限死循环防护（执行前拦截，Verification 特有）
@@ -1452,9 +1481,6 @@ class BaseAgent(ABC):
                     if blocked:
                         return blocked
             await self.emit_tool_call(tool_name, tool_input)
-
-            import time
-            start = time.time()
 
             # 🔥 根据工具类型设置不同的超时时间
             tool_timeouts = {
@@ -1524,6 +1550,10 @@ class BaseAgent(ABC):
             except asyncio.TimeoutError:
                 duration_ms = int((time.time() - start) * 1000)
                 await self.emit_tool_result(tool_name, f"超时 ({timeout}s)", duration_ms)
+                # Task 14：超时的工具调用同样落 trace（success=False）
+                self._trace_tool_call(
+                    tool_name, tool_input, f"工具执行超时 ({timeout}s)", duration_ms, False
+                )
                 return f"⚠️ 工具 '{tool_name}' 执行超时 ({timeout}秒)，请尝试其他方法或减小操作范围。"
             except asyncio.CancelledError:
                 duration_ms = int((time.time() - start) * 1000)
@@ -1534,6 +1564,12 @@ class BaseAgent(ABC):
             # 🔥 修复：确保传递有意义的结果字符串，避免 "None"
             result_preview = str(result.data) if result.data is not None else (result.error if result.error else "")
             await self.emit_tool_result(tool_name, result_preview, duration_ms)
+
+            # sandbox-verification-hard-gate Task 14：工具调用落 trace
+            # （成功与业务失败统一在此记录；取消/超时/异常在各自分支记录）
+            self._trace_tool_call(
+                tool_name, tool_input, result_preview, duration_ms, bool(result.success)
+            )
 
             # REQ-VP-2: sandbox_exec 工具经 execute_tool 包装层发射 sandbox_* 事件，
             # 使 LLM 调用的沙箱执行对前端可见（AgentTool 本身不持有 emit_event）。
@@ -1588,6 +1624,14 @@ class BaseAgent(ABC):
         except Exception as e:
             import traceback
             logger.error(f"Tool execution error: {e}")
+            # Task 14：异常的工具调用也落 trace（success=False）
+            self._trace_tool_call(
+                tool_name,
+                tool_input,
+                f"{type(e).__name__}: {e}",
+                int((time.time() - start) * 1000),
+                False,
+            )
             # 🔥 输出完整的原始错误信息，包括堆栈跟踪
             error_msg = f"""❌ 工具执行异常
 
@@ -1605,7 +1649,68 @@ class BaseAgent(ABC):
 2. 尝试使用其他工具
 3. 如果是权限或资源问题，跳过该操作"""
             return error_msg
-    
+
+    # ============ 审计追踪写点（sandbox-verification-hard-gate Task 14）============
+    # trace_manager 由 OrchestratorAgent 创建并注入（None=审计追踪关闭）。
+    # 所有写点一律 try/except 非致命：trace 仅服务审查，写失败只记 warning，
+    # 绝不得影响工具执行/LLM 调用主流程。
+
+    def _trace_tool_call(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        output: Any,
+        duration_ms: int,
+        success: bool,
+    ) -> None:
+        """一次工具调用落审计追踪（每工具调用一次，非每事件）。"""
+        tm = getattr(self, "trace_manager", None)
+        if not tm:
+            return
+        try:
+            # 入参摘要：标量原样保留，长文本截断到 200 字符（trace 文件大小可控）
+            params: Dict[str, Any] = {}
+            for k, v in (tool_input or {}).items():
+                if isinstance(v, (int, float, bool)) or v is None:
+                    params[k] = v
+                else:
+                    s = str(v)
+                    params[k] = s if len(s) <= 200 else s[:200] + "...[truncated]"
+            tm.add_tool_call(
+                tool_name=tool_name,
+                input_params=params,
+                output=str(output)[:500],
+                duration_ms=int(duration_ms or 0),
+                success=bool(success),
+            )
+        except Exception as e:
+            logger.warning(f"[{self.name}] trace add_tool_call 失败（非致命）: {e}")
+
+    def _trace_llm_call(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        duration_ms: int,
+        truncated: bool,
+    ) -> None:
+        """一轮 LLM 调用落审计追踪（每轮一次，非每 chunk）。"""
+        tm = getattr(self, "trace_manager", None)
+        if not tm:
+            return
+        try:
+            model = getattr(getattr(self.llm_service, "config", None), "model", "unknown")
+            tm.add_llm_call(
+                model=str(model),
+                prompt_tokens=int(prompt_tokens or 0),
+                completion_tokens=int(completion_tokens or 0),
+                duration_ms=int(duration_ms or 0),
+                purpose=f"{self.config.name}#iter{self._iteration}",
+                truncated=bool(truncated),
+            )
+        except Exception as e:
+            logger.warning(f"[{self.name}] trace add_llm_call 失败（非致命）: {e}")
+
     def get_tools_description(self) -> str:
         """生成工具描述文本（用于 prompt）"""
         tools_info = []

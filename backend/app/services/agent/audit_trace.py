@@ -332,7 +332,8 @@ class AuditTraceManager:
         prompt_tokens: int,
         completion_tokens: int,
         duration_ms: int,
-        purpose: str = "decision"
+        purpose: str = "decision",
+        truncated: bool = False,
     ):
         """记录 LLM 调用"""
         self.stats["llm_calls"] += 1
@@ -349,6 +350,8 @@ class AuditTraceManager:
                 "total_tokens": prompt_tokens + completion_tokens,
                 "duration_ms": duration_ms,
                 "purpose": purpose,
+                # Task 14：本轮是否 finish_reason=length 截断（Final Answer 丢失归因用）
+                "truncated": truncated,
             }
         )
 

@@ -1768,6 +1768,10 @@ class VerificationAgent(BaseAgent):
             except Exception as _e:
                 logger.warning(f"[{self.name}] Final evidence binding failed: {_e}")
 
+            # sandbox-verification-hard-gate Task 14：验证收尾——每个 finding 的
+            # 终态/沙箱尝试摘要落审计追踪（helper 内部逐条 try/except，非致命）
+            self._trace_verification_results(verified_findings)
+
             # 统计
             confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
             not_reproducible_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NOT_REPRODUCIBLE])
@@ -2715,6 +2719,57 @@ class VerificationAgent(BaseAgent):
                 + " " + "; ".join(f"{k}={v}" for k, v in notes.items())
             ).strip()
         return normalized
+
+    def _trace_verification_results(self, findings: List[Dict[str, Any]]) -> None:
+        """sandbox-verification-hard-gate Task 14：验证收尾批量落 trace。
+
+        每个 finding 一条 add_verification_result（finding_id/终态/沙箱尝试摘要）。
+        逐条 try/except 非致命：trace 仅服务人工审查，写失败不得影响验证结论返回。
+        """
+        tm = getattr(self, "trace_manager", None)
+        if not tm:
+            return
+        for finding in findings or []:
+            try:
+                fid = str(
+                    finding.get("id")
+                    or finding.get("_sandbox_finding_id")
+                    or finding.get("finding_id")
+                    or "unknown"
+                )
+                title = str(finding.get("title") or finding.get("vulnerability_type") or fid)
+                status = str(finding.get("verification_status") or "")
+                # confirmed（动态复现）与 static_confirmed（代码推理确认）均记"通过"，
+                # 终态原文保留在 evidence 字段供审查区分；其余状态记"失败/未确认"。
+                verified = status in (
+                    VerificationStatus.CONFIRMED,
+                    VerificationStatus.STATIC_CONFIRMED,
+                )
+                attempts = [
+                    a for a in (finding.get("sandbox_attempts") or [])
+                    if isinstance(a, dict) and not a.get("fabricated")
+                ]
+                note = str(finding.get("verification_note") or finding.get("verdict") or "")
+                evidence = (
+                    f"verification_status={status or 'unknown'}; "
+                    f"sandbox_attempts={len(attempts)}; {note[:300]}"
+                )
+                sandbox_output = None
+                if attempts:
+                    last = attempts[-1]
+                    sandbox_output = (
+                        f"exit_code={last.get('exit_code')}; "
+                        f"{str(last.get('evidence_summary') or last.get('output') or '')[:300]}"
+                    )
+                tm.add_verification_result(
+                    finding_id=fid,
+                    finding_title=title,
+                    verified=verified,
+                    evidence=evidence,
+                    sandbox_output=sandbox_output,
+                )
+            except Exception as e:
+                logger.warning(f"[{self.name}] trace add_verification_result 失败（非致命）: {e}")
 
     def _backfill_original_metadata(self, llm_finding: Dict[str, Any], original_findings: List[Dict[str, Any]]) -> None:
         """用原始 finding 的元数据回填 LLM 输出中的 unknown 字段"""
