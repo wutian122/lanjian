@@ -71,6 +71,7 @@
 ## Phase 3: 产出下限
 
 ### Task 9: Analysis 分层候选提示词改造
+- [x] **Task 9 完成**（commit 8354b1a，review CLEAN——spec 两 Scenario ✅（低置信候选产出/幻觉防护保留）、三处"宁可漏报"改写 + SUBMIT_FINDINGS 衔接无矛盾、归一化豁免（Task 8 未做本任务收口：双段重复 0.7 硬闸合并 + needs_verification≥0.1 豁免 + strict 同口径）；**Important 交接确认转 Task 11：recon 侦察线索（0.5/0.6+needs_verification）经豁免流入 _all_findings，违背 :617"高风险区不作 finding"既有裁决——Task 11 必须承接 recon 来源候选处置（排除或仅作上下文）**；2 Minor 记账：缺省 needs_verification=True 的放宽边界、丢弃日志文案 <0.7 未随阈值改）
 - Files: `backend/app/services/agent/agents/analysis.py`（:29-260 系统提示词）、`backend/app/services/agent/prompts/system_prompts.py`（:402、:89）
 - Interfaces: Final Answer findings 支持 `needs_verification`；提示词分级产出策略
 - TDD: 失败测试（mock LLM 返回 confidence=0.4 + needs_verification=true 的 finding → 通过归一化不被 0.7 阈值丢弃且 is_strict_finding 放行；confidence=0.05 → 仍丢弃）→ 改提示词与 `_normalize_finding`/strict_finding 豁免逻辑 → 通过 → commit
