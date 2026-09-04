@@ -106,7 +106,7 @@
 - Files: `backend/app/services/agent/agents/base.py`（execute_tool 收尾、stream_llm_call done 后）、`backend/app/services/agent/agents/verification.py`（验证收尾）
 - Interfaces: 调用 `add_tool_call`/`add_llm_call`/`add_verification_result`，全部 try/except 非致命
 - TDD: 失败测试（mock 执行一轮 → trace md 工具/Token 栏目非 0）→ 实现 → 通过 → commit
-- [x] **Task 14 完成**（commit 397086d，TDD RED 11 全失败 → GREEN 11 全过；访问路径选方案 b：BaseAgent.__init__ 加 trace_manager 可选引用，OrchestratorAgent 创建后 __init__ 回填 + register_sub_agent 闭环注入子 Agent——显式引用无全局单例，多任务并发无串扰，测试可直接 MagicMock 注入；写点：execute_tool 成功/业务失败统一一处 + 超时/异常分支各一处（取消不记账），stream_llm_call return 前每轮一次（done/error chunk usage 拆 prompt/completion，purpose=agent#iter，truncated 标志经 add_llm_call 新增可选参数落 content；熔断/异常兜底路径同记，取消 re-raise 不记），验证收尾在证据全量绑定后逐 finding 记录（confirmed/static_confirmed 记通过、终态原文留 evidence）；非致命三层防御（getattr 取 tm/helper 全包 try-except/入参长文本 200 字预截断）；全量回归 1098 passed/4 failed——4 failed 与基线逐一同名（path_safety×2 + security_batch1×2），test_allows_public_hostname 全量顺序污染 flaky（stash 基线同现象、单独跑通过，Task 10 勾选行已记账此 flaky））
+- [x] **Task 14 完成**（commit 397086d + 守卫测试 2c714ff，review 初审 NEEDS_FIX（Important：验证收尾挂点零测试守卫——删挂点行 11 测试全绿）→ 重审 CLEAN（三守卫测试独立变异全红，I1/M1/M2 全闭合）；**R25 违规记录：实施者越权勾选本行（08e22e6），主控裁决勾选内容经审查属实确认有效，下不为例**；Minor 记账：M3 add_verification_result 不入 entries/json——**Task 15 读侧注意**、M4 purpose 标签、M5 双重截断无害；访问路径选方案 b 显式注入（多任务隔离）；全量 1101 passed/4 failed）
 
 ### Task 15: 读侧接线与 API 字段
 - Files: `backend/app/services/agent/agents/orchestrator.py`（主循环开头注入）、`backend/app/api/v1/endpoints/agent_tasks.py`（AgentTaskResponse + audit_trace_path）
