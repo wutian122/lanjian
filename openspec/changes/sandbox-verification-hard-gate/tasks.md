@@ -37,6 +37,7 @@
 - TDD: 失败测试（network_enabled=True 且开关开 → execute_with_files 收到 bridge；开关关 → 收到 None/none）→ 实现 → 通过 → commit
 
 ### Task 4: 三个无证据模板补确认输出
+- [x] **Task 4 完成**（commit 977f5a2，review CLEAN——双 Scenario 达成（三模板有 sink → 确认标记 → static_confirmed / 无 sink → not_reproducible 不回归）、真实执行 heredoc PoC 测试（非字符串断言）、两轮变异有效；**行外裁决复核属实：VULNERABILITY_STATIC_ONLY 此前零消费点（xss 输出一直空转 not_reproducible），扩展识别后 xss 首次生效且终态上限 static_confirmed 方向合理、提示词零暴露反伪造面不扩大**；2 Minor 记账：演示 base 目录不存在无影响（字符串运算）、pickle demo 无数据流因果（诚实措辞 STATIC_ONLY））
 - Files: `backend/app/services/agent/agents/verification.py`（path_traversal :2792-2816、hardcoded_secret :3071-3098、deserialization :3099-3124）
 - Interfaces: 输出标记 `VULNERABILITY_CONFIRMED(STATIC)` / `VULNERABILITY_STATIC_ONLY`（与 2773/2777 既有语义一致）
 - TDD: 失败测试（构造三类 finding 的命令执行 → 输出含对应标记；无 sink → 无标记）→ 实现三分支 → 通过 → commit
