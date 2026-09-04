@@ -181,6 +181,23 @@ def _is_infra_error(text: str, *, ran_in_container: Optional[bool] = None) -> bo
     return False
 
 
+def _attempt_is_infra(attempt: dict) -> bool:
+    """Task 1/6：单个 attempt 是否为沙箱基础设施故障。
+
+    优先认 infra_error 标记；标记缺失（旧数据/其他 attempt 构造路径）时实时扫描
+    evidence_summary+command 文本兜底。connection 类签名仅在命令未进容器执行
+    （无退出码）时生效——容器内 PoC 的网络报错（SSRF 探测被拒等）是真实执行
+    未复现，不得误判为基础设施故障。模块级供状态引擎与软证据升级前置共用。
+    """
+    if attempt.get("infra_error"):
+        return True
+    ran_in_container = attempt.get("exit_code") is not None
+    return _is_infra_error(
+        str(attempt.get("evidence_summary") or "") + "\n" + str(attempt.get("command") or ""),
+        ran_in_container=ran_in_container,
+    )
+
+
 # R1 确定性验证状态引擎：由运行时沙箱证据推导验证结论，不信任 LLM 自述 verdict
 # 返回 (verification_status, is_verified, notes)
 # 证据优先级：confirmed(动态铁证) > static_confirmed(代码推理) > not_reproducible(尝试未复现)
@@ -236,18 +253,10 @@ def compute_verification_status(
     # Task 1：沙箱基础设施故障（MUST NOT 伪装成漏洞未复现）。
     # 全部真实 attempt 均为 infra_error（Docker 缺席/镜像缺失/连接失败）→ needs_context
     # 并附诊断说明，partial-infra（部分 infra_error + 部分真实执行过）维持 not_reproducible。
-    # defense-in-depth：infra_error 键缺失时（旧数据/其他 attempt 构造路径）实时扫描文本兜底；
-    # connection 类签名仅在命令未进容器执行（无退出码）时生效，避免把容器内 PoC 的网络报错
-    # （如 SSRF 探测被拒、真实执行未复现）误判为基础设施故障。
-    def _attempt_is_infra(a: dict) -> bool:
-        if a.get("infra_error"):
-            return True
-        ran = a.get("exit_code") is not None
-        return _is_infra_error(
-            str(a.get("evidence_summary") or "") + "\n" + str(a.get("command") or ""),
-            ran_in_container=ran,
-        )
-
+    # _attempt_is_infra 为模块级函数（软证据升级前置 Task 6 共用同一判定）：
+    # infra_error 键缺失时实时扫描文本兜底；connection 类签名仅在命令未进容器执行
+    # （无退出码）时生效，避免把容器内 PoC 的网络报错（如 SSRF 探测被拒、真实执行
+    # 未复现）误判为基础设施故障。
     if real_attempts and all(_attempt_is_infra(a) for a in real_attempts):
         infra_sigs = set()
         for a in real_attempts:
@@ -2635,9 +2644,20 @@ class VerificationAgent(BaseAgent):
         # 代码推理链确认（soft evidence）：沙箱环境受限无法动态复现时，
         # 有 dataflow+code_snippet+高置信度+verification_method → static_confirmed。
         # 仅当证据引擎未给出 confirmed/static_confirmed 时才兜底（避免覆盖铁证）。
-        # REQ-VE-2：验证器崩溃（全 poc_error）的 finding 不得走软证据兜底，
+        # Task 6（豁免路径 b 收口）：软证据是"有真实尝试但无动态铁证"时的代码推理
+        # 补充，不是零执行/基础设施故障的洗白通道——前置要求至少一个非 fabricated、
+        # 非 infra_error 的真实 attempt（与状态引擎共用 _attempt_is_infra 判定）；
+        # 零执行或全 infra 时维持 needs_context，infra 诊断 note 不再与"静态确认"
+        # 文案自相矛盾。
+        # REQ-VE-2：验证器崩溃（任一 poc_error）的 finding 不得走软证据兜底，
         # 否则"PoC 崩溃"会被洗成"已确认"（掩盖验证器故障）。
+        real_non_infra_attempts = [
+            a
+            for a in attempts
+            if isinstance(a, dict) and not a.get("fabricated") and not _attempt_is_infra(a)
+        ]
         if status in (VerificationStatus.NEEDS_CONTEXT, VerificationStatus.NOT_REPRODUCIBLE) \
+                and real_non_infra_attempts \
                 and not any(a.get("poc_error") for a in attempts):
             VULN_TYPES_SOFT_EVIDENCE = {
                 "xss", "ssrf", "auth_bypass", "csrf", "auth_missing", "tenant_isolation", "idor",

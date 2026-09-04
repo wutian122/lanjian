@@ -28,7 +28,9 @@ def test_confirmed_with_vuln_evidence_stays_confirmed():
     assert normalized["is_verified"] is True
 
 
-def test_static_confirmed_when_weak_evidence_no_sandbox_but_soft_evidence():
+def test_no_sandbox_no_attempts_soft_evidence_stays_needs_context():
+    """Task 6（spec b 条）：零沙箱 attempt 时四件套齐备也不得升级 static_confirmed——
+    软证据是"有真实尝试无动态铁证"的代码推理补充，不是零执行洗白通道。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
@@ -42,8 +44,8 @@ def test_static_confirmed_when_weak_evidence_no_sandbox_but_soft_evidence():
         "ai_confidence": 0.85,
     }
     normalized = agent._normalize_verification_outcome(finding)
-    assert normalized["verification_status"] == "static_confirmed"
-    assert normalized["is_verified"] is True
+    assert normalized["verification_status"] == "needs_context"
+    assert normalized["is_verified"] is False
 
 
 def test_not_reproducible_when_no_evidence():
@@ -85,14 +87,24 @@ def test_static_confirmed_low_confidence_not_promoted():
 
 
 def test_static_confirmed_excluded_from_verified_count_semantic():
-    """static_confirmed 的 is_verified=True 但状态不是 confirmed。"""
+    """static_confirmed 的 is_verified=True 但状态不是 confirmed。
+
+    Task 6：软证据升级现要求真实 attempt——此处 PoC 在沙箱真实执行（exit 0，
+    无动态铁证），升级合法生效后再验计数语义。"""
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
         "vulnerability_type": "ssrf",
         "file_path": "app.py",
         "line_start": 10,
-        "sandbox_attempts": [],
+        "sandbox_attempts": [
+            {
+                "success": True,
+                "exit_code": 0,
+                "evidence_summary": "PoC executed in container, no confirmation marker",
+                "command": "python3 /tmp/poc_0.py",
+            }
+        ],
         "verification_method": "code reasoning",
         "dataflow_path": [{"source": "url", "sink": "requests.get"}],
         "code_snippet": "requests.get(url)",
