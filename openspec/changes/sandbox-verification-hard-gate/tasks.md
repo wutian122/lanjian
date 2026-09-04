@@ -89,6 +89,7 @@
 - TDD: 失败测试（0 findings + 假 semgrep_findings 3 条 → 落库候选带标记进验证队列；output_floor_violated → 收口记 observations）→ 实现 → 通过 → commit
 
 ### Task 12: 门禁候选口径统一
+- [x] **Task 12 完成**（commit f1b46cc，review CLEAN——spec 三条款逐条核验（候选纳入门禁/findings_to_verify 四入口/仅 3 候选派发 3 个）、helper 合并到 strict_finding 三副本收口（逐行等价 + is 身份断言防漂移）、**快照滞留隐患发现并修复**（R4 merge 以新 dict 替换索引位置，全量门禁改现取值）、CONCERN 控制流核实（finish 段快照消费全在 await 前成立）、Task 11 交接五项落地；2 Minor 记账：非门禁提示计数口径（:1970 用户可见）、verification.py 导入行超长格式化）
 - Files: `backend/app/services/agent/agents/orchestrator.py`（has_findings :1133-1145、UNVERIFIED_TERMINAL :1262-1267）、`backend/app/services/agent/agents/verification.py`（findings_to_verify :832-837）
 - Interfaces: `needs_verification=true` 候选纳入门禁与验证队列口径
 - TDD: 失败测试（仅 3 候选 → verification 派发且门禁按候选计算）→ 实现 → 通过 → commit
