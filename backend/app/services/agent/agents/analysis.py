@@ -966,6 +966,8 @@ class AnalysisAgent(BaseAgent):
         # 提取搜索约束 - 防止重复搜索
         search_constraints = input_data.get("search_constraints", {})
         cross_round_context = previous_results.get("cross_round_context", "")
+        # sandbox-verification-hard-gate Task 15：trace 读侧——首轮注入此前执行轨迹摘要
+        trace_summary = previous_results.get("trace_summary", "") if isinstance(previous_results, dict) else ""
 
         # ✅ P1-4: 提取 Semgrep 精确定位信息
         semgrep_findings = previous_results.get("semgrep_findings", [])
@@ -1070,6 +1072,10 @@ class AnalysisAgent(BaseAgent):
 
         if cross_round_context:
             initial_message += f"\n{cross_round_context}\n"
+
+        # Task 15：注入此前执行轨迹摘要（调度/发现/工具轨迹），避免重复分析
+        if trace_summary:
+            initial_message += f"\n## 📋 此前执行轨迹摘要（避免重复劳动）\n{trace_summary}\n"
 
         # ✅ P1-4: 注入 Semgrep 精确定位信息
         if semgrep_findings:

@@ -1218,6 +1218,10 @@ class OrchestratorAgent(BaseAgent):
                     except Exception as e:
                         logger.error(f"[{self.name}] 上下文压缩失败: {e}")
 
+                # sandbox-verification-hard-gate Task 15：每轮 LLM 决策前注入 trace
+                # 摘要（此前调度/发现/工具轨迹），避免重复调度与重复分析；非致命。
+                await self._inject_trace_summary()
+
                 # structured-output-protocol Task 7：后端能力探测支持 tools 时
                 # 注入调度轮三函数定义；探测不可用/未探测（属性为 None）时不传，
                 # 保持 ReAct 文本协议现状（降级共存）。tool_choice 不传。
@@ -2636,6 +2640,71 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             )
         return observation
 
+    # sandbox-verification-hard-gate Task 15：trace 读侧——把执行轨迹摘要注入
+    # 主循环对话历史，并经 previous_results["trace_summary"] 传递给子 Agent。
+    # 数据源为 trace 内存 entries/stats（Task 14 M3：add_verification_result 只写
+    # markdown 不入 entries，故摘要含调度/工具/发现/压缩/LLM 轨迹，不含验证裁决；
+    # 验证完整结论见 audit_trace 文件，由 API audit_trace_path 字段提供入口）。
+    def _trace_summary_raw(self) -> str | None:
+        """读取 trace 生成摘要（截断 2000 字符）。trace 关闭或首轮空壳（0 调度
+        0 事件）返回 None；读取/生成异常上抛，由调用方按场景兜底。"""
+        tm = getattr(self, "trace_manager", None)
+        if tm is None:
+            return None
+        stats = getattr(tm, "stats", {}) or {}
+        entries = getattr(tm, "entries", []) or []
+        # 首轮（尚无任何调度/事件）注入空壳摘要只是噪声，跳过。
+        if not entries and stats.get("agents_dispatched", 0) == 0:
+            return None
+        summary = tm.get_summary_for_agent()
+        if not summary or not summary.strip():
+            return None
+        return summary[:2000]
+
+    def _build_trace_summary(self) -> str | None:
+        """同步非致命版（子 Agent 派发用）：异常 logger.warning 后返回 None。"""
+        try:
+            return self._trace_summary_raw()
+        except Exception as e:
+            logger.warning(f"[{self.name}] trace 摘要生成失败，跳过传递（非致命）: {e}")
+            return None
+
+    async def _inject_trace_summary(self) -> None:
+        """每轮主循环 LLM 调用前注入最新 trace 摘要（user 消息）。
+
+        历史中至多保留一条摘要段：注入前移除上一轮同名段（摘要随 entries/stats
+        每轮增长，旧段过时且浪费 token）。摘要生成失败时发一条 warning 事件并
+        跳过，不阻断主循环。
+        """
+        marker = "（系统提示：此前执行轨迹摘要"
+        try:
+            summary = self._trace_summary_raw()
+        except Exception as e:
+            logger.warning(f"[{self.name}] trace 摘要生成失败，跳过本轮注入（非致命）: {e}")
+            try:
+                await self.emit_event(
+                    "warning",
+                    f"审计轨迹摘要暂不可用，已跳过本轮注入（任务继续）: {e}",
+                )
+            except Exception:
+                pass
+            return
+        if not summary:
+            return
+        # 移除上一轮注入的同名摘要段，保持对话历史中至多一条最新摘要
+        self._conversation_history = [
+            m for m in self._conversation_history
+            if not (m.get("role") == "user" and marker in m.get("content", ""))
+        ]
+        self._conversation_history.append({
+            "role": "user",
+            "content": (
+                f"{marker}——以下为此前各 Agent 的调度/发现/工具轨迹，"
+                "请据此避免重复调度与重复分析；完整追踪见审计文件）：\n\n"
+                f"{summary}"
+            ),
+        })
+
     async def _dispatch_agent(self, params: dict[str, Any]) -> str:
         """调度子 Agent（支持单个和批量并行）"""
 
@@ -2786,6 +2855,12 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
             # 🔥 将之前 Agent 的完整结果传递给后续 Agent
             for prev_agent, prev_data in self._agent_results.items():
                 previous_results[prev_agent] = {"data": prev_data}
+
+            # sandbox-verification-hard-gate Task 15：trace 摘要经 previous_results
+            # 传递给子 Agent（读侧接线），子 Agent 在首轮消息注入以避免重复劳动。
+            trace_summary = self._build_trace_summary()
+            if trace_summary:
+                previous_results["trace_summary"] = trace_summary
 
             # ✅ P1-2: 构建 CrossRoundContext 并注入子 Agent
             # 当已有 findings 或 coverage 数据时，构建跨轮传递结构

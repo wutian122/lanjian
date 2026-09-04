@@ -400,6 +400,32 @@ class AuditTraceManager:
         summary += f"\n完整追踪文件: {self.trace_md}\n"
         return summary
 
+    @classmethod
+    def rel_trace_path_for_task(
+        cls,
+        task_id: str,
+        base_dir: Optional[str] = None,
+    ) -> Optional[str]:
+        """任务详情 API 用：返回 audit_trace.md 的相对路径（相对挂载点/项目根），
+        文件不存在（未启用 trace / 任务尚未写入）时返回 None。
+
+        相对路径取 base_dir 末级目录名（compose 中宿主机与容器内均为
+        ``audit_traces``），形如 ``audit_traces/<task_id 前 8 位>/audit_trace.md``，
+        运维可在宿主机 bind mount 点下直接定位该文件做任务复盘。
+        """
+        try:
+            base = Path(base_dir if base_dir is not None else settings.AUDIT_TRACE_DIR)
+            rel = f"{base.name}/{task_id[:8]}/audit_trace.md"
+            if (base / task_id[:8] / "audit_trace.md").exists():
+                return rel
+            return None
+        except Exception:
+            logger.warning(
+                f"[AuditTrace] rel_trace_path_for_task failed for {task_id[:8]}",
+                exc_info=True,
+            )
+            return None
+
     def finalize(self):
         """任务完成时写入最终统计"""
         self._update_stats_table()

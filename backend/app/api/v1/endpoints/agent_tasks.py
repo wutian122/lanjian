@@ -219,6 +219,11 @@ class AgentTaskResponse(BaseModel):
     # None=后端未启用 Redis registry（Redis 不可用时保持向后兼容）。
     orchestrator_alive: bool | None = None
 
+    # sandbox-verification-hard-gate Task 15：人工审查入口——audit_trace.md 的相对
+    # 路径（相对挂载点/项目根，形如 audit_traces/<id8>/audit_trace.md）；任务未启用
+    # trace 或文件不存在时为 None。运维可在宿主机 bind mount 点下直接读取复盘。
+    audit_trace_path: str | None = None
+
     class Config:
         from_attributes = True
 
@@ -2768,6 +2773,18 @@ async def get_agent_task(
             response_data["orchestrator_alive"] = (
                 True if _running_orchestrators.get(task_id) is not None else None
             )
+
+        # sandbox-verification-hard-gate Task 15：人工审查入口——解析 trace 文件
+        # 相对路径（文件真实存在才返回，否则 None）。纯路径推导，不依赖 orchestrator
+        # 实例存活，任务完成后仍可定位；任何异常降级为 None，不影响详情接口。
+        try:
+            from app.services.agent.audit_trace import AuditTraceManager
+            response_data["audit_trace_path"] = AuditTraceManager.rel_trace_path_for_task(
+                task.id
+            )
+        except Exception as e:
+            logger.debug(f"[GetTask] audit_trace_path resolve failed for {task_id}: {e}")
+            response_data["audit_trace_path"] = None
 
         return AgentTaskResponse(**response_data)
     except Exception as e:

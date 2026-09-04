@@ -1061,6 +1061,8 @@ class VerificationAgent(BaseAgent):
 
         # 提取跨轮传递上下文
         cross_round_context = previous_results.get("cross_round_context", "")
+        # sandbox-verification-hard-gate Task 15：trace 读侧——首轮注入此前执行轨迹摘要
+        trace_summary = previous_results.get("trace_summary", "") if isinstance(previous_results, dict) else ""
 
         # 🔥 处理交接信息
         handoff = input_data.get("handoff")
@@ -1256,6 +1258,10 @@ class VerificationAgent(BaseAgent):
         # 注入跨轮传递上下文
         if cross_round_context:
             initial_message += f"\n{cross_round_context}\n"
+
+        # Task 15：注入此前执行轨迹摘要（调度/发现/工具轨迹），避免重复验证
+        if trace_summary:
+            initial_message += f"\n## 📋 此前执行轨迹摘要（避免重复劳动）\n{trace_summary}\n"
 
         # 初始化对话历史
         self._conversation_history = [

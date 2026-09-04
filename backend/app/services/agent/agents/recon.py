@@ -367,6 +367,9 @@ class ReconAgent(BaseAgent):
         config = input_data.get("config", {})
         task = input_data.get("task", "")
         task_context = input_data.get("task_context", "")
+        # sandbox-verification-hard-gate Task 15：trace 读侧——首轮注入此前执行轨迹摘要
+        previous_results = input_data.get("previous_results", {})
+        trace_summary = previous_results.get("trace_summary", "") if isinstance(previous_results, dict) else ""
         
         # 🔥 获取目标文件列表
         target_files = config.get("target_files", [])
@@ -407,6 +410,10 @@ class ReconAgent(BaseAgent):
 {self.get_tools_description()}
 
 请开始你的信息收集工作。首先思考应该收集什么信息，然后**立即**选择合适的工具执行（输出 Action）。不要只输出 Thought，必须紧接着输出 Action。"""
+
+        # Task 15：注入此前执行轨迹摘要（调度/发现/工具轨迹），避免重复劳动
+        if trace_summary:
+            initial_message += f"\n## 📋 此前执行轨迹摘要（避免重复劳动）\n{trace_summary}\n"
 
         # 初始化对话历史
         self._conversation_history = [
