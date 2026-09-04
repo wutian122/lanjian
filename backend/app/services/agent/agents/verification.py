@@ -140,6 +140,27 @@ VULN_EVIDENCE_MARKERS = (
 
 LANGUAGE_TEST_TOOL_NAMES = {"python_test", "php_test", "javascript_test", "java_test", "go_test", "ruby_test", "shell_test", "bash_test"}
 
+# Task 1（Phase 1 基础设施语义修复）：沙箱基础设施故障签名——小写匹配。
+# 命中即视为沙箱环境自身故障（不是漏洞/PoC 问题），不冒充"漏洞未复现"。
+INFRA_ERROR_SIGNATURES = (
+    "docker not available",
+    "沙箱环境不可用",
+    "imagenotfound",
+    "no such image",
+    "pull access denied",
+    "error while creating mount source path",
+    "connection aborted",
+    "connection refused",
+)
+
+
+def _is_infra_error(text: str) -> bool:
+    """Task 1：识别 attempt 的错误/输出文本是否命中沙箱基础设施故障签名。"""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(sig in lower for sig in INFRA_ERROR_SIGNATURES)
+
 
 # R1 确定性验证状态引擎：由运行时沙箱证据推导验证结论，不信任 LLM 自述 verdict
 # 返回 (verification_status, is_verified, notes)
@@ -191,6 +212,23 @@ def compute_verification_status(
         return VerificationStatus.NEEDS_CONTEXT, False, {
             "reason": "pre-generated PoC crashed",
             "poc_error": True,
+        }
+
+    # Task 1：沙箱基础设施故障（MUST NOT 伪装成漏洞未复现）。
+    # 全部真实 attempt 均为 infra_error（Docker 缺席/镜像缺失/连接失败）→ needs_context
+    # 并附诊断说明，partial-infra（部分 infra_error + 部分真实执行过）维持 not_reproducible。
+    if real_attempts and all(a.get("infra_error") for a in real_attempts):
+        infra_sigs = sorted({
+            sig for a in real_attempts
+            for sig in INFRA_ERROR_SIGNATURES
+            if sig in (str(a.get("evidence_summary") or "") + str(a.get("command") or "")).lower()
+        })
+        return VerificationStatus.NEEDS_CONTEXT, False, {
+            "reason": (
+                "沙箱环境故障，未能执行验证："
+                + (", ".join(infra_sigs) if infra_sigs else "sandbox unavailable")
+            ),
+            "infra_error": True,
         }
 
     # 4) not_reproducible：尝试过但未复现
@@ -1886,6 +1924,9 @@ class VerificationAgent(BaseAgent):
         # Opt-1: command already extracted above for finding_id parsing
         target_match = re.search(r"Target:\s*([^'\"\n;]+)", command)
         target_ref = target_match.group(1).strip() if target_match else None
+        # Task 1：沙箱基础设施故障标记——命令文本或 observation 命中 INFRA_ERROR_SIGNATURES
+        # 即视为沙箱自身故障（Docker 缺席/镜像缺失/连接失败），与 PoC 失败语义分离。
+        infra_error = _is_infra_error(command) or _is_infra_error(obs_text)
 
         attempt = {
             "tool": "sandbox_exec",
@@ -1901,6 +1942,7 @@ class VerificationAgent(BaseAgent):
             "static_evidence": static_evidence,
             "poc_error": poc_error,
             "poc_error_type": poc_error_type,
+            "infra_error": infra_error,
         }
         self._sandbox_attempts.append(attempt)
         # V6 B4（REQ-VE-4）：双写——按 finding_id 登记运行时证据索引，
