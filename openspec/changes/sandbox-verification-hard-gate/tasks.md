@@ -19,6 +19,7 @@
 ## Phase 1: 基础设施语义修复
 
 ### Task 1: infra_error 标记与状态机分离
+- [x] **Task 1 完成**（commit 6a699a6 + 0686dd9 缺口修复，review CLEAN——两 Scenario 8 探针实证、签名 8 项锁定、attempt 合并链 infra_error 保留性核对通过；实施者主动核验修复 language_test/fallback 两处缺口 + connection 守卫防误判（SSRF PoC 容器内拒绝是真实执行）；2 Important 交接：①**确定性路径 exit_code=-1 合成致 connection 签名抑制**（daemon 中断窄时序漏判）→ Task 2/3 处理 _format_sandbox_result 退出码语义；②**软证据升级不排除 infra_error**（needs_context 被洗白 static_confirmed）→ Task 6 验收强制核对；4 Minor 记账）
 - Files: `backend/app/services/agent/agents/verification.py`（_record_sandbox_attempt :1606-1696、compute_verification_status :148-207）
 - Interfaces: Produces attempt 新字段 `infra_error: bool`；compute 新分支 `("needs_context", "infra_error")`
 - TDD: 写失败测试（attempt 全部含 "ImageNotFound"/"Docker not available" 签名 → 终态 needs_context 而非 not_reproducible；混合真实失败 → 仍 not_reproducible；成功铁证 → confirmed 不受影响）→ 跑失败 → 实现签名识别与分支前置 → 通过 → commit
