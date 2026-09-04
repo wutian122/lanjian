@@ -465,7 +465,7 @@ async def test_analysis_forced_summary_injects_guided_response_format(monkeypatc
 
     monkeypatch.setattr(agent, "stream_llm_call", AsyncMock(side_effect=_fake_summary_stream))
 
-    findings = await agent._run_forced_summary([])
+    findings, _floor = await agent._run_forced_summary([])
 
     assert len(findings) == 1
     assert findings[0]["title"] == "SQL 注入漏洞"

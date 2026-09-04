@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
 from ..json_parser import AgentJsonParser
 from ..strict_finding import _to_int, _to_float
+from ..core.coverage import CoverageMatrix, DIMENSIONS
 from ..knowledge.loader import KnowledgeLoader
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, build_enhanced_prompt
 
@@ -280,6 +281,223 @@ SUBMIT_FINDINGS_PROTOCOL_NOTE = """【工具协议说明】函数调用工具的
 3. 完成审计后调用 submit_findings 提交报告。findings 数组可同时包含高置信发现与低置信候选：confidence 0.1-0.7 的可疑点必须照常提交并设 needs_verification=true（候选不是误报，是交沙箱验证证实/证伪的工作清单，不要因为结论不确定就漏报）；确认没有漏洞时，findings 传空数组，并在 summary 中说明分析过程与观察到的风险点。"""
 
 
+# ============ 强制总结维度级产出下限（sandbox-verification-hard-gate Task 10）============
+
+# 维度标识别名 → 维度键。vulnerability_type 键（ssrf/deserialization 等）走
+# CoverageMatrix.map_finding_to_dimension；此处只补 vuln map 未覆盖的口语化/
+# 中英文维度别名。英文别名按词边界匹配（避免 "authorization" 被 "auth" 误归 D2）。
+_DIMENSION_LABEL_ALIASES: Dict[str, str] = {
+    # D1 注入类
+    "sql注入": "D1_injection", "sql 注入": "D1_injection",
+    "nosql": "D1_injection", "命令注入": "D1_injection",
+    "代码注入": "D1_injection", "模板注入": "D1_injection",
+    "ssti": "D1_injection", "ldap注入": "D1_injection",
+    "xss": "D1_injection", "跨站脚本": "D1_injection",
+    "原型链污染": "D1_injection", "注入": "D1_injection",
+    "injection": "D1_injection", "sqli": "D1_injection",
+    # D2 认证
+    "身份认证": "D2_auth", "身份验证": "D2_auth", "认证": "D2_auth",
+    "登录": "D2_auth", "会话管理": "D2_auth", "jwt": "D2_auth",
+    "authentication": "D2_auth", "auth": "D2_auth",
+    # D3 授权
+    "访问控制": "D3_authz", "越权": "D3_authz", "授权": "D3_authz",
+    "权限提升": "D3_authz", "特权提升": "D3_authz", "idor": "D3_authz",
+    "csrf": "D3_authz", "跨站请求伪造": "D3_authz",
+    "authorization": "D3_authz", "authz": "D3_authz", "权限": "D3_authz",
+    # D4 反序列化
+    "反序列化": "D4_deserialization", "xxe": "D4_deserialization",
+    "xml外部实体": "D4_deserialization", "内存破坏": "D4_deserialization",
+    # D5 文件
+    "路径遍历": "D5_file", "目录遍历": "D5_file", "文件包含": "D5_file",
+    "文件上传": "D5_file", "任意文件": "D5_file",
+    "path traversal": "D5_file", "lfi": "D5_file", "rfi": "D5_file",
+    # D6 SSRF
+    "服务端请求伪造": "D6_ssrf", "服务器端请求伪造": "D6_ssrf",
+    # D7 加密/密钥
+    "硬编码密钥": "D7_crypto", "硬编码凭据": "D7_crypto", "硬编码密码": "D7_crypto",
+    "弱加密": "D7_crypto", "弱哈希": "D7_crypto", "敏感信息泄露": "D7_crypto",
+    "敏感数据": "D7_crypto", "密钥管理": "D7_crypto", "加密": "D7_crypto",
+    "密钥": "D7_crypto", "crypto": "D7_crypto",
+    "cryptography": "D7_crypto", "secret": "D7_crypto",
+    # D8 配置
+    "安全配置": "D8_config", "错误配置": "D8_config", "配置错误": "D8_config",
+    "开放重定向": "D8_config", "未验证重定向": "D8_config", "cors": "D8_config",
+    "调试模式": "D8_config", "debug": "D8_config",
+    "misconfiguration": "D8_config", "重定向": "D8_config", "配置": "D8_config",
+    # D9 业务逻辑
+    "业务逻辑": "D9_business_logic", "竞态条件": "D9_business_logic",
+    "竞态": "D9_business_logic", "并发缺陷": "D9_business_logic",
+    "business logic": "D9_business_logic", "race condition": "D9_business_logic",
+    # D10 供应链
+    "供应链": "D10_supply_chain", "依赖组件": "D10_supply_chain",
+    "第三方依赖": "D10_supply_chain", "过时依赖": "D10_supply_chain",
+    "漏洞依赖": "D10_supply_chain", "supply chain": "D10_supply_chain",
+    "dependency": "D10_supply_chain", "dependencies": "D10_supply_chain",
+    "cve": "D10_supply_chain",
+}
+
+_DIMENSION_KEYS_LOWER = {d.lower(): d for d in DIMENSIONS}
+
+# 豁免行：UNCOVERED_DIMENSION_EXEMPT: <维度标识>[- 理由]（兼容全角冒号）
+_EXEMPT_LINE_RE = re.compile(
+    r"UNCOVERED_DIMENSION_EXEMPT\s*[:：]\s*(.+)", re.IGNORECASE
+)
+# 维度标识与豁免理由的分隔符（按特异性排序，先长后短；冒号兜底）
+_EXEMPT_SEPARATORS = (" — ", " – ", "——", " - ", "－", "：", ":")
+
+_FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
+
+即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
+
+## 产出下限（必须遵守）
+对你尚未充分覆盖的每个漏洞维度（SQL 注入、认证/授权绕过、XSS、命令注入、路径遍历、SSRF、反序列化、XXE、硬编码密钥、弱加密、竞态条件、供应链依赖等），你必须二选一：
+1. **输出候选发现**：只要你在实际读取的代码中看到过可疑模式，即使结论不确定（疑似可利用但被中间层部分缓解等），也输出为候选——confidence 如实填 0.1-0.7 并设 needs_verification=true，交由沙箱验证证实或证伪。候选不是误报，不要埋没实际看到的可疑点；
+2. **书面豁免**：该维度在本项目确实不适用时，在 summary 中写出豁免理由（如"本项目为纯静态前端，无 SQL 查询入口"）。每条豁免必须在 summary 中**单独成行**，严格使用以下格式（一行一个维度，维度标识不得省略）：
+   UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <豁免理由>
+   维度标识使用维度键（D1_injection、D2_auth、D3_authz、D4_deserialization、D5_file、D6_ssrf、D7_crypto、D8_config、D9_business_logic、D10_supply_chain）或漏洞类型名（sql_injection、xss、command_injection、path_traversal、ssrf、deserialization、xxe、hardcoded_secret、csrf、idor 等）。
+不允许对未覆盖维度既不给候选也不给豁免——0 候选且 0 豁免的总结视为无效产出。
+
+请按以下 JSON 格式输出：
+```json
+{
+    "findings": [
+        {
+            "vulnerability_type": "sql_injection|xss|command_injection|path_traversal|ssrf|hardcoded_secret|other",
+            "severity": "critical|high|medium|low",
+            "title": "漏洞标题",
+            "description": "详细描述",
+            "file_path": "文件路径（必须是实际读取过的文件）",
+            "line_start": 行号,
+            "code_snippet": "相关代码片段",
+            "suggestion": "修复建议",
+            "confidence": 0.5,
+            "needs_verification": true
+        }
+    ],
+    "summary": "分析总结；未覆盖维度的书面豁免以 UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <理由> 逐行附在末尾"
+}
+```
+
+Final Answer:"""
+
+_FORCED_SUMMARY_RETRY_PROMPT = """你的上一条总结没有对任何未覆盖维度给出候选发现或书面豁免，这是无效产出。
+
+请立即重新输出 Final Answer，对你尚未充分覆盖的每个漏洞维度二选一：
+1. 在 findings 数组中输出候选发现——只要实际读取的代码中出现过可疑模式，confidence 如实填 0.1-0.7 并设 needs_verification=true；
+2. 在 summary 中以单独成行的书面豁免说明该维度为何不适用，格式严格为：
+   UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <豁免理由>
+   维度标识使用维度键（D1_injection、D2_auth、D3_authz、D4_deserialization、D5_file、D6_ssrf、D7_crypto、D8_config、D9_business_logic、D10_supply_chain）或漏洞类型名（sql_injection、ssrf、deserialization 等）。
+
+0 候选且 0 豁免仍视为无效产出。
+
+Final Answer:"""
+
+
+def _resolve_dimension_label(label: Any) -> Optional[str]:
+    """维度标识文本 → DIMENSIONS 维度键，无法识别返回 None。
+
+    三级解析：①维度键（D6_ssrf，大小写不敏感）/ Dn 数字前缀；
+    ②vulnerability_type 键（CoverageMatrix 映射：ssrf/deserialization 等）；
+    ③中文/英文别名（英文按词边界，避免 auth 误匹配 authorization）。
+    """
+    if not isinstance(label, str):
+        return None
+    text = label.strip().strip("*").strip().lower()
+    if not text:
+        return None
+    # ① 维度键 / Dn 数字前缀
+    if text in _DIMENSION_KEYS_LOWER:
+        return _DIMENSION_KEYS_LOWER[text]
+    m = re.match(r"^d(\d{1,2})(?:[^a-z0-9]|$)", text)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= len(DIMENSIONS):
+            return DIMENSIONS[n - 1]
+    # ② vulnerability_type 映射
+    dim = CoverageMatrix.map_finding_to_dimension(text)
+    if dim:
+        return dim
+    # ②' 标签带括号/后缀说明时（如 "ssrf（外部请求伪造）"），取开头英文标识符再映射
+    token_match = re.match(r"([a-z][a-z0-9_]*)", text)
+    if token_match and token_match.group(1) != text:
+        dim = CoverageMatrix.map_finding_to_dimension(token_match.group(1))
+        if dim:
+            return dim
+    # ③ 别名（英文词边界 / 中文子串）
+    for alias, target in _DIMENSION_LABEL_ALIASES.items():
+        if alias.isascii():
+            if re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", text):
+                return target
+        elif alias in text:
+            return target
+    return None
+
+
+def _parse_dimension_exemptions(summary: Any) -> Dict[str, str]:
+    """从 summary 文本提取书面豁免行 → {维度键: 豁免理由}。
+
+    行格式（提示词约束）：UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <豁免理由>。
+    兼容 markdown 列表前缀（-/*/>）、全角冒号、无理由（仅维度标识）；
+    维度标识无法解析的行跳过并告警（重试提示会纠正格式）。
+    """
+    result: Dict[str, str] = {}
+    if not isinstance(summary, str):
+        return result
+    for raw_line in summary.splitlines():
+        line = raw_line.strip().lstrip("-*>• ").strip()
+        m = _EXEMPT_LINE_RE.search(line)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        label, reason = rest, ""
+        for sep in _EXEMPT_SEPARATORS:
+            if sep in rest:
+                label, reason = rest.split(sep, 1)
+                break
+        label = label.strip().strip("*").strip()
+        dim = _resolve_dimension_label(label)
+        if not dim:
+            logger.warning(
+                f"[Analysis] 强制总结豁免行维度标识无法识别，已跳过: {label!r}"
+            )
+            continue
+        reason = reason.strip()
+        if dim not in result or (reason and not result[dim]):
+            result[dim] = reason
+    return result
+
+
+def _build_output_floor_report(parsed: Any) -> Dict[str, Any]:
+    """强制总结轮解析结果 → 维度级产出下限报告。
+
+    - dimension_gaps_reported: {维度键: "candidate"|"exempt"}，同维度候选优先；
+    - output_floor_violated: 本轮 0 候选且 0 有效豁免；
+    - candidate_count/exempt_count: 计数（候选含维度无法映射的，豁免仅计可解析维度）。
+    """
+    gaps: Dict[str, str] = {}
+    candidate_count = 0
+    findings = parsed.get("findings") if isinstance(parsed, dict) else None
+    if isinstance(findings, list):
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            candidate_count += 1
+            dim = _resolve_dimension_label(item.get("vulnerability_type"))
+            if dim:
+                gaps[dim] = "candidate"
+    exempts = _parse_dimension_exemptions(
+        parsed.get("summary") if isinstance(parsed, dict) else None
+    )
+    for dim in exempts:
+        gaps.setdefault(dim, "exempt")
+    return {
+        "dimension_gaps_reported": gaps,
+        "output_floor_violated": candidate_count == 0 and len(exempts) == 0,
+        "candidate_count": candidate_count,
+        "exempt_count": len(exempts),
+    }
+
+
 @dataclass
 class AnalysisStep:
     """分析步骤"""
@@ -445,7 +663,11 @@ class AnalysisAgent(BaseAgent):
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "整体分析总结（分析过程、覆盖范围、风险概览）",
+                    "description": (
+                        "整体分析总结（分析过程、覆盖范围、风险概览）；未覆盖维度的"
+                        "书面豁免以 UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <理由> "
+                        "逐行附在末尾"
+                    ),
                 },
                 "findings": {
                     "type": "array",
@@ -583,92 +805,124 @@ class AnalysisAgent(BaseAgent):
         logger.warning(msg)
         await self.emit_event("warning", msg)
 
-    async def _run_forced_summary(self, all_findings: list) -> list:
+    async def _forced_summary_round(self) -> tuple:
+        """单次强制总结 LLM 调用 + 解析（Task 10 抽出，首调/重试共用）。
+
+        返回 (parsed_result, 原始输出文本, 本轮候选 findings 列表)。
+        guided json_schema 可用时注入 findings response_format（Task 8）；
+        不可用/未探测时不传，维持提示词约束 + json-repair 兜底。
+        """
+        summary_response_format = None
+        backend_caps = getattr(self.llm_service, "backend_capabilities", None)
+        if backend_caps is not None and getattr(backend_caps, "guided_json", False):
+            summary_response_format = self._build_findings_response_format()
+
+        summary_output, _ = await self.stream_llm_call(
+            self._conversation_history,
+            response_format=summary_response_format,
+            # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+        )
+        raw_output = summary_output or ""
+        parsed_result: Dict[str, Any] = {"findings": [], "summary": ""}
+        if raw_output.strip():
+            # 解析总结输出
+            summary_text = re.sub(r'```json\s*', '', raw_output.strip())
+            summary_text = re.sub(r'```\s*', '', summary_text)
+            parsed = AgentJsonParser.parse(
+                summary_text,
+                default={"findings": [], "summary": ""}
+            )
+            if isinstance(parsed, dict):
+                parsed_result = parsed
+        findings = parsed_result.get("findings")
+        findings = (
+            [f for f in findings if isinstance(f, dict)]
+            if isinstance(findings, list) else []
+        )
+        parsed_result["findings"] = findings
+        if not isinstance(parsed_result.get("summary"), str):
+            parsed_result["summary"] = ""
+        return parsed_result, raw_output, findings
+
+    async def _run_forced_summary(self, all_findings: list) -> tuple:
         """强制总结：轮次耗尽或软停止交卷时，让 LLM 立即输出 Final Answer 汇总发现。
 
         合并语义（fix-audit-time-budget-2026-08）：已有发现时扩展（跨文件去重由
         orchestrator 层 _merge_or_append_finding 负责），空列表时替换。
         注：当前 run() 数据流下软停止交卷时 all_findings 恒为空（is_final 必伴随
         break，其后循环头不再执行），extend 分支主要作为防御与后续扩展点。
+
+        Task 10（维度级产出下限）：解析后校验候选数/豁免数，0 候选且 0 豁免时
+        追加一次重试提示（仍空则 output_floor_violated=True，由 Task 11
+        orchestrator 侧按覆盖不足收口）。返回 (all_findings, floor_report)。
         """
         await self.emit_thinking("📝 分析阶段结束，正在生成漏洞总结...")
 
         # 添加强制总结的提示
         self._conversation_history.append({
             "role": "user",
-            "content": """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
-
-即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
-
-## 产出下限（必须遵守）
-对你尚未充分覆盖的每个漏洞维度（SQL 注入、认证/授权绕过、XSS、命令注入、路径遍历、SSRF、反序列化、XXE、硬编码密钥、弱加密、竞态条件等），你必须二选一：
-1. **输出候选发现**：只要你在实际读取的代码中看到过可疑模式，即使结论不确定（疑似可利用但被中间层部分缓解等），也输出为候选——confidence 如实填 0.1-0.7 并设 needs_verification=true，交由沙箱验证证实或证伪。候选不是误报，不要埋没实际看到的可疑点；
-2. **书面豁免**：该维度在本项目确实不适用时，在 summary 中明确写出豁免理由（如"本项目为纯静态前端，无 SQL 查询入口"）。
-不允许对未覆盖维度既不给候选也不给豁免——0 候选且 0 豁免的总结视为无效产出。
-
-请按以下 JSON 格式输出：
-```json
-{
-    "findings": [
-        {
-            "vulnerability_type": "sql_injection|xss|command_injection|path_traversal|ssrf|hardcoded_secret|other",
-            "severity": "critical|high|medium|low",
-            "title": "漏洞标题",
-            "description": "详细描述",
-            "file_path": "文件路径（必须是实际读取过的文件）",
-            "line_start": 行号,
-            "code_snippet": "相关代码片段",
-            "suggestion": "修复建议",
-            "confidence": 0.5,
-            "needs_verification": true
-        }
-    ],
-    "summary": "分析总结（含各未覆盖维度的书面豁免理由）"
-}
-```
-
-Final Answer:""",
+            "content": _FORCED_SUMMARY_PROMPT,
         })
 
+        floor_report: Dict[str, Any] = {
+            "dimension_gaps_reported": {},
+            "output_floor_violated": False,
+        }
         try:
-            # structured-output-protocol Task 8：强制总结轮为纯 JSON 一次性输出
-            # （无工具调用）——guided_json 可用时注入 findings schema 的
-            # response_format，输出严格合法 JSON；不可用/未探测时不传，维持
-            # 提示词约束 + json-repair 兜底现状。
-            summary_response_format = None
-            backend_caps = getattr(self.llm_service, "backend_capabilities", None)
-            if backend_caps is not None and getattr(backend_caps, "guided_json", False):
-                summary_response_format = self._build_findings_response_format()
-
-            summary_output, _ = await self.stream_llm_call(
-                self._conversation_history,
-                response_format=summary_response_format,
-                # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+            parsed_result, raw_output, round_findings = await self._forced_summary_round()
+            # 强制总结轮同样可能被 max_tokens 截断，统一归因
+            await self._warn_truncated_final_answer(
+                len(round_findings), context="强制总结 Final Answer"
             )
+            report = _build_output_floor_report(parsed_result)
 
-            if summary_output and summary_output.strip():
-                # 解析总结输出
-                import re
-                summary_text = summary_output.strip()
-                summary_text = re.sub(r'```json\s*', '', summary_text)
-                summary_text = re.sub(r'```\s*', '', summary_text)
-                parsed_result = AgentJsonParser.parse(
-                    summary_text,
-                    default={"findings": [], "summary": ""}
+            if report["output_floor_violated"]:
+                # 全空总结不静默通过：发 warning 可观测事件并重试一次
+                msg = (
+                    f"[{self.name}] 强制总结未对任何未覆盖维度给出候选或豁免"
+                    f"（0 候选 0 豁免），追加一次重试提示"
                 )
-                if "findings" in parsed_result and isinstance(parsed_result["findings"], list):
-                    summary_findings = parsed_result["findings"]
-                    if all_findings:
-                        all_findings.extend(summary_findings)
-                    else:
-                        all_findings = summary_findings
-                    # 强制总结轮同样可能被 max_tokens 截断，统一归因
-                    await self._warn_truncated_final_answer(
-                        len(summary_findings), context="强制总结 Final Answer"
-                    )
+                logger.warning(msg)
+                await self.emit_event("warning", msg)
+                # 首轮输出入历史保持对话连贯，再附重试提示
+                self._conversation_history.append({
+                    "role": "assistant", "content": raw_output,
+                })
+                self._conversation_history.append({
+                    "role": "user", "content": _FORCED_SUMMARY_RETRY_PROMPT,
+                })
+                parsed_retry, _, retry_findings = await self._forced_summary_round()
+                await self._warn_truncated_final_answer(
+                    len(retry_findings), context="强制总结重试 Final Answer"
+                )
+                report_retry = _build_output_floor_report(parsed_retry)
+                round_findings = round_findings + retry_findings
+                # 两轮缺口并集，候选优先于豁免（首调 violated 时其 gaps 必为空，
+                # 合并为防御性处理）
+                merged_gaps: Dict[str, str] = dict(report["dimension_gaps_reported"])
+                for dim, kind in report_retry["dimension_gaps_reported"].items():
+                    if kind == "candidate" or dim not in merged_gaps:
+                        merged_gaps[dim] = kind
+                report = {
+                    "dimension_gaps_reported": merged_gaps,
+                    "output_floor_violated": (
+                        report["candidate_count"] + report_retry["candidate_count"] == 0
+                        and report["exempt_count"] + report_retry["exempt_count"] == 0
+                    ),
+                }
+
+            if round_findings:
+                if all_findings:
+                    all_findings.extend(round_findings)
+                else:
+                    all_findings = round_findings
+            floor_report = {
+                "dimension_gaps_reported": report["dimension_gaps_reported"],
+                "output_floor_violated": report["output_floor_violated"],
+            }
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to generate summary: {e}")
-        return all_findings
+        return all_findings, floor_report
 
     async def run(self, input_data: Dict[str, Any]) -> AgentResult:
         """
@@ -856,6 +1110,9 @@ Final Answer:""",
         self._steps = []
         all_findings = []
         error_message = None  # 🔥 跟踪错误信息
+        # Task 10：维度级产出下限报告（强制总结路径由 _run_forced_summary 回传；
+        # None=未走强制总结，收尾时从最终 findings 聚合候选维度）
+        floor_report: Optional[Dict[str, Any]] = None
         # Task 8：submit_findings 协议说明段仅在能力可用时注入一次（首轮）
         submit_findings_note_injected = False
         
@@ -1115,7 +1372,7 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
             # 软停止退出也补全总结（当前数据流下软停止时通常零发现，合并逻辑防御未来扩展）
             needs_summary = (not all_findings) or self._soft_stop_consumed
             if needs_summary and not self.is_cancelled and not error_message:
-                all_findings = await self._run_forced_summary(all_findings)
+                all_findings, floor_report = await self._run_forced_summary(all_findings)
             
             # 处理结果
             duration_ms = int((time.time() - start_time) * 1000)
@@ -1129,7 +1386,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 return AgentResult(
                     success=False,
                     error="任务已取消",
-                    data={"findings": all_findings},
+                    data={
+                        "findings": all_findings,
+                        "dimension_gaps_reported": {},
+                        "output_floor_violated": False,
+                    },
                     iterations=self._iteration,
                     tool_calls=self._tool_calls,
                     tokens_used=self._total_tokens,
@@ -1145,7 +1406,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 return AgentResult(
                     success=False,
                     error=error_message,
-                    data={"findings": all_findings},
+                    data={
+                        "findings": all_findings,
+                        "dimension_gaps_reported": {},
+                        "output_floor_violated": False,
+                    },
                     iterations=self._iteration,
                     tool_calls=self._tool_calls,
                     tokens_used=self._total_tokens,
@@ -1193,10 +1458,25 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
             # 并入 _search_registry 与下一轮 CrossRoundContext（跨轮"禁止重读/禁止重复搜索"去重）
             execution_report = self._collect_execution_report()
 
+            # Task 10：未走强制总结（主循环正常 Final Answer）时，从最终发现
+            # 聚合候选维度；强制总结路径的 floor_report 已含豁免语义，直接回写
+            if floor_report is None:
+                reported_gaps: Dict[str, str] = {}
+                for finding in standardized_findings:
+                    dim = _resolve_dimension_label(finding.get("vulnerability_type"))
+                    if dim:
+                        reported_gaps[dim] = "candidate"
+                floor_report = {
+                    "dimension_gaps_reported": reported_gaps,
+                    "output_floor_violated": False,
+                }
+
             return AgentResult(
                 success=True,
                 data={
                     "findings": standardized_findings,
+                    "dimension_gaps_reported": floor_report["dimension_gaps_reported"],
+                    "output_floor_violated": floor_report["output_floor_violated"],
                     "files_read": execution_report["files_read"],
                     "grep_patterns": execution_report["grep_patterns"],
                     "steps": [

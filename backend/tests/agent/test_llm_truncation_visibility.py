@@ -336,7 +336,7 @@ async def test_forced_summary_truncation_emits_warning(monkeypatch):
 
     monkeypatch.setattr(agent, "stream_llm_call", _fake_stream)
 
-    findings = await agent._run_forced_summary([])
+    findings, _floor = await agent._run_forced_summary([])
 
     assert len(findings) == 1, "json-repair 应解析出 1 条部分 finding"
     warnings = _emitted_warning_texts(agent)

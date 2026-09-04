@@ -224,11 +224,11 @@ async def test_forced_summary_merges_into_existing_findings(monkeypatch):
     ]
     monkeypatch.setattr(agent, "stream_llm_call", AsyncMock(return_value=(_SUMMARY_OUTPUT, 0)))
 
-    merged = await agent._run_forced_summary(list(existing))
+    merged, _floor = await agent._run_forced_summary(list(existing))
     assert len(merged) == 2  # 已有 XSS + 总结补报的 SQL 注入
     assert merged[0]["vulnerability_type"] == "xss"
 
-    replaced = await agent._run_forced_summary([])
+    replaced, _floor2 = await agent._run_forced_summary([])
     assert len(replaced) == 1
     assert replaced[0]["vulnerability_type"] == "sql_injection"
 
@@ -242,7 +242,7 @@ async def test_forced_summary_ignores_non_list_findings(monkeypatch):
         agent, "stream_llm_call", AsyncMock(return_value=('{"findings": "oops"}', 0))
     )
 
-    merged = await agent._run_forced_summary(list(existing))
+    merged, _floor = await agent._run_forced_summary(list(existing))
     assert merged == existing
 
 
