@@ -372,6 +372,30 @@ class TestForcedSummaryFloorEnforcement:
         assert len(findings) == 1
 
     @pytest.mark.asyncio
+    async def test_retry_round_exception_preserves_first_round_violated(self):
+        """首轮 0 候选 0 豁免（已算出 violated=True）后重试轮 LLM 调用抛异常：
+        floor_report 必须保留首轮 violated=True 并回写 data，不得被异常吞成 False
+        （LLM 不稳定时"首轮全空+重试失败"恰是覆盖不足的最差场景）。"""
+        agent = _make_agent()
+        call_count = {"i": 0}
+
+        async def _fake(messages, **kwargs):
+            call_count["i"] += 1
+            if call_count["i"] == 1:
+                return _summary_json(findings=[], summary="无"), 10
+            raise RuntimeError("重试轮 LLM 服务 500")
+
+        agent.stream_llm_call = _fake
+
+        findings, floor = await agent._run_forced_summary([])
+
+        assert call_count["i"] == 2, "首轮全空后必须恰好发起一次重试"
+        assert findings == []
+        assert floor["output_floor_violated"] is True, (
+            "重试轮异常不得吞掉首轮 violated 信号（data 会静默成 False）"
+        )
+
+    @pytest.mark.asyncio
     async def test_violated_first_round_emits_warning(self):
         """首轮违反下限 SHALL 发射 warning 事件（覆盖不足可观测）。"""
         agent = _make_agent()

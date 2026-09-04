@@ -875,6 +875,13 @@ class AnalysisAgent(BaseAgent):
                 len(round_findings), context="强制总结 Final Answer"
             )
             report = _build_output_floor_report(parsed_result)
+            # 首轮报告立即落地：后续重试轮若 LLM 调用异常（服务不稳定的最差场景），
+            # 首轮 violated=True 信号不得被 except 吞成默认 False（data 静默错报）；
+            # 重试成功后由下方重试合并结果覆盖
+            floor_report = {
+                "dimension_gaps_reported": report["dimension_gaps_reported"],
+                "output_floor_violated": report["output_floor_violated"],
+            }
 
             if report["output_floor_violated"]:
                 # 全空总结不静默通过：发 warning 可观测事件并重试一次
