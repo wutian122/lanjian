@@ -5,6 +5,7 @@
 > 排查结论：①R1 空响应=reasoning 吃光 max_tokens 预算（已由 32768 修复，护栏保留）；②R2 残余空响应=模型 reasoning 后自然停止零正文（finish_reason=stop、无截断、无服务端错误，纯模型行为）；③Orchestrator 空 name/空参数 tool_calls（模型退化，Task 7 自愈路径喂回后仍可能连续退化）；④10.129.2.101 服务端 mm 崩溃（32 Traceback）对应老板下午任务时段，触发器精确复现未完成、**服务端零操作**（老板指令），mm 触发器二分诊断挂起。
 
 ### Task 20: 空响应强化重试（reasoning-后-无正文 nudge）
+- [x] **Task 20 完成**（commit 30e06af，review CLEAN——tool_calls 轮豁免双重保险、判定链顺序正确（tool_calls→truncated→reasoning_only→other）、四接入点无漏接、上限轮不追加锁定、与 Task 2B 截断机制/Task 8 submit_findings 协同不冲突；3 Minor 记账：空列表归一注释、getattr 冗余防御、run 循环 mock 桩强度）
 - Files: `backend/app/services/agent/agents/base.py`（stream_llm_call 空响应判定处 :1330 附近）、`backend/app/services/agent/agents/{analysis,recon,verification}.py`（空响应重试提示词 :706-730/:955-959 等各处）
 - Interfaces: 空响应重试提示词升级——区分两种形态并分别 nudge：①finish_reason=stop 且正文空（"你上一轮只输出了思考没有给出行动，请直接输出 Action 或调用工具，不要重复思考"）；②finish_reason=length 且正文空（提示由 B 变更截断机制已有，此处补充"输出预算被思考耗尽，请精简思考"）。连续空响应达上限后的收口行为保持现状
 - TDD: 失败测试（mock 两种空响应形态 → 断言重试提示包含对应 nudge 文案且连续计数正确）→ 实现 → 通过 → commit
