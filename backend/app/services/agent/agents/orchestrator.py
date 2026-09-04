@@ -293,10 +293,11 @@ class OrchestratorAgent(BaseAgent):
         self.trace_manager = None
         if get_agent_config().audit_trace_enabled and task_id:
             from app.services.agent.audit_trace import AuditTraceManager
+            # Task 13：base_dir 不传，由 AuditTraceManager 默认读 settings.AUDIT_TRACE_DIR
+            # （env AUDIT_TRACE_DIR 覆盖；compose bind mount /app/audit_traces 持久化）。
             self.trace_manager = AuditTraceManager(
                 task_id=task_id,
                 project_name="unknown",  # 将在 run() 中更新
-                base_dir=get_agent_config().audit_trace_dir
             )
             logger.info(f"[{self.name}] 审计追踪已启用")
 

@@ -10,6 +10,7 @@ Task 13（sandbox-verification-hard-gate / Phase 4）: audit_trace 路径 env �
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,3 +90,22 @@ def test_writing_tool_call_creates_file_in_configured_dir(tmp_path, monkeypatch)
     assert "test_tool" in md_content
     # 文件位于 target/<task_id前8>/
     assert mgr.trace_md.parent.parent == Path(str(target))
+
+
+def test_orchestrator_trace_manager_uses_settings_audit_trace_dir(tmp_path, monkeypatch):
+    """生产路径闭合：OrchestratorAgent 创建 trace_manager 时必须消费 settings.AUDIT_TRACE_DIR，
+    而非 AgentConfig.audit_trace_dir（否则 compose 里的 AUDIT_TRACE_DIR env 是死配置）。"""
+    from app.services.agent.agents.orchestrator import OrchestratorAgent
+
+    target = tmp_path / "orch_traces"
+    monkeypatch.setattr(settings, "AUDIT_TRACE_DIR", str(target))
+
+    agent = OrchestratorAgent(
+        llm_service=SimpleNamespace(),
+        tools={},
+        task_id="orchtest0001",
+    )
+
+    assert agent.trace_manager is not None, "audit_trace_enabled 默认 True，task_id 存在时必须创建"
+    assert agent.trace_manager.base_dir == Path(str(target))
+    assert (Path(str(target)) / "orchtest").exists()
