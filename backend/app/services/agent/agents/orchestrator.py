@@ -26,6 +26,7 @@ from ..coverage import CoverageStatus, evaluate_coverage
 from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, MULTI_AGENT_RULES, build_enhanced_prompt
 from ..round_strategy import RoundContext
+from ..strict_finding import MIN_CANDIDATE_CONFIDENCE, MIN_CONFIDENCE_THRESHOLD
 from .base import AgentConfig, AgentPattern, AgentResult, AgentType, BaseAgent, TaskHandoff
 from app.services.agent.config import get_agent_config
 
@@ -2451,7 +2452,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
 当前已收集的发现数量: {len(self._all_findings)}
 注意：覆盖率门禁已自动放行，你可以直接 finish。
-"""
+{"（提示：低置信可疑点也应作为候选（needs_verification=true）计入产出并交沙箱验证，不要因为 Analysis 没有给出'确认漏洞'就反复重派——候选本身就是有效产出。）" if agent_name == "analysis" else ""}"""
 
         self._dispatched_tasks[agent_name] = dispatch_count + 1
 
@@ -3283,23 +3284,27 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 if resolved != file_path:
                     normalized["file_path"] = resolved
 
-        # ✅ FIX: Confidence 阈值过滤 (阈值=0.7)
+        # Confidence 阈值过滤：高置信阈值 0.7；分层候选（needs_verification=true
+        # 且 0.1 ≤ confidence < 0.7）豁免放行，交 Verification Agent 沙箱证实/证伪
+        # （spec finding-output-floor——低置信候选是沙箱验证的工作清单，不是误报）；
+        # confidence < 0.1 的无依据猜测仍丢弃。
         confidence = normalized.get("confidence", 0)
-        if isinstance(confidence, (int, float)) and confidence < 0.7:
+        if isinstance(confidence, (int, float)) and confidence < MIN_CONFIDENCE_THRESHOLD:
+            is_candidate = (
+                bool(normalized.get("needs_verification"))
+                and confidence >= MIN_CANDIDATE_CONFIDENCE
+            )
+            if not is_candidate:
+                logger.info(
+                    f"[Orchestrator] 🚫 低置信度过滤: confidence={confidence} < 0.7 "
+                    f"(title: {normalized.get('title', 'N/A')[:50]})"
+                )
+                return None
             logger.info(
-                f"[Orchestrator] 🚫 低置信度过滤: confidence={confidence} < 0.7 "
+                f"[Orchestrator] 📋 低置信候选放行: confidence={confidence} "
+                f"needs_verification=true，交沙箱验证 "
                 f"(title: {normalized.get('title', 'N/A')[:50]})"
             )
-            return None
-
-        # ✅ FIX: Confidence 阈值过滤 (阈值=0.7)
-        confidence = normalized.get("confidence", 0)
-        if isinstance(confidence, (int, float)) and confidence < 0.7:
-            logger.info(
-                f"[Orchestrator] 🚫 低置信度过滤: confidence={confidence} < 0.7 "
-                f"(title: {normalized.get('title', 'N/A')[:50]})"
-            )
-            return None
 
         return normalized
 

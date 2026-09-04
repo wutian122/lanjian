@@ -5,6 +5,23 @@ from typing import Any, Mapping
 # confidence 阈值：低于此值的发现视为低置信度，过滤掉
 MIN_CONFIDENCE_THRESHOLD: float = 0.7
 
+# 分层候选下界（spec finding-output-floor）：needs_verification=true 的候选
+# 在 [0.1, 0.7) 区间放行交沙箱证实/证伪；低于 0.1 视为无依据噪声仍丢弃
+MIN_CANDIDATE_CONFIDENCE: float = 0.1
+
+
+def _is_verification_candidate(finding: Mapping[str, Any], conf_value: float | None) -> bool:
+    """分层候选判定：显式 needs_verification 标记且置信度落在候选区间。
+
+    候选豁免 0.7 硬阈值（Analysis 分层候选制——低置信可疑点交沙箱验证，
+    而非在归一化/落库闸丢弃）；confidence < 0.1 的纯猜测不豁免。
+    """
+    if not finding.get("needs_verification"):
+        return False
+    if conf_value is None:
+        return False
+    return MIN_CANDIDATE_CONFIDENCE <= conf_value < MIN_CONFIDENCE_THRESHOLD
+
 
 def _to_int(value: Any) -> int | None:
     """REQ-TH-1: LLM 数值字段归一化——'113'/'113.0'/113 → int；None/''/非法 → None，不抛异常。
@@ -44,7 +61,9 @@ def is_strict_finding(finding: Mapping[str, Any]) -> bool:
     if not vuln_type:
         return False
 
-    # confidence 阈值过滤：低于 0.7 的发现不通过 strict 校验
+    # confidence 阈值过滤：低于 0.7 的发现不通过 strict 校验；
+    # 分层候选（needs_verification=true 且 0.1 ≤ confidence < 0.7）豁免，
+    # 交沙箱验证证实/证伪（spec finding-output-floor）；< 0.1 仍不通过
     confidence = finding.get("confidence")
     if confidence is None:
         confidence = finding.get("ai_confidence")
@@ -55,7 +74,8 @@ def is_strict_finding(finding: Mapping[str, Any]) -> bool:
         except (TypeError, ValueError):
             conf_value = None
         if conf_value is not None and conf_value < MIN_CONFIDENCE_THRESHOLD:
-            return False
+            if not _is_verification_candidate(finding, conf_value):
+                return False
 
     file_path = str(finding.get("file_path") or "").strip()
     line_start = _to_int(finding.get("line_start", 0)) or 0

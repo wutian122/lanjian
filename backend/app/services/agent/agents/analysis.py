@@ -197,6 +197,14 @@ Action Input: {"target_path": ".", "rules": "auto"}
 }
 ```
 
+### findings 字段语义（分层候选制，必须遵守）
+- **confidence**：你对该发现真实性的置信度 0.0-1.0。
+  - **≥ 0.7（高置信）**：你在实际读取的代码中看到了完整的污点链/危险模式，作为确认发现正常报告。
+  - **0.1-0.7（低置信可疑点）**：你在代码中实际看到了可疑模式但结论不确定（如"疑似可注入但被中间层部分缓解"）——**不要丢弃**，作为候选输出，confidence 如实填写并设 **needs_verification=true**。候选不是误报：未经验证的候选正是沙箱验证的工作清单，由 Verification Agent 在沙箱中证实或证伪。
+  - **< 0.1**：纯猜测、无代码依据，不得输出。
+- **needs_verification**：true 表示该发现需要沙箱动态验证。低置信候选必须为 true；高置信发现若可利用性未经动态验证也设 true。
+- **你不需要自行验证可利用性**：可利用性验证（PoC、沙箱复现）是 Verification Agent 的职责，不是你报告的前置条件。**不要因为"还没证明能利用"就放弃报告一个你在代码中实际看到的可疑模式**——把它作为候选交出去。
+
 ## 重点关注的漏洞类型
 - SQL 注入 (query, execute, raw SQL)
 - XSS (innerHTML, document.write, v-html)
@@ -208,7 +216,7 @@ Action Input: {"target_path": ".", "rules": "auto"}
 
 ## 重要原则
 1. **外部工具优先** - 首先使用 semgrep、bandit 等专业工具
-2. **质量优先** - 宁可深入分析几个真实漏洞，不要浅尝辄止报告大量误报
+2. **分层候选产出** - 高置信发现（confidence ≥ 0.7）正常报告；低置信可疑点（0.1-0.7）作为候选输出并标 needs_verification=true，由沙箱验证证实或证伪。候选不是误报——未经验证的候选正是沙箱验证的工作清单；宁可多交候选给沙箱验证，也不要把实际看到的可疑点埋没。只有 confidence < 0.1 的无依据猜测才不输出
 3. **上下文分析** - 看到可疑代码要读取上下文，理解完整逻辑
 4. **自主判断** - 不要机械相信工具输出，要用你的专业知识判断
 
@@ -219,7 +227,7 @@ Action Input: {"target_path": ".", "rules": "auto"}
 当你使用 `get_vulnerability_knowledge` 或 `query_security_knowledge` 时：
 1. **知识示例 ≠ 项目代码** - 知识库的代码示例是通用示例，不是目标项目的代码
 2. **语言可能不匹配** - 知识库可能返回 Python 示例，但项目可能是 PHP/Rust/Go
-3. **必须在实际代码中验证** - 你只能报告你在 read_file 中**实际看到**的漏洞
+3. **必须在实际代码中验证** - 你只能报告你在 read_file 中**实际看到**的漏洞模式。高置信发现和低置信候选都必须满足此约束：候选允许结论不确定（疑似、待沙箱证实），但不允许没有代码依据——候选的 file_path/code_snippet 同样必须来自你实际读取过的文件
 4. **禁止推测** - 不要因为知识库说"这种模式常见"就假设项目中存在
 
 ❌ 错误做法（幻觉来源）：
@@ -269,7 +277,7 @@ SUBMIT_FINDINGS_PROTOCOL_NOTE = """【工具协议说明】函数调用工具的
 当前环境支持函数调用（工具），但只有一个函数工具 submit_findings，专门用于提交最终漏洞报告：
 1. 日常工作工具仍走文本格式：semgrep_scan、bandit_scan、gitleaks_scan、read_file、search_code 等分析操作，必须继续按文本协议输出 "Action: <工具名>" 和 "Action Input: <JSON 参数>"，不要尝试调用不存在的函数；
 2. submit_findings 仅用于提交最终报告：禁止在完成安全扫描并用 read_file 实际阅读代码之前调用它——没有实际工具调用的分析无效，凭推测提交的漏洞属于幻觉；
-3. 完成审计后调用 submit_findings 提交报告；确认没有漏洞时，findings 传空数组，并在 summary 中说明分析过程与观察到的风险点。"""
+3. 完成审计后调用 submit_findings 提交报告。findings 数组可同时包含高置信发现与低置信候选：confidence 0.1-0.7 的可疑点必须照常提交并设 needs_verification=true（候选不是误报，是交沙箱验证证实/证伪的工作清单，不要因为结论不确定就漏报）；确认没有漏洞时，findings 传空数组，并在 summary 中说明分析过程与观察到的风险点。"""
 
 
 @dataclass
@@ -592,6 +600,12 @@ class AnalysisAgent(BaseAgent):
 
 即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
 
+## 产出下限（必须遵守）
+对你尚未充分覆盖的每个漏洞维度（SQL 注入、认证/授权绕过、XSS、命令注入、路径遍历、SSRF、反序列化、XXE、硬编码密钥、弱加密、竞态条件等），你必须二选一：
+1. **输出候选发现**：只要你在实际读取的代码中看到过可疑模式，即使结论不确定（疑似可利用但被中间层部分缓解等），也输出为候选——confidence 如实填 0.1-0.7 并设 needs_verification=true，交由沙箱验证证实或证伪。候选不是误报，不要埋没实际看到的可疑点；
+2. **书面豁免**：该维度在本项目确实不适用时，在 summary 中明确写出豁免理由（如"本项目为纯静态前端，无 SQL 查询入口"）。
+不允许对未覆盖维度既不给候选也不给豁免——0 候选且 0 豁免的总结视为无效产出。
+
 请按以下 JSON 格式输出：
 ```json
 {
@@ -601,13 +615,15 @@ class AnalysisAgent(BaseAgent):
             "severity": "critical|high|medium|low",
             "title": "漏洞标题",
             "description": "详细描述",
-            "file_path": "文件路径",
+            "file_path": "文件路径（必须是实际读取过的文件）",
             "line_start": 行号,
             "code_snippet": "相关代码片段",
-            "suggestion": "修复建议"
+            "suggestion": "修复建议",
+            "confidence": 0.5,
+            "needs_verification": true
         }
     ],
-    "summary": "分析总结"
+    "summary": "分析总结（含各未覆盖维度的书面豁免理由）"
 }
 ```
 

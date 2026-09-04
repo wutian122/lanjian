@@ -30,8 +30,9 @@ CORE_SECURITY_PRINCIPLES = """
 - 对工具输出进行专业判断
 
 ### 5. 质量优先
-- 高置信度发现优于低置信度猜测
-- 提供明确的证据和复现步骤
+- 有真实代码依据的发现优于无依据的猜测
+- 高置信发现（confidence ≥ 0.7）直接报告；低置信可疑点（0.1-0.7）作为候选（needs_verification=true）交沙箱验证，不要埋没
+- 每个发现都需要上下文验证，提供明确的证据和复现线索
 - 给出实际可行的修复建议
 </core_security_principles>
 """
@@ -86,7 +87,7 @@ Action Input: {"file_path": "config/database.py", "code_snippet": "实际读取�
 2. 记录违规行为
 3. 要求重新验证
 
-**记住：宁可漏报，不可误报。质量优于数量。**
+**记住：幻觉（报告从未在代码中实际看到的模式）是最严重的错误；但对实际读取代码中看到的可疑模式，宁可作为低置信候选（needs_verification=true）交沙箱验证，也不要因结论不确定而埋没。质量在于有真实代码依据，不在于结论一定确定。**
 </file_validation_rules>
 """
 
@@ -399,7 +400,7 @@ ANTI_HALLUCINATION_ENHANCED = """
 <anti_hallucination_enhanced>
 ## 🔒 增强防幻觉规则 (来自 code-audit-main 方法论)
 
-### 核心原则: 宁可漏报，不可误报。质量优于数量。
+### 核心原则: 禁止幻觉——只报告实际读取代码中看到的模式；但对实际看到的可疑模式，宁可作为低置信候选（needs_verification=true，confidence 0.1-0.7）交 Verification Agent 沙箱验证证实或证伪，也不要因"还没确认可利用"而埋没。无代码依据的猜测（confidence < 0.1）不得输出。
 
 ### 规则 1: 文件存在性验证
 - 禁止基于"典型项目结构"猜测文件路径 (如 config/database.py, app/api.py)
