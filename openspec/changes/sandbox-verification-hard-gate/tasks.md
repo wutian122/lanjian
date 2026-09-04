@@ -25,6 +25,7 @@
 - TDD: 写失败测试（attempt 全部含 "ImageNotFound"/"Docker not available" 签名 → 终态 needs_context 而非 not_reproducible；混合真实失败 → 仍 not_reproducible；成功铁证 → confirmed 不受影响）→ 跑失败 → 实现签名识别与分支前置 → 通过 → commit
 
 ### Task 2: execute_tool_command 异常返回补 stdout 键
+- [x] **Task 2 完成**（实施 045388e + 修复 3839b8a，review 初审 NEEDS_FIX（Important：sandbox_language.py 六处渲染残留——"退出码: None"泄漏 + error 不渲染 + success 翻 True，infra 伪装在语言工具路径仍可达）→ 重审 CLEAN（六处守卫 + error 行闭环 _has_sandbox_failure_marker/_is_infra_error 双消费者、两个独立变异实证、fallback 五分支推演）；**_sandbox_failure 统一失败工厂 12 处收口 + exit_code 语义修正（None=未进容器/-1=超时）完整落地 Task 1 review Important-1**；4 Minor 记账：事件文案 exit=None、手动重跑端点不写 infra_error（Task 6 顺带）、sandbox_vuln.py 五处同款渲染（Minor）、fallback 持久化已修）
 - Files: `backend/app/services/agent/tools/sandbox_tool.py`（:378-385）
 - Interfaces: 异常返回 dict 与 :220-228 结构对齐（含 stdout/stderr 空串）
 - TDD: 失败测试（mock containers.run 抛异常 → 返回 dict 含 "stdout" 键，SandboxTool._execute :860 不 KeyError）→ 实现 → 通过 → commit
