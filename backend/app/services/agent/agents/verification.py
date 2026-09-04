@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
 from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, build_enhanced_prompt
+from app.core.config import settings
 from app.models.agent_task import VerificationStatus
 from app.services.agent.strict_finding import is_strict_finding, _to_int, _to_float
 
@@ -1707,6 +1708,8 @@ class VerificationAgent(BaseAgent):
                             command=fallback_cmd.get("command", ""),
                             host_project_dir=sandbox_project_root,
                             timeout=fallback_cmd.get("timeout", 60),
+                            # Task 3：兜底入口与确定性路径同一映射，network_enabled 不丢弃
+                            network_mode=self._network_mode_for_command(fallback_cmd),
                         )
                         result = self._format_sandbox_result(result_dict)
                     else:
@@ -2770,6 +2773,21 @@ class VerificationAgent(BaseAgent):
                 return tool.sandbox_manager
         return None
 
+    @staticmethod
+    def _network_mode_for_command(cmd_input: Optional[Dict[str, Any]]) -> str:
+        """确定性 PoC 的网络模式映射（Task 3）。
+
+        模板显式请求网络（network_enabled=True，如 SSRF metadata 探测）**且**
+        全局沙箱联网开关（SANDBOX_NETWORK_ENABLED，环境变量配置）开启时才给
+        "bridge"；其余一律显式 "none"。
+
+        必须显式传值：execute_with_files 的 network_mode 形参虽默认 "none"，
+        但传 None 会透传到 Docker SDK 并被当作"默认网络"（bridge）处理，反而开网。
+        """
+        if (cmd_input or {}).get("network_enabled") and settings.SANDBOX_NETWORK_ENABLED:
+            return "bridge"
+        return "none"
+
     async def _run_deterministic_sandbox_commands(
         self, sandbox_commands: List[Dict], sandbox_project_root: Optional[str]
     ) -> None:
@@ -2804,6 +2822,9 @@ class VerificationAgent(BaseAgent):
                         command=command,
                         host_project_dir=sandbox_project_root,
                         timeout=timeout,
+                        # Task 3：模板 network_enabled 必须映射为容器 network_mode，
+                        # 否则 SSRF metadata 探测永远落 none 被 blocked
+                        network_mode=self._network_mode_for_command(cmd_input),
                     )
                     result = self._format_sandbox_result(result_dict)
                     exit_code = (

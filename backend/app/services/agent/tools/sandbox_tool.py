@@ -825,7 +825,14 @@ class SandboxTool(AgentTool):
             else None
         )
         needs_project_mount = self._command_needs_project_mount(command)
-        network_mode = "bridge" if network_enabled else "none"
+        # Task 3：网络双门禁——LLM 的 network_enabled=true 仅在管理员全局开关
+        # （SANDBOX_NETWORK_ENABLED → SandboxConfig.network_enabled）开启时才给
+        # bridge，防止模型自授网络绕过 kill-switch；读不到配置时安全侧落 false。
+        network_allowed = bool(
+            getattr(getattr(self.sandbox_manager, "config", None), "network_enabled", False)
+        )
+        network_active = bool(network_enabled) and network_allowed
+        network_mode = "bridge" if network_active else "none"
 
         if effective_workdir and needs_project_mount:
             result = await self.sandbox_manager.execute_tool_command(
@@ -844,7 +851,7 @@ class SandboxTool(AgentTool):
         # 格式化输出
         output_parts = ["🐳 沙箱执行结果\n"]
         output_parts.append(f"命令: {command}")
-        output_parts.append(f"网络模式: {'bridge (允许网络)' if network_enabled else 'none (隔离)'}")
+        output_parts.append(f"网络模式: {'bridge (允许网络)' if network_active else 'none (隔离)'}")
         # exit_code=None 表示命令未进容器（Docker 不可用/容器创建失败/daemon 中断）：
         # 不渲染退出码行——下游 _record_sandbox_attempt 以"退出码: N"存在与否判
         # ran_in_container，渲染 -1 会把 infra 失败误判为"容器内执行过"，抑制
@@ -868,7 +875,7 @@ class SandboxTool(AgentTool):
             metadata={
                 "command": command,
                 "exit_code": result["exit_code"],
-                "network_mode": "bridge" if network_enabled else "none",
+                "network_mode": network_mode,
                 "timeout": timeout,
                 "stdout_summary": (result.get("stdout") or "")[:2000],
                 "stderr_summary": (result.get("stderr") or "")[:1000],
