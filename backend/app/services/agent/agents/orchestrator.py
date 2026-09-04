@@ -1191,6 +1191,41 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     "content": history_content,
                 })
 
+                # sandbox-verification-hard-gate Task 21：无效 tool_calls 强 nudge 自愈。
+                # R2 实测模型退化三形态（空 name/dispatch_agent 空参/坏 JSON）下，泛化
+                # "未知操作"提示强度不足、喂回后模型继续退化；分发前分类拦截，喂
+                # schema 重喂 observation（照常走 llm_observation 事件，前端可见），
+                # 连续 ≥2 次追加协议降级引导（文本解析路径保留可承接）。
+                # _invalid_tool_calls_count 为连续计数，与 _empty_retry_count（空响应）
+                # 相互独立：空响应轮在此之前 continue，互不触碰。
+                if tool_calls_this_round:
+                    invalid_kind = self._classify_invalid_tool_call(tool_calls_this_round, step)
+                    if invalid_kind is not None:
+                        invalid_count = getattr(self, "_invalid_tool_calls_count", 0) + 1
+                        self._invalid_tool_calls_count = invalid_count
+                        observation = self._invalid_tool_call_nudge(invalid_kind, invalid_count)
+                        step.observation = observation
+                        logger.warning(
+                            f"[{self.name}] 无效 tool_calls（连续第 {invalid_count} 次）: {invalid_kind}"
+                        )
+                        await self.emit_llm_decision(
+                            "工具调用无效",
+                            {
+                                "missing_name": "函数名缺失",
+                                "unknown_name": "函数名未知",
+                                "empty_dispatch_args": "dispatch_agent 参数缺失",
+                                "bad_json": "参数 JSON 非法",
+                            }[invalid_kind],
+                        )
+                        await self.emit_llm_observation(observation)
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": f"Observation:\n{observation}",
+                        })
+                        continue
+                # 有效决策轮（tool_calls 合法或文本协议解析成功）复位连续无效计数
+                self._invalid_tool_calls_count = 0
+
                 # 执行 LLM 决定的操作
                 if step.action == "finish":
                     # 🔥 弹性终止门禁：三层门禁保障审计质量
@@ -1549,6 +1584,10 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                 else:
                     observation = f"未知操作: {step.action}，可用操作: dispatch_agent, summarize, finish"
+                    # Task 21：observation 必须回写 step——否则循环末尾入历史的是
+                    # "Observation:\nNone"，自愈提示实际未喂回模型（tool_calls 形态的
+                    # 同类问题已由分发前拦截块承接，此分支服务文本协议未知 Action）
+                    step.observation = observation
                     await self.emit_llm_decision("未知操作", observation)
 
                 # 添加观察结果到历史
@@ -2125,6 +2164,11 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
     # 直接映射到现有 action 分发；文本协议（Thought:/Action:/Action Input:）路径
     # 原样保留（降级共存，spec llm-structured-output 第三 Requirement）。
 
+    # Task 21：tools 协议合法动作与 dispatch_agent 合法 agent 枚举
+    # （与 _build_orchestrator_tool_defs 的三函数 schema 保持一致）
+    _ORCH_TOOL_ACTIONS = ("dispatch_agent", "summarize", "finish")
+    _DISPATCH_AGENT_NAMES = ("recon", "analysis", "verification")
+
     def _build_orchestrator_tool_defs(self) -> list[dict[str, Any]]:
         """调度轮 OpenAI tools 定义：三函数与文本协议 Action 一一对应。
 
@@ -2190,9 +2234,10 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         """tool_calls 响应映射为 AgentStep（与文本协议 _parse_llm_response 对等）。
 
         取第一个工具调用：function.name → action，function.arguments（JSON 字符串）
-        → action_input。tool_calls 形态由服务端 tool-call-parser 保证合法，因此
-        不走文本格式错误重试计数；非法 JSON/未知函数名不抛错——空参数或原名
-        进入现有分发分支（"未知操作"/参数缺失观察喂回模型自愈）。
+        → action_input。tool_calls 形态由服务端 tool-call-parser 保证结构合法，因此
+        不走文本格式错误重试计数；映射本身不抛错（非法 JSON/非对象参数降级为空
+        dict、空/未知函数名原样保留），无效形态的分类与强 nudge 自愈由主循环
+        Task 21 拦截块（_classify_invalid_tool_call）在分发前统一处理。
         """
         if not tool_calls:
             return None
@@ -2211,6 +2256,78 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         else:
             parsed = {}
         return AgentStep(thought="", action=action, action_input=parsed)
+
+    # ============ 无效 tool_calls 强 nudge 自愈（sandbox-verification-hard-gate Task 21）============
+
+    def _classify_invalid_tool_call(
+        self, tool_calls: list[dict[str, Any]] | None, step: AgentStep
+    ) -> str | None:
+        """判定 tool_calls 响应是否为模型退化无效形态（Task 21）。
+
+        返回 None（合法，进入正常分发）或分类码：
+        - "bad_json"：arguments 为非空字符串但不是合法 JSON 对象——输出损坏，
+          坏 JSON 优先判定（参数已不可读，下游参数校验无意义）；
+        - "missing_name"：函数名为空/缺失（R2 实测形态①）；
+        - "unknown_name"：函数名不在 dispatch_agent/summarize/finish 集合；
+        - "empty_dispatch_args"：dispatch_agent 的 agent 缺失/空/不在枚举，
+          或 task 缺失/空白（R2 实测形态②，现状会真实调度一次空任务）。
+        agent 枚举比对大小写不敏感，与 _dispatch_agent 的 lower 匹配一致。
+        """
+        call = (tool_calls or [{}])[0] or {}
+        arguments = call.get("arguments")
+        if isinstance(arguments, str) and arguments.strip():
+            try:
+                reparsed = json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                return "bad_json"
+            if not isinstance(reparsed, dict):
+                return "bad_json"
+
+        action = (step.action or "").strip()
+        if not action:
+            return "missing_name"
+        if action not in self._ORCH_TOOL_ACTIONS:
+            return "unknown_name"
+        if action == "dispatch_agent":
+            params = step.action_input if isinstance(step.action_input, dict) else {}
+            agent_name = str(params.get("agent") or "").strip().lower()
+            task = params.get("task")
+            if (
+                agent_name not in self._DISPATCH_AGENT_NAMES
+                or not isinstance(task, str)
+                or not task.strip()
+            ):
+                return "empty_dispatch_args"
+        return None
+
+    def _invalid_tool_call_nudge(self, kind: str, count: int) -> str:
+        """按无效分类返回强 nudge observation；连续 ≥2 次追加协议降级引导（Task 21）。
+
+        降级引导模型改用 Thought:/Action:/Action Input: 文本格式——文本解析
+        路径（_parse_llm_response）原样保留，降级后的文本响应可直接承接。
+        """
+        if kind in ("missing_name", "unknown_name"):
+            observation = (
+                "【系统提示：工具调用缺少有效的函数名。请重新输出，可用操作与参数 schema："
+                "dispatch_agent(agent: 'recon'|'analysis'|'verification', task: str, context: str)、"
+                "summarize()、finish()。注意 agent 与 task 参数必须非空。】"
+            )
+        elif kind == "empty_dispatch_args":
+            observation = (
+                "【系统提示：dispatch_agent 的 agent 参数缺失或无效，"
+                "必须为 recon/analysis/verification 之一；task 必须为非空的具体任务描述。"
+                "请重新调用。】"
+            )
+        else:  # bad_json
+            observation = "【系统提示：工具调用参数不是合法 JSON，请重新输出完整参数。】"
+
+        if count >= 2:
+            observation += (
+                f"\n【系统提示：已连续 {count} 次工具调用无效。"
+                "请改用文本格式输出：Thought: ... / Action: dispatch_agent 或 finish / "
+                "Action Input: {...}】"
+            )
+        return observation
 
     async def _dispatch_agent(self, params: dict[str, Any]) -> str:
         """调度子 Agent（支持单个和批量并行）"""
