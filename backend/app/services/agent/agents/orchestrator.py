@@ -2647,18 +2647,29 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
     # 验证完整结论见 audit_trace 文件，由 API audit_trace_path 字段提供入口）。
     def _trace_summary_raw(self) -> str | None:
         """读取 trace 生成摘要（截断 2000 字符）。trace 关闭或首轮空壳（0 调度
-        0 事件）返回 None；读取/生成异常上抛，由调用方按场景兜底。"""
+        0 事件 0 门禁裁决）返回 None；读取/生成异常上抛，由调用方按场景兜底。"""
         tm = getattr(self, "trace_manager", None)
         if tm is None:
             return None
         stats = getattr(tm, "stats", {}) or {}
         entries = getattr(tm, "entries", []) or []
-        # 首轮（尚无任何调度/事件）注入空壳摘要只是噪声，跳过。
-        if not entries and stats.get("agents_dispatched", 0) == 0:
+        gates = getattr(self, "_gate_observations", []) or []
+        # 首轮（尚无任何调度/事件/门禁裁决）注入空壳摘要只是噪声，跳过。
+        if not entries and stats.get("agents_dispatched", 0) == 0 and not gates:
             return None
         summary = tm.get_summary_for_agent()
         if not summary or not summary.strip():
             return None
+        # I1（review 第 1 轮）：spec 要求摘要含"关键门禁裁决"——追加最近 5 条
+        # 门禁裁决（gate_release/output_floor/dispatch_budget/semgrep_fallback 等），
+        # 这是后续轮避免重复调度最该看到的决策信息；空列表省略该段。主循环注入与
+        # 子 Agent 传递同走本方法，一处修复两处生效。
+        if gates:
+            summary += "\n## 关键门禁裁决\n"
+            for obs in gates[-5:]:
+                gate = str(obs.get("gate", "?"))
+                reason = str(obs.get("reason", "")).replace("\n", " ")[:120]
+                summary += f"- [{gate}] {reason}\n"
         return summary[:2000]
 
     def _build_trace_summary(self) -> str | None:

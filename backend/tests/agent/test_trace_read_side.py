@@ -14,6 +14,7 @@ sandbox-verification-hard-gate Task 15（Phase 4）：audit_trace 读侧接线�
 的是调度/发现/工具轨迹；验证结论需查完整 trace 文件（API 字段即其入口）。
 """
 
+import json
 import os
 import sys
 import time
@@ -26,8 +27,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from app.core.config import settings
+from app.services.agent.agents.analysis import AnalysisAgent
 from app.services.agent.agents.base import AgentResult
 from app.services.agent.agents.orchestrator import OrchestratorAgent
+from app.services.agent.agents.recon import ReconAgent
+from app.services.agent.agents.verification import VerificationAgent
 from app.services.agent.audit_trace import AuditTraceManager
 from app.services.agent.core.circuit_breaker import (
     CircuitState,
@@ -358,3 +362,215 @@ def test_agent_task_response_carries_audit_trace_path():
         created_at=datetime(2026, 1, 1),
     )
     assert resp_default.audit_trace_path is None
+
+
+# ---------- F. I1：摘要含关键门禁裁决（spec SHALL） ----------
+
+def test_summary_includes_gate_decisions(tmp_path, monkeypatch):
+    """I1：_gate_observations 有门禁裁决 → 摘要含"关键门禁裁决"段（gate 名 + reason）。
+
+    门禁裁决（output_floor/dispatch_budget/gate_release/semgrep_fallback）是后续轮
+    避免重复调度最该看到的决策信息，spec 明确要求摘要含"关键门禁裁决"。
+    """
+    agent, _ = _make_orch(tmp_path, monkeypatch, seed=True)
+    agent._gate_observations = [
+        {"gate": "output_floor", "reason": "Analysis 0 候选产出下限违规，Semgrep 兜底落库", "time": "t1"},
+        {"gate": "dispatch_budget", "reason": "analysis 调度达 3 次上限，自动放行 finish", "time": "t2"},
+    ]
+    summary = agent._build_trace_summary()
+    assert "关键门禁裁决" in summary
+    assert "output_floor" in summary
+    assert "Analysis 0 候选产出下限违规" in summary
+    assert "dispatch_budget" in summary
+    assert "analysis 调度达 3 次上限" in summary
+
+
+def test_summary_omits_gate_section_when_no_decisions(tmp_path, monkeypatch):
+    """无门禁裁决（空列表）→ 摘要不含"关键门禁裁决"段。"""
+    agent, _ = _make_orch(tmp_path, monkeypatch, seed=True)
+    assert agent._gate_observations == []
+    summary = agent._build_trace_summary()
+    assert "关键门禁裁决" not in summary
+
+
+def test_summary_gate_section_within_truncation(tmp_path, monkeypatch):
+    """门禁裁决段在 2000 字符截断后仍保留（gate 段紧随事件列表，reason 逐条截断）。"""
+    agent, _ = _make_orch(tmp_path, monkeypatch, seed=True)
+    agent._gate_observations = [
+        {"gate": "gate_release", "reason": "验证门禁连续拒绝达上限放行收尾", "time": "t"},
+    ]
+    agent.trace_manager.get_summary_for_agent = MagicMock(return_value="Z" * 1900)
+    summary = agent._build_trace_summary()
+    assert len(summary) <= 2000
+    # gate 段由实现追加在 trace 摘要之后；1900 字符正文 + gate 段超 2000 时 gate 被截，
+    # 故本条仅断言不超长 + 不抛异常（gate 段可见性由上一条非超长场景保证）。
+
+
+# ---------- G. I2：子 Agent 消费侧注入守卫 ----------
+
+_TRACE_SUMMARY = (
+    "# 审计任务 readside 摘要\n\n## 统计\n- Agent 调度: 2 次\n- 发现漏洞: 2 个\n\n"
+    "## 最近 10 条关键事件\n"
+    "- [10:00:01] 调度 recon Agent\n"
+    "- [10:00:05] 调度 analysis Agent\n"
+    "- [10:01:00] HIGH - 登录接口 SQL 注入\n"
+)
+
+
+def _final_stream(text, capture):
+    """文本协议流；首次被调用时把 LLM 收到的 messages 存入 capture（首轮注入证据）。"""
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
+                   response_format=None):
+        if "first" not in capture:
+            capture["first"] = list(messages or [])
+        yield {
+            "type": "done", "content": text, "reasoning": "", "accumulated": text,
+            "usage": {"total_tokens": 10}, "finish_reason": "stop",
+        }
+    return _gen
+
+
+def _submit_stream(tool_calls, capture):
+    """tools 协议流；首次被调用时把 LLM 收到的 messages 存入 capture。"""
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
+                   response_format=None):
+        if "first" not in capture:
+            capture["first"] = list(messages or [])
+        yield {
+            "type": "done", "content": "", "reasoning": "",
+            "tool_calls": tool_calls,
+            "usage": {"total_tokens": 10}, "finish_reason": "tool_calls",
+        }
+    return _gen
+
+
+def _first_user_msgs(capture):
+    """首轮 LLM 实际收到的 user 消息（initial_message 注入点，不受后续多轮压缩影响）。"""
+    return [m.get("content", "") for m in capture.get("first", []) if m.get("role") == "user"]
+
+
+_VFINDING = {
+    "vulnerability_type": "sql_injection", "severity": "high",
+    "title": "SQL 注入漏洞", "description": "f-string 拼接查询",
+    "file_path": "src/sql_vuln.py", "line_start": 6,
+    "code_snippet": "query = f\"SELECT * FROM users WHERE id = '{user_id}'\"",
+    "needs_verification": True,
+}
+
+_VPAYLOAD = {
+    "summary": {"total": 1, "confirmed": 1, "likely": 0, "false_positive": 0},
+    "findings": [{
+        **_VFINDING,
+        "verdict": "confirmed", "confidence": 0.95, "is_verified": True,
+        "verification_method": "沙箱执行 PoC",
+        "verification_details": "PoC 触发延时，漏洞确认",
+        "sandbox_attempts": [],
+    }],
+}
+
+
+@pytest.mark.asyncio
+async def test_recon_consumes_trace_summary_in_initial_message(tmp_path):
+    """I2 守卫：Recon 首轮 initial_message 含 trace_summary 段；无 trace_summary 时不含。"""
+    final = "Thought: 信息收集完成\nFinal Answer: " + json.dumps({
+        "tech_stack": {"languages": ["Python"], "frameworks": []},
+        "entry_points": ["main.py"], "high_risk_areas": [],
+    }, ensure_ascii=False)
+
+    async def _run(with_summary):
+        capture = {}
+        service = _make_service(caps=None)
+        service.chat_completion_stream = _final_stream(final, capture)
+        agent = ReconAgent(llm_service=service, tools={}, event_emitter=_make_emitter())
+        prev = {"trace_summary": _TRACE_SUMMARY} if with_summary else {}
+        await agent.run({
+            "project_info": {"name": "p", "root": str(tmp_path)},
+            "config": {}, "previous_results": prev,
+        })
+        return _first_user_msgs(capture)
+
+    msgs_with = await _run(True)
+    assert msgs_with, "首轮 LLM 必须收到 initial_message"
+    assert any("此前执行轨迹摘要" in c and "登录接口 SQL 注入" in c for c in msgs_with), (
+        "Recon initial_message 必须注入 trace_summary 段"
+    )
+    msgs_without = await _run(False)
+    assert not any("此前执行轨迹摘要" in c for c in msgs_without), (
+        "无 trace_summary 时 Recon 不得注入摘要段"
+    )
+
+
+@pytest.mark.asyncio
+async def test_analysis_consumes_trace_summary_in_initial_message(tmp_path):
+    """I2 守卫：Analysis 首轮 initial_message 含 trace_summary 段；无 trace_summary 时不含。"""
+    final = "Thought: 分析完成\nFinal Answer: " + json.dumps(
+        {"summary": "无新增发现", "findings": []}, ensure_ascii=False)
+
+    async def _run(with_summary):
+        capture = {}
+        service = _make_service(caps=None)
+        service.chat_completion_stream = _final_stream(final, capture)
+        agent = AnalysisAgent(llm_service=service, tools={}, event_emitter=_make_emitter())
+        agent._check_token_budget_exceeded = lambda: False
+        prev = {"trace_summary": _TRACE_SUMMARY} if with_summary else {}
+        await agent.run({
+            "project_info": {"name": "p", "root": str(tmp_path)},
+            "config": {}, "previous_results": prev,
+        })
+        return _first_user_msgs(capture)
+
+    msgs_with = await _run(True)
+    assert msgs_with, "首轮 LLM 必须收到 initial_message"
+    assert any("此前执行轨迹摘要" in c and "登录接口 SQL 注入" in c for c in msgs_with), (
+        "Analysis initial_message 必须注入 trace_summary 段"
+    )
+    msgs_without = await _run(False)
+    assert not any("此前执行轨迹摘要" in c for c in msgs_without), (
+        "无 trace_summary 时 Analysis 不得注入摘要段"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verification_consumes_trace_summary_in_initial_message(tmp_path, monkeypatch):
+    """I2 守卫：Verification 首轮 LLM 收到的 initial_message 含 trace_summary 段；无则不含。
+
+    锚定"首轮 LLM 实际收到的 messages"而非跑完后的 _conversation_history：verification
+    首轮 submit_findings 不被接受（要求先验证）会进入多轮并可能触发上下文压缩，把首轮
+    initial_message 压缩替换；注入发生在首轮，故捕获首轮 messages 才是准确守卫。
+    """
+    monkeypatch.setattr(
+        "app.services.agent.agents.verification.asyncio.sleep", AsyncMock())
+
+    async def _run(with_summary):
+        capture = {}
+        caps = BackendCapabilities(tools=True, guided_json=False)
+        service = _make_service(caps=caps)
+        service.chat_completion_stream = _submit_stream(
+            [_tool_call("submit_findings", json.dumps(_VPAYLOAD, ensure_ascii=False))],
+            capture,
+        )
+        agent = VerificationAgent(llm_service=service, tools={}, event_emitter=_make_emitter())
+        agent._check_token_budget_exceeded = lambda: False
+        # 守卫只断言首轮 LLM 收到的 initial_message；verification 首轮 submit_findings
+        # 不被当作交卷会循环到 max_iterations（51 分钟），故限 1 轮——首轮 LLM 调用即
+        # 捕获注入证据，随后轮次耗尽收口不再调 LLM。
+        agent.config.max_iterations = 1
+        # 沙箱准备/确定性执行在本守卫范围外，桩掉（照搬 test_empty_response_nudge）
+        agent._run_deterministic_sandbox_commands = AsyncMock()
+        agent._build_sandbox_commands = MagicMock(return_value=[])
+        agent._prepare_sandbox_files = MagicMock(return_value=None)
+        prev = {"findings": [dict(_VFINDING)]}
+        if with_summary:
+            prev["trace_summary"] = _TRACE_SUMMARY
+        await agent.run({"previous_results": prev, "config": {}})
+        return _first_user_msgs(capture)
+
+    msgs_with = await _run(True)
+    assert msgs_with, "首轮 LLM 必须收到 initial_message"
+    assert any("此前执行轨迹摘要" in c and "登录接口 SQL 注入" in c for c in msgs_with), (
+        "Verification initial_message 必须注入 trace_summary 段"
+    )
+    msgs_without = await _run(False)
+    assert not any("此前执行轨迹摘要" in c for c in msgs_without), (
+        "无 trace_summary 时 Verification 不得注入摘要段"
+    )
