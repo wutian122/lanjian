@@ -2,7 +2,7 @@
  * Agent 运行预算表单逻辑（sandbox-verification-hard-gate Task 16）
  *
  * 与后端 AgentTaskCreate 约束对齐（backend/app/api/v1/endpoints/agent_tasks.py）：
- * - timeout_seconds: ge=60 le=7200，None 时回退全局 Agent 超时配置（7200s）
+ * - timeout_seconds: ge=60 le=7200，None 时回退全局 Agent 超时配置（llmConfig.agentTimeout，默认 1800s）
  * - max_iterations: ge=1 le=200，后端默认 50
  *
  * 默认值语义裁决：表单留空 = 不传字段，保留 Task 1 "NULL 回退全局配置"语义；

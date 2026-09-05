@@ -2,8 +2,8 @@
  * Agent 运行预算表单字段（Task 16）
  *
  * 两处创建对话框（agent/CreateAgentTaskDialog、audit/CreateTaskDialog 的 agent
- * 模式）高级选项区共用。留空 = 不传字段（超时走全局 7200s、迭代走后端默认 50），
- * 校验逻辑见 shared/utils/budgetConfig.ts。
+ * 模式）高级选项区共用。留空 = 不传字段（超时回退全局 llmConfig.agentTimeout，默认 1800s；
+ * 迭代走后端默认 50），校验逻辑见 shared/utils/budgetConfig.ts。
  */
 import { Timer, Repeat } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -44,7 +44,7 @@ export function BudgetConfigFields({
             step={1}
             value={timeoutMinutes}
             onChange={(e) => onTimeoutMinutesChange(e.target.value)}
-            placeholder={`默认 ${t.default}（全局配置）`}
+            placeholder="留空使用全局超时配置"
             className="h-8 text-sm"
           />
           <p className="text-[11px] text-muted-foreground">

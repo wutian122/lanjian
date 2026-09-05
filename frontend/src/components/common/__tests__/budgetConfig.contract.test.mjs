@@ -8,8 +8,8 @@
  * 覆盖 openspec 变更 sandbox-verification-hard-gate Task 16：
  * - 两处创建对话框（agent/CreateAgentTaskDialog、audit/CreateTaskDialog）
  *   高级选项区提供"超时时间（分钟）/最大迭代次数"入口
- * - 默认值语义裁决：留空不传字段（timeout_seconds 走全局 7200s、max_iterations
- *   走后端默认 50），仅用户显式修改才传——保留 Task 1 "NULL 回退全局"语义
+ * - 默认值语义裁决：留空不传字段（timeout_seconds 走全局 llmConfig.agentTimeout，默认 1800s；
+ *   max_iterations 走后端默认 50），仅用户显式修改才传——保留 Task 1 "NULL 回退全局"语义
  * - 范围校验与后端 AgentTaskCreate 约束对齐（timeout_seconds ge=60 le=7200
  *   → 分钟 1-120；max_iterations ge=1 le=200），范围外提交前端拦截
  * - Task 8 review M2 承接：VerificationResult 类型补 sandbox_skip_reason，
@@ -50,7 +50,7 @@ const buildBudgetPayload = budgetMod?.buildBudgetPayload;
 const BUDGET_LIMITS = budgetMod?.BUDGET_LIMITS;
 
 if (buildBudgetPayload) {
-  // 默认不传语义：全空 → payload 无字段（timeout 走全局 7200s、迭代走后端默认 50）
+  // 默认不传语义：全空 → payload 无字段（timeout 走全局 llmConfig.agentTimeout，默认 1800s；迭代走后端默认 50）
   {
     const r = buildBudgetPayload({ timeoutMinutes: "", maxIterations: "" });
     assert(r.ok === true && Object.keys(r.payload).length === 0,
@@ -65,7 +65,7 @@ if (buildBudgetPayload) {
   {
     const r = buildBudgetPayload({ timeoutMinutes: "120", maxIterations: "" });
     assert(r.ok === true && r.payload.timeout_seconds === 7200,
-      '120 分钟 → timeout_seconds=7200（与全局 agentTimeout 一致）');
+      '120 分钟 → timeout_seconds=7200（=后端 le=7200 上限；全局 agentTimeout 默认 1800s）');
   }
   {
     const r = buildBudgetPayload({ timeoutMinutes: "1", maxIterations: "" });
@@ -118,7 +118,7 @@ if (existsSync(budgetUtilPath)) {
     '超时分钟范围常量 min=1 max=120（对应后端 60-7200 秒）');
   assert(/maxIterations[\s\S]*?min:\s*1\b/.test(util) && /maxIterations[\s\S]*?max:\s*200\b/.test(util),
     '最大迭代范围常量 min=1 max=200（与后端 ge=1 le=200 对齐）');
-  assert(/default:\s*120/.test(util), '超时默认值 120 分钟（=全局 7200s）');
+  assert(/default:\s*120/.test(util), '表单建议值 120 分钟，留空实际回退全局（默认 1800s）');
   assert(/default:\s*50/.test(util), '迭代默认值 50（=后端 Field 默认）');
 
   // 提交体构造：分钟 ×60 转秒
