@@ -1,4 +1,4 @@
-import { X, AlertTriangle } from "lucide-react";
+import { X, AlertTriangle, CloudOff } from "lucide-react";
 import { FindingSandboxEvidence } from "./FindingSandboxEvidence";
 import type { AgentFinding } from "@/shared/api/agentTasks";
 
@@ -35,6 +35,14 @@ export function FindingDetailPanel({ finding, onClose }: FindingDetailPanelProps
   })();
 
   const verResult = finding.verification_result;
+
+  // Task 17：finding 级沙箱环境故障提示。后端 compute_verification_status 的 infra
+  // 分支（全部 attempt 为 infra_error：Docker 缺席/镜像缺失/连接失败）落库形态为
+  // 终态 needs_context + verification_note 含 "infra_error=True"（notes 键值拼接）。
+  // 与 sandbox_skip_reason（豁免/放行）语义独立：环境故障不是"不可复现"，也不是豁免。
+  const infraFailure =
+    finding.verification_status === "needs_context" &&
+    /infra_error=True/.test(verResult?.verification_note ?? "");
 
   return (
     <div className="fixed inset-y-0 right-0 z-50 w-[480px] max-w-full bg-white dark:bg-gray-900 shadow-xl border-l dark:border-gray-700 overflow-y-auto">
@@ -85,6 +93,25 @@ export function FindingDetailPanel({ finding, onClose }: FindingDetailPanelProps
               <span className="block text-xs text-amber-500 dark:text-amber-500/70 mt-1 font-mono">
                 {verResult.sandbox_skip_reason}
               </span>
+            </div>
+          </div>
+        )}
+
+        {/* 沙箱环境故障（Task 1/17：全部 attempt 因 Docker/镜像故障未进容器，
+            终态 needs_context——不代表漏洞不可复现） */}
+        {infraFailure && (
+          <div>
+            <div className="text-xs text-red-500 dark:text-red-400 mb-1 flex items-center gap-1">
+              <CloudOff className="w-3 h-3" />
+              沙箱环境故障
+            </div>
+            <div className="text-sm bg-red-50 dark:bg-red-900/30 rounded p-3 text-red-700 dark:text-red-300">
+              沙箱环境故障（未能验证）：沙箱镜像缺失或 Docker 环境不可用，本次未能执行动态验证，不代表漏洞不可复现。
+              {verResult?.verification_note && (
+                <span className="block text-xs text-red-400 dark:text-red-500/70 mt-1 font-mono whitespace-pre-wrap">
+                  {verResult.verification_note}
+                </span>
+              )}
             </div>
           </div>
         )}

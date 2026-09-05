@@ -253,6 +253,12 @@ export interface SandboxAttempt {
   target_ref?: string;
   finding_id?: string;
   weak_evidence?: boolean;
+  // Task 17：沙箱证据语义标记（与后端 verification.py _record_sandbox_attempt 产物逐字对齐）
+  fabricated?: boolean; // R3 反伪造：声称确认但输出含模拟/源码缺失签名，已排除出判定
+  static_evidence?: boolean; // 确定性 PoC 模板 STATIC 标记：演示性静态确认，非真实动态利用
+  poc_error?: boolean; // REQ-VE-2：PoC/验证器自身崩溃（Traceback/SyntaxError 等）
+  poc_error_type?: string | null; // 崩溃类型（后端值 "pre-generated PoC crashed"）
+  infra_error?: boolean; // Task 1：沙箱基础设施故障（Docker 缺席/镜像缺失/连接失败，未进容器）
 }
 
 // Re-export from API
