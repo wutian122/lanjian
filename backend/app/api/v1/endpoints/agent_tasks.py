@@ -199,6 +199,11 @@ class AgentTaskResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # sandbox-verification-hard-gate Task 17：有效时间预算（秒）。
+    # resolve_task_timeout_seconds 回退链结果（显式任务值 > 用户 llmConfig.agentTimeout
+    # > 全局 AGENT_TIMEOUT_SECONDS > 1800），与 watchdog/orchestrator deadline 同源；
+    # None=解析失败，前端不展示倒计时。
+    timeout_seconds: int | None = None
 
     @field_serializer("created_at", "started_at", "completed_at", "paused_at", when_used="json")
     def _ser_time(self, dt: datetime | None) -> str | None:
@@ -2785,6 +2790,20 @@ async def get_agent_task(
         except Exception as e:
             logger.debug(f"[GetTask] audit_trace_path resolve failed for {task_id}: {e}")
             response_data["audit_trace_path"] = None
+
+        # sandbox-verification-hard-gate Task 17：回传有效时间预算供详情页
+        # StatsPanel 展示剩余/已用时间。取值复用 resolve_task_timeout_seconds
+        # （与 _execute_agent_task watchdog :1128 同一回退链同一时钟）：任务未显式
+        # 设置时解析任务创建者 llmConfig.agentTimeout > 全局配置 > 1800，避免前端
+        # 拿 DB NULL 臆造预算。任何异常降级 None（不影响详情接口）。
+        try:
+            _budget_user_config = await _get_user_config(db, task.created_by)
+            response_data["timeout_seconds"] = int(
+                resolve_task_timeout_seconds(task, _budget_user_config)
+            )
+        except Exception as e:
+            logger.debug(f"[GetTask] timeout_seconds resolve failed for {task_id}: {e}")
+            response_data["timeout_seconds"] = None
 
         return AgentTaskResponse(**response_data)
     except Exception as e:

@@ -3,19 +3,21 @@
  * Enterprise dashboard-style statistics
  */
 
-import { memo } from "react";
-import { Activity, FileCode, Repeat, Zap, Bug, Shield, AlertTriangle, TrendingUp, Database, Layers } from "lucide-react";
+import { memo, useEffect, useState } from "react";
+import { Activity, FileCode, Repeat, Zap, Bug, Shield, AlertTriangle, TrendingUp, Database, Layers, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/shared/utils/utils";
 import { VerificationStatusBreakdown } from "@/shared/components/VerificationStatusBreakdown";
+import { describeTimeBudget, isRunningStatus } from "@/shared/utils/timeBudget";
 import type { StatsPanelProps } from "../types";
 
-function MetricItem({ icon, label, value, suffix = "", compact = false }: {
+function MetricItem({ icon, label, value, suffix = "", compact = false, valueClassName }: {
   icon: React.ReactNode;
   label: string;
   value: string | number;
   suffix?: string;
   compact?: boolean;
+  valueClassName?: string;
 }) {
   return (
     <div className={cn(
@@ -27,7 +29,7 @@ function MetricItem({ icon, label, value, suffix = "", compact = false }: {
       </div>
       <div className="flex-1 min-w-0">
         <div className={cn("text-muted-foreground font-medium", compact ? "text-[10px]" : "text-xs")}>{label}</div>
-        <div className={cn("font-semibold text-foreground", compact ? "text-sm" : "text-base")}>
+        <div className={cn("font-semibold text-foreground", compact ? "text-sm" : "text-base", valueClassName)}>
           {value}<span className={cn("text-muted-foreground ml-0.5", compact ? "text-xs" : "text-sm")}>{suffix}</span>
         </div>
       </div>
@@ -36,10 +38,20 @@ function MetricItem({ icon, label, value, suffix = "", compact = false }: {
 }
 
 export const StatsPanel = memo(function StatsPanel({ task, findings, compact = false }: StatsPanelProps) {
+  // Task 17：运行中倒计时每秒刷新；终态/暂停态不 tick（视图不依赖当前时间）
+  const [now, setNow] = useState(() => Date.now());
+  const taskStatus = task?.status;
+  useEffect(() => {
+    if (!task || !isRunningStatus(taskStatus)) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [task, taskStatus]);
+
   if (!task) return null;
 
   const totalFindings = task.findings_count || 0;
   const progressPercent = task.progress_percentage || 0;
+  const timeBudget = describeTimeBudget(task, now);
 
   return (
     <div className={cn(compact ? "space-y-2" : "space-y-3")}>
@@ -97,6 +109,15 @@ export const StatsPanel = memo(function StatsPanel({ task, findings, compact = f
 
       {/* Metrics Grid */}
       <div className={cn("grid grid-cols-2", compact ? "gap-1.5" : "gap-2")}>
+        {timeBudget && (
+          <MetricItem
+            icon={<Clock className={cn("w-4 h-4", timeBudget.tone === "overdue" ? "text-red-600" : "text-sky-600")} />}
+            label={timeBudget.label}
+            value={timeBudget.value}
+            compact={compact}
+            valueClassName={timeBudget.tone === "overdue" ? "text-red-600" : undefined}
+          />
+        )}
         <MetricItem
           icon={<Repeat className="w-4 h-4 text-teal-600" />}
           label="迭代次数"

@@ -64,6 +64,10 @@ export interface AgentTask {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  // Task 17：有效时间预算（秒）。详情接口回传 resolve_task_timeout_seconds
+  // 回退链结果（显式任务值 > 用户 llmConfig.agentTimeout > 全局 1800），
+  // 与后端 watchdog/orchestrator deadline 同源；null=解析失败（不展示倒计时）。
+  timeout_seconds?: number | null;
 
   // 进度
   progress_percentage: number;
