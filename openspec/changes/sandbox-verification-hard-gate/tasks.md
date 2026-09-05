@@ -131,6 +131,9 @@
 ## Phase 6: 台账治理与端到端
 
 ### Task 18: OpenSpec 台账治理
+- [x] **Task 18 完成**（commit 05fd5a1，review CLEAN——归档 fix-verification-evidence-root（18/18 复核五项全过 + 主 spec sync +7 无操作头残留）、核实 fix-sandbox-evidence-and-recovery 27/33（抽查 8 项 file:line 坐实 + 6 项弃权理由真实：T15/T20/T22 测试缺口、T31-33 E2E 无 harness）、**structured-output-protocol 9/9 归档候选经确认另行归档**；零代码改动）
+
+### Task 18: OpenSpec 台账治理
 - Files: `openspec/changes/fix-sandbox-evidence-and-recovery/tasks.md`（核实补勾）、归档 `fix-verification-evidence-root`
 - Interfaces: openspec status/archive 命令
 - 验收：status 与实际实施一致；archive 复核四项+Purpose 全过（R18/R24）
