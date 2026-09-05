@@ -2273,14 +2273,18 @@ class VerificationAgent(BaseAgent):
         """
         results: List[Dict] = []
         for f in findings_to_verify:
+            # 证据先绑定待验 finding 本体：findings_to_verify 元素与 orchestrator
+            # _all_findings 同引用（previous_results["findings"] 直传，_deduplicate
+            # 不复制 dict），证据落本体后即使调度超时/取消走不到 merge 也不丢
+            # （生产 9344d5dd：40 findings 沙箱 attempts 全 null，断点 A）。
+            if not f.get("sandbox_attempts"):
+                self._attach_runtime_sandbox_attempts(f)
             target = {
                 **f,
                 "verdict": "needs_context",
                 "confidence": 0.5,
                 "is_verified": False,
             }
-            if not target.get("sandbox_attempts"):
-                self._attach_runtime_sandbox_attempts(target)
             results.append(self._normalize_verification_outcome(target))
         return results
 
@@ -2455,11 +2459,25 @@ class VerificationAgent(BaseAgent):
     def _bind_unbound_runtime_evidence(self, verified_findings: List[Dict]) -> None:
         """REQ-ER-2: 成功路径最终兜底绑定——verified_findings 中仍无沙箱证据的 finding，
         按 ID/位置从运行时索引强制再绑定（_attach_runtime_sandbox_attempts 幂等，去重合并）。
+        新绑上的证据同步回待验本体（self._all_findings 元素，与 orchestrator
+        _all_findings 同引用），与 _bind_runtime_evidence_to_all 回写同语义。
         """
         for vf in verified_findings:
             if vf.get("sandbox_attempts"):
                 continue
             self._attach_runtime_sandbox_attempts(vf)
+            if not vf.get("sandbox_attempts"):
+                continue
+            vf_fp = str(vf.get("file_path") or "").strip().lower()
+            if not vf_fp:
+                continue
+            for orig in getattr(self, "_all_findings", []) or []:
+                if not isinstance(orig, dict):
+                    continue
+                if str(orig.get("file_path") or "").strip().lower() == vf_fp:
+                    if not orig.get("sandbox_attempts"):
+                        orig["sandbox_attempts"] = vf["sandbox_attempts"]
+                    break
 
     def _bind_runtime_evidence_to_all(
         self, verified_findings: List[Dict], findings_to_verify: List[Dict]
@@ -2488,22 +2506,26 @@ class VerificationAgent(BaseAgent):
                 verified_findings.append(target)
                 if fp:
                     seen_paths[fp] = target
-            if target.get("sandbox_attempts"):
-                continue
-            self._attach_runtime_sandbox_attempts(target)
-            # 证据可能改变状态（needs_context → confirmed/not_reproducible），重新归一化
-            if target.get("sandbox_attempts"):
-                strict = self._normalize_verification_outcome(target)
-                target.clear()
-                target.update(strict)
-            elif not target.get("verification_status"):
-                # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
-                # 归一化经 compute_verification_status 分支 5 给 needs_context，
-                # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
-                # 不得留无状态 finding 出 Agent。
-                strict = self._normalize_verification_outcome(target)
-                target.clear()
-                target.update(strict)
+            if not target.get("sandbox_attempts"):
+                self._attach_runtime_sandbox_attempts(target)
+                # 证据可能改变状态（needs_context → confirmed/not_reproducible），重新归一化
+                if target.get("sandbox_attempts"):
+                    strict = self._normalize_verification_outcome(target)
+                    target.clear()
+                    target.update(strict)
+                elif not target.get("verification_status"):
+                    # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
+                    # 归一化经 compute_verification_status 分支 5 给 needs_context，
+                    # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
+                    # 不得留无状态 finding 出 Agent。
+                    strict = self._normalize_verification_outcome(target)
+                    target.clear()
+                    target.update(strict)
+            # 证据同步回待验本体：orig 是 findings_to_verify 元素，与 orchestrator
+            # _all_findings 同引用（previous_results["findings"] 直传），绑定落本体后
+            # 调度超时/取消走不到 merge 沙箱证据也不丢（生产 9344d5dd 断点 A）。
+            if target.get("sandbox_attempts") and not orig.get("sandbox_attempts"):
+                orig["sandbox_attempts"] = target["sandbox_attempts"]
 
     def _attempt_has_vuln_evidence(self, attempt: dict[str, Any]) -> bool:
         """B3 严标准：判断沙箱 attempt 是否含真正的漏洞触发证据（VULNERABILITY_CONFIRMED 等）。

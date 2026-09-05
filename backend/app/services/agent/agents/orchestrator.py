@@ -993,6 +993,69 @@ class OrchestratorAgent(BaseAgent):
             )
         return merged
 
+    def _salvage_dispatched_findings(
+        self,
+        agent_name: str,
+        run_task: "asyncio.Task | None",
+        result: AgentResult | None = None,
+    ) -> None:
+        """超时/取消早退前抢救子 Agent 已声明的 findings（生产 9344d5dd 断点 B）。
+
+        调度超时/用户取消的早退分支直接返回文本，子 Agent 取消收口
+        （verification._finalize_findings_without_final_answer：LLM 调用收到
+        CancelledError -> break -> 证据绑定收口）返回的
+        AgentResult(success=False, data.findings 已绑 sandbox_attempts) 走不到
+        正常 merge 段，已执行的 mechanism 结果整体丢弃（生产两次超时 1800s/551s
+        后 40 findings 证据全 null）。wait_for 超时/取消传播前，run_with_cancel_check
+        的 except 块已 await run_task 收口完成，故此处可从 run_task.result() 取回。
+        复用 _merge_failed_result_findings 最小 merge 管线（normalize +
+        _merge_or_append_finding），至少保住 sandbox_attempts；任何异常非致命。
+        """
+        try:
+            agent_result = result
+            if (
+                agent_result is None
+                and run_task is not None
+                and run_task.done()
+                and not run_task.cancelled()
+            ):
+                agent_result = run_task.result()
+            if not isinstance(agent_result, AgentResult):
+                return
+            data = getattr(agent_result, "data", None)
+            if not isinstance(data, dict) or not data.get("findings"):
+                return
+            merged = self._merge_failed_result_findings(agent_name, agent_result)
+            if merged:
+                logger.warning(
+                    f"[Orchestrator] {agent_name} 早退抢救：{merged} 条已声明 findings"
+                    f"（含沙箱证据）已 merge，未随超时/取消丢弃"
+                )
+        except Exception as e:
+            logger.warning(f"[Orchestrator] {agent_name} 早退抢救 merge 失败（非致命）: {e}")
+
+    @staticmethod
+    def _merge_attempts_lists_deduped(existing: list, incoming: list) -> list:
+        """sandbox_attempts 合并按语义键去重（命令+退出码+证据摘要前缀），
+        与 VerificationAgent._merge_attempts_deduped/_attempt_dedupe_key 同键语义。
+
+        断点 A 修复后证据同时落在共享本体（findings_to_verify 元素）与
+        verification 返回结果上，merge 段简单拼接会双计同源证据。
+        """
+
+        def _key(a: dict) -> tuple:
+            return (
+                str(a.get("command") or "")[:200],
+                a.get("exit_code"),
+                str(a.get("evidence_summary") or "")[:200],
+            )
+
+        by_key: dict[tuple, dict] = {}
+        for a in list(existing) + list(incoming):
+            if isinstance(a, dict) and _key(a) not in by_key:
+                by_key[_key(a)] = a
+        return list(by_key.values())
+
     def _build_coverage_bypass_info(
         self,
         reason: str,
@@ -2947,8 +3010,13 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
             # 调度超时 = min(类型上限, 剩余任务预算)，见 _resolve_dispatch_timeout
             timeout = self._resolve_dispatch_timeout(agent_name)
 
+            # run_task 提到外层：超时/取消早退时抢救子 Agent 已产出的 findings
+            # （见 _salvage_dispatched_findings；生产 9344d5dd 断点 B）
+            run_task: asyncio.Task | None = None
+
             async def run_with_cancel_check() -> AgentResult:
                 """包装子 Agent 执行，定期检查取消状态"""
+                nonlocal run_task
                 run_task = asyncio.create_task(agent.run(sub_input))
                 try:
                     while not run_task.done():
@@ -3016,6 +3084,9 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                     phase=current_phase,
                     agent=agent_name,
                 )
+                # 断点 B 修复：早退前抢救子 Agent 取消收口已声明的 findings
+                # （verification 的沙箱证据不得随超时整体丢弃，生产 9344d5dd）
+                self._salvage_dispatched_findings(agent_name, run_task)
                 return f"## {agent_name} Agent 执行超时\n\n子 Agent 执行超过 {timeout} 秒，已强制终止。请尝试更具体的任务或使用其他 Agent。"
             except asyncio.CancelledError:
                 self._dispatch_failures += 1
@@ -3033,6 +3104,8 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                     phase=current_phase,
                     agent=agent_name,
                 )
+                # 断点 B 修复：取消早退同样抢救已声明 findings
+                self._salvage_dispatched_findings(agent_name, run_task)
                 return f"## {agent_name} Agent 执行取消\n\n任务已被用户取消"
 
             # 🔥 执行后再次检查取消状态
@@ -3050,6 +3123,8 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                     phase=current_phase,
                     agent=agent_name,
                 )
+                # 断点 B 修复：子 Agent 已正常返回但编排被取消，结果同样保全
+                self._salvage_dispatched_findings(agent_name, run_task, result=result)
                 return f"## {agent_name} Agent 执行中断\n\n任务已被用户取消"
 
             await self.emit_event(
@@ -3516,8 +3591,12 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                             merged[key] = value
                         continue
                     # Bug B fix: sandbox_attempts merge (list, not scalar)
+                    # 语义键去重：断点 A 修复后证据同时在共享本体与验证返回结果上，
+                    # 简单拼接会双计同源证据（见 _merge_attempts_lists_deduped）
                     if key == "sandbox_attempts" and isinstance(value, list) and len(value) > 0:
-                        merged[key] = (merged.get(key) or []) + value
+                        merged[key] = self._merge_attempts_lists_deduped(
+                            merged.get(key) or [], value
+                        )
                         continue
                     # Default: skip None/empty/zero
                     if value is not None and value != "" and value != 0:
