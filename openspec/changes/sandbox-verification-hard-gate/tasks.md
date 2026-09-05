@@ -117,8 +117,9 @@
 ## Phase 5: 前端
 
 ### Task 16: 创建表单预算入口
+- [x] **Task 16 完成**（实施 e1b84cb + 文案修复 ac11644，review 初审 NEEDS_FIX（Important：默认值文案与后端事实不符——"默认 7200"是 spec 笔误，实际回退链默认 1800s）→ 重审 CLEAN（7 处文案逐一对齐 + 契约 53/53 + 零逻辑变更）；R21 spec 笔误纠正已由主控修正 tasks.md:121；留空语义裁决：不传字段走全局配置（Task 1 NULL 语义保留）；Task 8 M2 承接（skip_reason 前端展示）随本任务交付；2 Minor 记账：audit 端校验时序（finally 复位无害）、台账 M2 归属措辞统一
 - Files: `frontend/src/components/agent/CreateAgentTaskDialog.tsx`、`frontend/src/components/audit/CreateTaskDialog.tsx`、`frontend/src/shared/api/agentTasks.ts`
-- Interfaces: 提交体新增 `timeout_seconds`（分钟输入×60，默认 7200）、`max_iterations`（默认 50）
+- Interfaces: 提交体新增 `timeout_seconds`（分钟输入×60；留空不传走全局 agentTimeout 配置，默认 1800s——Task 1 的 NULL 语义）、`max_iterations`（留空后端默认 50）
 - TDD: 组件测试（渲染两输入项、提交体含字段、范围校验）→ 实现 → 通过 → commit
 
 ### Task 17: 详情页预算/剩余时间与三标记
