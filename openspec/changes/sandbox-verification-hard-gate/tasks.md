@@ -123,6 +123,7 @@
 - TDD: 组件测试（渲染两输入项、提交体含字段、范围校验）→ 实现 → 通过 → commit
 
 ### Task 17: 详情页预算/剩余时间与三标记
+- [x] **Task 17 完成**（三标记半 f8cf910 review CLEAN + StatsPanel 半 39ecf3f review CLEAN；**后端最小增量偏离主控裁决：接受**（AgentTaskResponse 本无 timeout_seconds，前端剩余时间无数据源，19 行复用 resolve_task_timeout_seconds 回退链——ledger 落账）；StatsPanel 时间格（运行态剩余 1s tick/终态耗时/超时红字）；三标记+infra_error 徽章（伪造红/静态蓝/崩溃琥珀/infra 灰）；2 Minor 记账：三端点 timeout_seconds 语义不一（detail 有效值/list+create 显式值，后续统一）、测试路径笔误）
 - Files: `frontend/src/pages/AgentAudit/components/StatsPanel.tsx`、`frontend/src/pages/AgentAudit/components/FindingSandboxEvidence.tsx`、`frontend/src/shared/api/agentTasks.ts`（类型）
 - Interfaces: StatsPanel 时间格（运行中=剩余、完成=耗时）；attempt 三徽章（fabricated/static_evidence/poc_error）
 - TDD: 组件测试 → 实现 → 通过 → commit
