@@ -1,6 +1,23 @@
-import { X } from "lucide-react";
+import { X, AlertTriangle } from "lucide-react";
 import { FindingSandboxEvidence } from "./FindingSandboxEvidence";
 import type { AgentFinding } from "@/shared/api/agentTasks";
+
+/**
+ * sandbox_skip_reason 中文释义（Task 8 M2 承接）。
+ * 数据链路：后端 finding.sandbox_skip_reason → 落库 verification_result JSON；
+ * 程序化取值见 orchestrator.py（放行路径）与 verification.py（弹性退出/无模板
+ * 豁免），LLM 亦可在 Final Answer 自由标注（未知值回退显示原始字符串）。
+ */
+const SKIP_REASON_LABELS: Record<string, string> = {
+  gate_release_after_max_redispatch: "门禁放行：达到最大重派次数后放行，未经沙箱复现",
+  orchestrator_max_iterations_exhausted: "编排器迭代次数耗尽，未经沙箱验证",
+  elastic_exit: "弹性退出：验证重试预算耗尽后豁免沙箱验证",
+  no_poc_template: "无 PoC 模板：该漏洞类型无确定性沙箱验证模板",
+};
+
+function skipReasonLabel(reason: string): string {
+  return SKIP_REASON_LABELS[reason] ?? reason;
+}
 
 interface FindingDetailPanelProps {
   finding: AgentFinding;
@@ -55,6 +72,22 @@ export function FindingDetailPanel({ finding, onClose }: FindingDetailPanelProps
             )}
           </div>
         </div>
+
+        {/* 沙箱跳过原因（未沙箱验证的豁免/放行说明，Task 8 M2 承接） */}
+        {verResult?.sandbox_skip_reason && (
+          <div>
+            <div className="text-xs text-amber-600 dark:text-amber-400 mb-1 flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3" />
+              未沙箱验证
+            </div>
+            <div className="text-sm bg-amber-50 dark:bg-amber-900/30 rounded p-3 text-amber-700 dark:text-amber-300">
+              {skipReasonLabel(verResult.sandbox_skip_reason)}
+              <span className="block text-xs text-amber-500 dark:text-amber-500/70 mt-1 font-mono">
+                {verResult.sandbox_skip_reason}
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* 验证结果详情 */}
         {verResult?.details && (

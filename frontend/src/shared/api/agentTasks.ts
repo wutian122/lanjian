@@ -88,6 +88,13 @@ export interface VerificationResult {
   verification_status?: string;
   verification_note?: string;
   failure_reason?: string;
+  /**
+   * 沙箱跳过/豁免原因（Task 8 持久化进 verification_result JSON）。
+   * 程序化取值：gate_release_after_max_redispatch /
+   * orchestrator_max_iterations_exhausted / elastic_exit / no_poc_template；
+   * LLM 亦可自由标注。中文释义见 skipReasonLabel。
+   */
+  sandbox_skip_reason?: string;
   sandbox_attempts_summary?: Array<{
     success?: boolean;
     exit_code?: number;

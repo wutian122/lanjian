@@ -48,6 +48,8 @@ import { api } from "@/shared/config/database";
 import { getRuleSets, type AuditRuleSet } from "@/shared/api/rules";
 import { getPromptTemplates, type PromptTemplate } from "@/shared/api/prompts";
 import { createAgentTask } from "@/shared/api/agentTasks";
+import { BudgetConfigFields } from "@/components/common/BudgetConfigFields";
+import { buildBudgetPayload } from "@/shared/utils/budgetConfig";
 
 import { useProjects } from "./hooks/useTaskForm";
 import { useZipFile, formatFileSize } from "./hooks/useZipFile";
@@ -98,6 +100,11 @@ export default function CreateTaskDialog({
   const [showFileSelection, setShowFileSelection] = useState(false);
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
+
+  // 运行预算（Task 16，仅 agent 模式生效）：留空 = 不传字段，
+  // 超时走全局 7200s、迭代走后端默认 50
+  const [timeoutMinutes, setTimeoutMinutes] = useState("");
+  const [maxIterations, setMaxIterations] = useState("");
 
   const [auditMode, setAuditMode] = useState<AuditMode>("agent");
 
@@ -186,6 +193,8 @@ export default function CreateTaskDialog({
       }
       setSearchTerm("");
       setShowAdvanced(false);
+      setTimeoutMinutes("");
+      setMaxIterations("");
       const defaultRuleSet = ruleSets.find(r => r.is_default);
       setSelectedRuleSetId(defaultRuleSet?.id || ruleSets[0]?.id || "");
       const defaultPrompt = promptTemplates.find(p => p.is_default);
@@ -214,6 +223,13 @@ export default function CreateTaskDialog({
       let taskId: string;
 
       if (auditMode === "agent") {
+        // Task 16：运行预算校验（范围与后端 AgentTaskCreate 对齐），不合法拦截提交
+        const budget = buildBudgetPayload({ timeoutMinutes, maxIterations });
+        if (!budget.ok) {
+          toast.error(budget.errors[0]);
+          return;
+        }
+
         // ZIP 项目：先上传 ZIP 文件到后端
         if (isZipProject(selectedProject) && !zipState.useStoredZip && zipState.zipFile) {
           await api.uploadProjectZip(selectedProject.id, zipState.zipFile);
@@ -227,6 +243,7 @@ export default function CreateTaskDialog({
           exclude_patterns: excludePatterns,
           target_files: selectedFiles,
           verification_level: "sandbox",
+          ...budget.payload,
         });
 
         onOpenChange(false);
@@ -603,6 +620,16 @@ export default function CreateTaskDialog({
                         </div>
                       );
                     })()}
+
+                    {/* 运行预算（超时时间 / 最大迭代次数，Task 16；仅 Agent 模式） */}
+                    {auditMode === "agent" && (
+                      <BudgetConfigFields
+                        timeoutMinutes={timeoutMinutes}
+                        maxIterations={maxIterations}
+                        onTimeoutMinutesChange={setTimeoutMinutes}
+                        onMaxIterationsChange={setMaxIterations}
+                      />
+                    )}
                   </CollapsibleContent>
                 </Collapsible>
               </div>

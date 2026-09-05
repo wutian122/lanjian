@@ -44,6 +44,8 @@ import {
 import { toast } from "sonner";
 import { api } from "@/shared/config/database";
 import { createAgentTask } from "@/shared/api/agentTasks";
+import { BudgetConfigFields } from "@/components/common/BudgetConfigFields";
+import { buildBudgetPayload } from "@/shared/utils/budgetConfig";
 import { isRepositoryProject, isZipProject } from "@/shared/utils/projectUtils";
 import { getZipFileInfo, type ZipFileMeta } from "@/shared/utils/zipStorage";
 import { validateZipFile } from "@/features/projects/services/repoZipScan";
@@ -81,6 +83,10 @@ export default function CreateAgentTaskDialog({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [creating, setCreating] = useState(false);
 
+  // 运行预算（Task 16）：留空 = 不传字段，超时走全局 7200s、迭代走后端默认 50
+  const [timeoutMinutes, setTimeoutMinutes] = useState("");
+  const [maxIterations, setMaxIterations] = useState("");
+
   // ZIP 文件状态
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [storedZipInfo, setStoredZipInfo] = useState<ZipFileMeta | null>(null);
@@ -114,6 +120,8 @@ export default function CreateAgentTaskDialog({
       setZipFile(null);
       setStoredZipInfo(null);
       setSelectedFiles(undefined);
+      setTimeoutMinutes("");
+      setMaxIterations("");
     }
   }, [open]);
 
@@ -194,6 +202,13 @@ export default function CreateAgentTaskDialog({
   const handleCreate = async () => {
     if (!selectedProject) return;
 
+    // Task 16：运行预算校验（范围与后端 AgentTaskCreate 对齐），不合法拦截提交
+    const budget = buildBudgetPayload({ timeoutMinutes, maxIterations });
+    if (!budget.ok) {
+      toast.error(budget.errors[0]);
+      return;
+    }
+
     setCreating(true);
     try {
       // B1: 若用户现场选择了新 ZIP，先上传再建任务（后端 Agent 任务只读已持久化的 ZIP，
@@ -208,6 +223,7 @@ export default function CreateAgentTaskDialog({
         exclude_patterns: excludePatterns,
         target_files: selectedFiles,
         verification_level: "sandbox",
+        ...budget.payload,
       });
 
       onOpenChange(false);
@@ -475,6 +491,14 @@ export default function CreateAgentTaskDialog({
                       }}
                     />
                   </div>
+
+                  {/* 运行预算（超时时间 / 最大迭代次数，Task 16） */}
+                  <BudgetConfigFields
+                    timeoutMinutes={timeoutMinutes}
+                    maxIterations={maxIterations}
+                    onTimeoutMinutesChange={setTimeoutMinutes}
+                    onMaxIterationsChange={setMaxIterations}
+                  />
                 </CollapsibleContent>
               </Collapsible>
             </div>
