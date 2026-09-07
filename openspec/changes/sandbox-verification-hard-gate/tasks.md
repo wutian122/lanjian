@@ -137,7 +137,7 @@
 - [x] **A1 完成**（commit 94e8b4f，review CLEAN——EL/SSTI 非可验证类型排除（unverifiable 拦截在 canonicalize 之前），词边界 11 反例实证、拦截时序、三档 observation 分档、F1 并存零改动；生产根因（ELProcessor EL 类落 sql_injection 白跑）拦截链闭合；3 Minor 记账：expression 泛词 ReDoS 误归口径（无功能损失，backlog）、融合词缝隙（理论）、测试冗余）
 
 ### F2: watchdog 收口失效（事件循环同步阻塞冻结——独立修复待审）
-- [ ] **F2 待审查**（三 commit 6c7fc6a/576254d/c491a95：litellm 出站线程池剥离根治同步阻塞（sync-iterable 分支冻结 uvicorn 单 worker 10h04m，watchdog/三层超时全失效——生产任务 c286b0c1 实证）+ watchdog 强杀补丁（mark_deadline_hit 同时 cancel/shield/3s 二次时限/never-retrieved 防护）+ per-chunk 取消坑防堵（ensure_future+shield+aclose+_hard_interrupt）；回归 1181 passed/4 failed）
+- [x] **F2 完成**（三 commit 6c7fc6a/576254d/c491a95，review CLEAN——根因代码行亲验（litellm streaming_handler sync next 分支）+ 线程桥绕行根治（事件循环线程零 LLM 网络读、150s 兜底链逐环确认、取消语义协作 Event+daemon 线程）+ watchdog 补丁（同时 cancel/shield/3s 二次时限/栈落盘/语义边界三判别）+ per-chunk shield 防堵（Py3.12 吞取消实锤堵漏/_safe_aclose/_hard_interrupt 链贯通）；20 例新测试亲跑全过、全量 1218 passed/4 failed、A1 并行零冲突；4 Minor 记账：冗余 except/双 close 注释/测试数对账/放弃等待兜底）+ watchdog 强杀补丁（mark_deadline_hit 同时 cancel/shield/3s 二次时限/never-retrieved 防护）+ per-chunk 取消坑防堵（ensure_future+shield+aclose+_hard_interrupt）；回归 1181 passed/4 failed）
 
 ## Phase 6: 台账治理与端到端
 
