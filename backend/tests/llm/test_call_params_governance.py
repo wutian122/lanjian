@@ -312,7 +312,7 @@ class TestLiteLLMNonStreamInjection:
 
 
 class TestLiteLLMStreamInjection:
-    """litellm 流式路径（stream_complete → litellm.acompletion，SGLang 流式实际路径）"""
+    """litellm 流式路径（stream_complete → litellm.completion 同步线程桥，SGLang 流式实际路径）"""
 
     @pytest.mark.asyncio
     async def test_stream_extra_body_contains_default_rp(self):
@@ -320,15 +320,11 @@ class TestLiteLLMStreamInjection:
         adapter = LiteLLMAdapter(service.config)
         captured: Dict[str, Any] = {}
 
-        async def _fake_acompletion(**kwargs: Any):
+        def _fake_completion(**kwargs: Any):
             captured.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion):
+        with patch("litellm.completion", _fake_completion):
             chunks = [c async for c in adapter.stream_complete(_make_request(stream=True))]
 
         assert chunks[-1]["type"] == "done"
@@ -340,15 +336,11 @@ class TestLiteLLMStreamInjection:
         adapter = LiteLLMAdapter(service.config)
         captured: Dict[str, Any] = {}
 
-        async def _fake_acompletion(**kwargs: Any):
+        def _fake_completion(**kwargs: Any):
             captured.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion):
+        with patch("litellm.completion", _fake_completion):
             chunks = [
                 c
                 async for c in adapter.stream_complete(

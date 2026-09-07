@@ -745,9 +745,21 @@ class LiteLLMAdapter(BaseLLMAdapter):
         chunk_count = 0  # 🔥 跟踪 chunk 数量
 
         try:
-            response = await litellm.acompletion(**kwargs)
+            # F2/A1 事件循环冻结根治：litellm 流式封装 CustomStreamWrapper.__anext__
+            # 的 sync-iterable 分支用同步 next() 读 socket（无 await 点），在
+            # uvicorn 单 worker 上会整体冻结事件循环（生产任务 c286b0c1 卡 10h，
+            # watchdog/三层超时全失效）。同步 litellm.completion(stream=True) 全程
+            # （建连+迭代读）剥离到专用工作线程，chunk 经 asyncio.Queue 桥接；
+            # kwargs["timeout"]（默认 150s）在线程内作为 httpx 同步超时正常生效，
+            # 消费端取消经 threading.Event 协作停止。详见 sync_stream_bridge 模块文档。
+            from ..sync_stream_bridge import iter_sync_stream
 
-            async for chunk in response:
+            chunk_stream = iter_sync_stream(
+                lambda: litellm.completion(**kwargs),
+                stream_name=f"llm-stream-{self.config.provider.value}",
+            )
+
+            async for chunk in chunk_stream:
                 chunk_count += 1
 
                 # 🔥 检查是否有 usage 信息（某些 API 会在最后的 chunk 中包含）

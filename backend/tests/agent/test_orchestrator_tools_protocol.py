@@ -72,24 +72,27 @@ def _stream_chunk(tool_calls=None, content=None, reasoning=None, finish_reason=N
 
 
 class _FakeStream:
+    """同步假流（模拟 litellm.completion(stream=True) 返回的同步可迭代对象；
+    F2/A1 线程桥后流式出站在工作线程内走同步 litellm.completion）。"""
+
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
-    def __aiter__(self):
+    def __iter__(self):
         return self
 
-    async def __anext__(self):
+    def __next__(self):
         if not self._chunks:
-            raise StopAsyncIteration
+            raise StopIteration
         return self._chunks.pop(0)
 
 
-def _patch_acompletion(chunks, captured):
-    async def _fake_acompletion(**kwargs):
+def _patch_completion(chunks, captured):
+    def _fake_completion(**kwargs):
         captured.update(kwargs)
         return _FakeStream(chunks)
 
-    return patch("litellm.acompletion", _fake_acompletion)
+    return patch("litellm.completion", _fake_completion)
 
 
 @pytest.mark.asyncio
@@ -103,7 +106,7 @@ async def test_adapter_aggregates_streaming_tool_calls_arguments():
         _stream_chunk(finish_reason="tool_calls"),
     ]
     captured = {}
-    with _patch_acompletion(chunks, captured):
+    with _patch_completion(chunks, captured):
         out = [c async for c in adapter.stream_complete(
             _make_request(tools=[{"type": "function", "function": {"name": "dispatch_agent"}}])
         )]
@@ -139,7 +142,7 @@ async def test_adapter_aggregates_multiple_tool_call_indices():
         _stream_chunk(finish_reason="tool_calls"),
     ]
     captured = {}
-    with _patch_acompletion(chunks, captured):
+    with _patch_completion(chunks, captured):
         out = [c async for c in adapter.stream_complete(
             _make_request(tools=[{"type": "function", "function": {"name": "x"}}])
         )]
@@ -158,7 +161,7 @@ async def test_adapter_done_chunk_without_tool_calls_has_no_key():
         _stream_chunk(content="Thought: ok"),
         _stream_chunk(content=" done", finish_reason="stop"),
     ]
-    with _patch_acompletion(chunks, {}):
+    with _patch_completion(chunks, {}):
         out = [c async for c in adapter.stream_complete(_make_request())]
 
     done = out[-1]

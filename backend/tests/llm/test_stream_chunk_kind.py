@@ -75,17 +75,14 @@ def _make_stream_chunk(
 
 
 async def _collect_stream(chunks: List[MagicMock]) -> List[dict]:
-    """patch litellm.acompletion 返回给定 chunk 序列，跑完 stream_complete"""
+    """patch litellm.completion（同步，工作线程内调用）返回给定 chunk 序列的
+    同步可迭代对象，跑完 stream_complete（F2/A1 线程桥后的出站边界）"""
     adapter = LiteLLMAdapter(_make_config())
 
-    async def _fake_acompletion(**kwargs: Any):
-        async def _iter():
-            for c in chunks:
-                yield c
+    def _fake_completion(**kwargs: Any):
+        return iter(chunks)
 
-        return _iter()
-
-    with patch("litellm.acompletion", _fake_acompletion):
+    with patch("litellm.completion", _fake_completion):
         return [c async for c in adapter.stream_complete(_make_request())]
 
 

@@ -5,7 +5,8 @@ structured-output-protocol Task 1：请求链三参数透传测试
 参数）能从 service 层经 LLMRequest 透传到两条实际请求路径：
 
 1. ``LiteLLMAdapter._native_openai_call``——SGLang（OPENAI + 自定义 base_url）非流式路径
-2. ``litellm.acompletion``——litellm 非流式路径与 SGLang 流式路径（stream_complete）
+2. ``litellm.acompletion``——litellm 非流式路径；流式路径 stream_complete
+   经 F2/A1 线程桥调用 ``litellm.completion``（同步，工作线程内执行）
 
 零破坏断言：不传三参数时，请求构造与改造前完全一致（不新增任何键）。
 
@@ -433,19 +434,16 @@ class TestLiteLLMPath:
 
     @pytest.mark.asyncio
     async def test_stream_complete_kwargs_contain_three_params(self):
-        """stream_complete（SGLang 流式实际路径）kwargs 含 tools/response_format/extra_body"""
+        """stream_complete（SGLang 流式实际路径，litellm.completion 同步线程桥）
+        kwargs 含 tools/response_format/extra_body"""
         adapter = LiteLLMAdapter(_make_config())
         captured: Dict[str, Any] = {}
 
-        async def _fake_acompletion(**kwargs: Any):
+        def _fake_completion(**kwargs: Any):
             captured.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion):
+        with patch("litellm.completion", _fake_completion):
             chunks = [
                 c
                 async for c in adapter.stream_complete(
@@ -470,15 +468,11 @@ class TestLiteLLMPath:
         adapter = LiteLLMAdapter(_make_config())
         captured: Dict[str, Any] = {}
 
-        async def _fake_acompletion(**kwargs: Any):
+        def _fake_completion(**kwargs: Any):
             captured.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion):
+        with patch("litellm.completion", _fake_completion):
             [c async for c in adapter.stream_complete(_make_request(stream=True))]
 
         for absent in ("tools", "response_format", "extra_body", "repetition_penalty"):

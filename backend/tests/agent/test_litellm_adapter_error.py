@@ -39,7 +39,7 @@ class TestStreamErrorDiagnosability:
         empty_exc = Exception("")  # str(e) 为空
 
         with caplog.at_level(logging.ERROR, logger="app.services.llm.adapters.litellm_adapter"):
-            with patch("litellm.acompletion", side_effect=empty_exc):
+            with patch("litellm.completion", side_effect=empty_exc):
                 try:
                     async for _chunk in adapter.stream_complete(_make_request()):
                         pass
@@ -66,7 +66,7 @@ class TestStreamErrorDiagnosability:
         real_exc = Exception("connection reset by peer")
 
         with caplog.at_level(logging.ERROR, logger="app.services.llm.adapters.litellm_adapter"):
-            with patch("litellm.acompletion", side_effect=real_exc):
+            with patch("litellm.completion", side_effect=real_exc):
                 try:
                     async for _chunk in adapter.stream_complete(_make_request()):
                         pass

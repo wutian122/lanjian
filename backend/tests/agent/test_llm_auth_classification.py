@@ -123,7 +123,7 @@ class TestStreamAuthClassification:
         adapter = _make_adapter()
         exc = _rate_limit_err("OpenAIException - authorization failed")
         error_chunks = []
-        with patch("litellm.acompletion", side_effect=exc):
+        with patch("litellm.completion", side_effect=exc):
             async for chunk in adapter.stream_complete(_make_request()):
                 if chunk.get("type") == "error":
                     error_chunks.append(chunk)
@@ -138,7 +138,7 @@ class TestStreamAuthClassification:
         adapter = _make_adapter()
         exc = _rate_limit_err("quota exceeded, insufficient balance")
         error_chunks = []
-        with patch("litellm.acompletion", side_effect=exc):
+        with patch("litellm.completion", side_effect=exc):
             async for chunk in adapter.stream_complete(_make_request()):
                 if chunk.get("type") == "error":
                     error_chunks.append(chunk)
@@ -154,7 +154,7 @@ class TestStreamAuthClassification:
         ]:
             exc = _rate_limit_err(msg)
             error_chunks = []
-            with patch("litellm.acompletion", side_effect=exc):
+            with patch("litellm.completion", side_effect=exc):
                 async for chunk in adapter.stream_complete(_make_request()):
                     if chunk.get("type") == "error":
                         error_chunks.append(chunk)

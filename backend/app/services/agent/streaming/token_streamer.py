@@ -75,18 +75,26 @@ class TokenStreamer:
         """
         try:
             import litellm
-            
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                stream=True,  # 启用流式输出
-            )
-            
-            async for chunk in response:
+
+            # F2/A1 事件循环冻结根治：litellm 流式同步迭代在专用工作线程执行
+            # （acompletion 流式封装的 sync-iterable 分支同步 next() 读 socket 会
+            # 冻结事件循环）；详见 app.services.llm.sync_stream_bridge 模块文档。
+            from app.services.llm.sync_stream_bridge import iter_sync_stream
+
+            kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+                "stream": True,  # 启用流式输出
+            }
+
+            async for chunk in iter_sync_stream(
+                lambda: litellm.completion(**kwargs),
+                stream_name="llm-token-streamer",
+            ):
                 if self._cancelled:
                     break
                 
@@ -152,22 +160,29 @@ class TokenStreamer:
         """
         try:
             import litellm
-            
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                stream=True,
-            )
-            
+
+            # F2/A1 事件循环冻结根治：同 stream_completion，litellm 流式迭代
+            # 经线程桥剥离到工作线程（详见 app.services.llm.sync_stream_bridge）。
+            from app.services.llm.sync_stream_bridge import iter_sync_stream
+
+            kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+                "stream": True,
+            }
+
             # 工具调用累积器
             tool_calls_accumulator: Dict[int, Dict] = {}
-            
-            async for chunk in response:
+
+            async for chunk in iter_sync_stream(
+                lambda: litellm.completion(**kwargs),
+                stream_name="llm-token-streamer-tools",
+            ):
                 if self._cancelled:
                     break
                 

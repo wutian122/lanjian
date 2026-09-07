@@ -124,7 +124,7 @@ class TestStreamMaxTokensError:
         adapter = _make_adapter(base_url=None)
         exc = _make_litellm_api_error("max_tokens must be less than 32768")
         error_chunks = []
-        with patch("litellm.acompletion", side_effect=exc):
+        with patch("litellm.completion", side_effect=exc):
             async for chunk in adapter.stream_complete(_make_request()):
                 if chunk.get("type") == "error":
                     error_chunks.append(chunk)

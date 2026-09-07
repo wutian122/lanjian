@@ -568,20 +568,16 @@ class TestGuardOnThreePaths:
 
     @pytest.mark.asyncio
     async def test_litellm_stream_path_strips_thinking_off(self):
-        """路径③litellm 流式（stream_complete → litellm.acompletion，SGLang 流式
-        实际路径）：关思考参数与 <|think_off|> 标记到不了 acompletion"""
+        """路径③litellm 流式（stream_complete → litellm.completion 同步线程桥，
+        SGLang 流式实际路径）：关思考参数与 <|think_off|> 标记到不了出站调用"""
         adapter = LiteLLMAdapter(_make_config())
         captured: Dict[str, Any] = {}
 
-        async def _fake_acompletion(**kwargs: Any):
+        def _fake_completion(**kwargs: Any):
             captured.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion):
+        with patch("litellm.completion", _fake_completion):
             chunks = [
                 c
                 async for c in adapter.stream_complete(
@@ -641,15 +637,11 @@ class TestGuardOnThreePaths:
         adapter3 = LiteLLMAdapter(_make_config())
         captured3: Dict[str, Any] = {}
 
-        async def _fake_acompletion3(**kwargs: Any):
+        def _fake_completion3(**kwargs: Any):
             captured3.update(kwargs)
+            return iter([_make_stream_chunk("x", finish_reason="stop")])
 
-            async def _iter():
-                yield _make_stream_chunk("x", finish_reason="stop")
-
-            return _iter()
-
-        with patch("litellm.acompletion", _fake_acompletion3):
+        with patch("litellm.completion", _fake_completion3):
             [c async for c in adapter3.stream_complete(
                 _make_request(messages=[LLMMessage(role="user", content="hi")])
             )]
