@@ -162,6 +162,56 @@ def _map_semgrep_to_vuln_type(check_id: str) -> str:
     return "other"
 
 
+# F1（Task 11 follow-up）：Semgrep 兜底只保留"有确定性 PoC 专用模板"的漏洞
+# 类型——与 verification._gen_sandbox_command 的 cmd_templates 专用模板集合
+# 保持一致。配置类（.github/Dockerfile 等，vulnerability_type=other）与
+# weak_crypto/xxe 等走 default 通用模板的类型，确定性 PoC 只能输出
+# NO_SINK/STATIC_CONFIRMED，无验证价值却占用沙箱验证预算（Task 19 生产实证：
+# 40 条 semgrep_fallback 候选全为配置类，拖垮 Verification LLM 循环，时间
+# 预算烧穿导致 verification 未跑、attempt 无法落库验收）。
+VERIFIABLE_SEMGREP_TYPES: frozenset[str] = frozenset({
+    "sql_injection",
+    "command_injection",
+    "xss",
+    "path_traversal",
+    "ssrf",
+    "auth_missing",
+    "tenant_isolation",
+    "idor",
+    "hardcoded_secret",
+    "deserialization",
+})
+
+# _map_semgrep_to_vuln_type 对 SQL/注入类 check_id（含 "sql"/"injection"）
+# 统一返回泛化 "injection"——该名称在 verification 模板表中无专用模板
+# （子串匹配 key-in-vuln_type 方向也命不中），会落入 default 空转。兜底
+# 落库前规范化为 "sql_injection"，使确定性 SQL PoC 模板能正确分派
+# （规则集 p/sql-injection 的 check_id 均含 "sql"，主导该映射分支）。
+_SEMGREP_FALLBACK_TYPE_ALIASES: dict[str, str] = {
+    "injection": "sql_injection",
+}
+
+# 兜底候选严重度下限：INFO/LOW 不送沙箱（低严重度命中无确定性验证价值）。
+_SEMGREP_FALLBACK_SEVERITY_ORDER: dict[str, int] = {
+    "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
+}
+_SEMGREP_FALLBACK_MIN_SEVERITY_RANK = 2  # medium
+
+
+def _is_verifiable_semgrep_candidate(candidate: dict[str, Any]) -> bool:
+    """F1: 兜底候选是否值得送沙箱——类型有确定性 PoC 专用模板且 severity ≥ medium。
+
+    入参为 _build_semgrep_fallback_candidates 产物（vulnerability_type 已做
+    别名规范化）；未知 severity 按 medium 处理（预扫仅产出 high/medium/low）。
+    """
+    vuln_type = str(candidate.get("vulnerability_type") or "").strip().lower()
+    if vuln_type not in VERIFIABLE_SEMGREP_TYPES:
+        return False
+    severity = str(candidate.get("severity") or "medium").strip().lower()
+    rank = _SEMGREP_FALLBACK_SEVERITY_ORDER.get(severity, _SEMGREP_FALLBACK_MIN_SEVERITY_RANK)
+    return rank >= _SEMGREP_FALLBACK_MIN_SEVERITY_RANK
+
+
 @dataclass
 class AgentStep:
     """执行步骤"""
@@ -684,6 +734,8 @@ class OrchestratorAgent(BaseAgent):
             seen.add(key)
             message = sf.get("description") or rule_id or "Semgrep 静态扫描发现"
             title = message if len(message) <= 120 else message[:120]
+            raw_type = sf.get("vulnerability_type") or _map_semgrep_to_vuln_type(rule_id)
+            vuln_type = _SEMGREP_FALLBACK_TYPE_ALIASES.get(str(raw_type).lower(), raw_type)
             candidates.append({
                 "title": title or rule_id,
                 "description": f"[静态扫描兜底候选] {message}（Semgrep 规则: {rule_id}）",
@@ -691,7 +743,7 @@ class OrchestratorAgent(BaseAgent):
                 "line_start": sf.get("line_start", 0),
                 "line_end": sf.get("line_end", 0),
                 "severity": sf.get("severity") or "medium",
-                "vulnerability_type": sf.get("vulnerability_type") or _map_semgrep_to_vuln_type(rule_id),
+                "vulnerability_type": vuln_type,
                 "code_snippet": sf.get("code_snippet", ""),
                 "confidence": 0.5,
                 "needs_verification": True,
@@ -716,8 +768,46 @@ class OrchestratorAgent(BaseAgent):
             if self._actionable_findings():
                 return 0
             candidates = self._build_semgrep_fallback_candidates()
-            added = 0
+            # F1: 落库前过滤——只保留有确定性 PoC 专用模板且 severity ≥ medium
+            # 的候选；配置类/default 模板类型不送沙箱（Task 19 生产实证：配置类
+            # 候选只能产出 NO_SINK，白烧验证预算拖垮 Verification 循环）。
+            verifiable: list[dict[str, Any]] = []
+            filtered: list[dict[str, Any]] = []
             for candidate in candidates:
+                if _is_verifiable_semgrep_candidate(candidate):
+                    verifiable.append(candidate)
+                else:
+                    filtered.append(candidate)
+            if filtered:
+                type_counts: dict[str, int] = {}
+                low_sev_counts: dict[str, int] = {}
+                for c in filtered:
+                    ctype = str(c.get("vulnerability_type") or "unknown")
+                    type_counts[ctype] = type_counts.get(ctype, 0) + 1
+                    sev = str(c.get("severity") or "medium").strip().lower()
+                    if _SEMGREP_FALLBACK_SEVERITY_ORDER.get(
+                        sev, _SEMGREP_FALLBACK_MIN_SEVERITY_RANK
+                    ) < _SEMGREP_FALLBACK_MIN_SEVERITY_RANK:
+                        low_sev_counts[sev] = low_sev_counts.get(sev, 0) + 1
+                breakdown = ", ".join(f"{t}×{n}" for t, n in sorted(type_counts.items()))
+                sev_detail = (
+                    "；低严重度分布: "
+                    + ", ".join(f"{s}×{n}" for s, n in sorted(low_sev_counts.items()))
+                    if low_sev_counts
+                    else ""
+                )
+                self._record_gate_observation(
+                    "semgrep_fallback_filtered",
+                    f"{len(filtered)} 条 Semgrep 兜底候选无确定性 PoC 验证条件"
+                    f"（类型分布: {breakdown}{sev_detail}），"
+                    "不进验证队列、不送沙箱、不入兜底候选报告段落",
+                )
+                logger.info(
+                    f"[Orchestrator] Semgrep fallback filtered {len(filtered)} non-verifiable "
+                    f"candidates (types: {breakdown}, low-severity: {sum(low_sev_counts.values())})"
+                )
+            added = 0
+            for candidate in verifiable:
                 normalized = self._normalize_finding(candidate)
                 if normalized is None:
                     continue
