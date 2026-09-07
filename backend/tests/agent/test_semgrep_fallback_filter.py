@@ -213,6 +213,108 @@ async def test_all_filtered_keeps_no_fallback_semantics():
     assert len(_filtered_obs(agent)) == 1
 
 
+# ============ 别名二次分流：injection → sql/command ============
+
+@pytest.mark.asyncio
+async def test_command_injection_check_id_routes_to_command_template():
+    """命令注入规则 id（含 'injection' 被 _map 截胡为泛化 'injection'）兜底
+    落库类型必须是 command_injection（不是 sql_injection）——否则误走 SQL
+    模板（sink 硬编码 execute/raw/query，subprocess/os.system 0 命中）
+    退化为 NO_SINK 假阴。"""
+    from app.services.agent.agents.verification import VerificationAgent
+
+    agent = _make_orch()
+    agent._semgrep_findings = [
+        _semgrep_finding(
+            path="app/run.py",
+            rule="python.lang.security.audit.os-command-injection",
+            message="OS command injection via subprocess",
+            vuln_type=None,  # 走 _map_semgrep_to_vuln_type → "injection"
+        ),
+    ]
+
+    added = await agent._apply_semgrep_fallback()
+
+    assert added == 1
+    vtype = agent._all_findings[0]["vulnerability_type"]
+    assert vtype == "command_injection", f"命令注入误标为 {vtype!r}"
+
+    # 模板分派：command_injection 专用模板（命令 sink），不是 SQL 模板
+    verifier = VerificationAgent.__new__(VerificationAgent)
+    matched = verifier._gen_sandbox_command(vtype, "app/run.py", 10, "cmd inj", 0)
+    cmd = matched["input"]["command"]
+    assert "command_injection" in matched["label"]
+    assert "subprocess" in cmd or "os.system" in cmd or "os.popen" in cmd
+    assert "sqlite3" not in cmd, "命令注入不得走 SQL 模板"
+
+
+@pytest.mark.asyncio
+async def test_sql_injection_check_id_routes_to_sql_template():
+    """纯 SQL 规则 id 兜底落库类型 = sql_injection，走 SQL 专用模板。"""
+    from app.services.agent.agents.verification import VerificationAgent
+
+    agent = _make_orch()
+    agent._semgrep_findings = [
+        _semgrep_finding(
+            path="app/db.py",
+            rule="python.django.security.injection.sql.sql-injection",
+            vuln_type=None,
+        ),
+    ]
+
+    added = await agent._apply_semgrep_fallback()
+
+    assert added == 1
+    vtype = agent._all_findings[0]["vulnerability_type"]
+    assert vtype == "sql_injection"
+
+    verifier = VerificationAgent.__new__(VerificationAgent)
+    matched = verifier._gen_sandbox_command(vtype, "app/db.py", 10, "sqli", 0)
+    assert "sqlite3" in matched["input"]["command"]
+
+
+@pytest.mark.asyncio
+async def test_other_injection_check_id_without_command_hint_routes_to_sql():
+    """其他含 'injection' 但无 command/exec/subprocess 线索的 check_id
+    （_map 第 1 分支截胡为 'injection'，如 open-redirect-injection 类）：
+    兜底按 F1 别名现状落 sql_injection（确定性专用模板优于 default 空转）。"""
+    agent = _make_orch()
+    agent._semgrep_findings = [
+        _semgrep_finding(
+            path="app/web.py",
+            rule="custom.open-redirect-injection",
+            vuln_type=None,
+        ),
+    ]
+
+    added = await agent._apply_semgrep_fallback()
+
+    assert added == 1
+    assert agent._all_findings[0]["vulnerability_type"] == "sql_injection"
+
+
+@pytest.mark.parametrize(
+    "rule_id,expected",
+    [
+        ("p.command-injection", "command_injection"),
+        ("java.lang.security.audit.os-command-injection", "command_injection"),
+        ("python.lang.security.audit.dangerous-asyncio-exec-injection", "command_injection"),
+        ("p.sql-injection", "sql_injection"),
+        ("p.sql-injection.execute", "sql_injection"),
+    ],
+)
+def test_canonicalize_type_mapping_unit(rule_id, expected):
+    """分流函数单元：命令注入关键词 → command_injection；含 sql → sql_injection。"""
+    from app.services.agent.agents.orchestrator import (
+        _canonicalize_semgrep_fallback_type,
+    )
+
+    assert _canonicalize_semgrep_fallback_type("injection", rule_id) == expected
+    # 非 injection 类型原样返回（不干预其他映射）
+    assert _canonicalize_semgrep_fallback_type("xss", rule_id) == "xss"
+    assert _canonicalize_semgrep_fallback_type("other", rule_id) == "other"
+
+
 # ============ ⑤ 去重与过滤共存 ============
 
 @pytest.mark.asyncio

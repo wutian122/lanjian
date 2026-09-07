@@ -182,14 +182,28 @@ VERIFIABLE_SEMGREP_TYPES: frozenset[str] = frozenset({
     "deserialization",
 })
 
-# _map_semgrep_to_vuln_type 对 SQL/注入类 check_id（含 "sql"/"injection"）
-# 统一返回泛化 "injection"——该名称在 verification 模板表中无专用模板
-# （子串匹配 key-in-vuln_type 方向也命不中），会落入 default 空转。兜底
-# 落库前规范化为 "sql_injection"，使确定性 SQL PoC 模板能正确分派
-# （规则集 p/sql-injection 的 check_id 均含 "sql"，主导该映射分支）。
-_SEMGREP_FALLBACK_TYPE_ALIASES: dict[str, str] = {
-    "injection": "sql_injection",
-}
+# _map_semgrep_to_vuln_type 第 1 分支（"injection" in cid）截胡了第 156 行
+# 的 command_injection 分支：SQL 类与命令注入类 check_id 都含 "injection"，
+# 一律被泛化为 "injection"——该名称在 verification 模板表中无专用键，且
+# 一刀切削为 sql_injection 会让命令注入候选误走 SQL 模板（sink 硬编码
+# execute/raw/query，subprocess/os.system 0 命中 → NO_SINK 假阴）。兜底
+# 落库前按 rule_id 二次分流：命令注入关键词（command/exec/subprocess）
+# 且不含 sql → command_injection；否则 → sql_injection。
+def _canonicalize_semgrep_fallback_type(raw_type: Any, rule_id: str) -> str:
+    """规范化兜底候选 vulnerability_type；仅对泛化 "injection" 二次分流。
+
+    非 "injection" 类型原样返回（不干预 _map 的其他映射结果）。
+    """
+    vtype = str(raw_type or "").strip().lower()
+    if vtype != "injection":
+        return raw_type
+    cid = str(rule_id or "").lower()
+    if (
+        "command" in cid or "exec" in cid or "subprocess" in cid
+    ) and "sql" not in cid:
+        return "command_injection"
+    return "sql_injection"
+
 
 # 兜底候选严重度下限：INFO/LOW 不送沙箱（低严重度命中无确定性验证价值）。
 _SEMGREP_FALLBACK_SEVERITY_ORDER: dict[str, int] = {
@@ -735,7 +749,7 @@ class OrchestratorAgent(BaseAgent):
             message = sf.get("description") or rule_id or "Semgrep 静态扫描发现"
             title = message if len(message) <= 120 else message[:120]
             raw_type = sf.get("vulnerability_type") or _map_semgrep_to_vuln_type(rule_id)
-            vuln_type = _SEMGREP_FALLBACK_TYPE_ALIASES.get(str(raw_type).lower(), raw_type)
+            vuln_type = _canonicalize_semgrep_fallback_type(raw_type, rule_id)
             candidates.append({
                 "title": title or rule_id,
                 "description": f"[静态扫描兜底候选] {message}（Semgrep 规则: {rule_id}）",
