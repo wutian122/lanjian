@@ -40,6 +40,48 @@ class _LLMCriticalStreamError(Exception):
         self.user_message = user_message
 
 
+# F2 块 3：per-chunk 取消坑防堵常量（秒）。
+# per-chunk wait_for 超时后，取消在飞 __anext__ fetch 后等待其收口的时限；
+# 超时即放弃等待（吞取消的协程无法强制杀死），转显式 aclose 收口。
+_ST_FETCH_CANCEL_SETTLE_SECONDS = 5.0
+# aclose 迭代器本身的收口时限（async-generator 收尾挂起时不阻断超时处理）。
+_ST_ACLOSE_TIMEOUT_SECONDS = 5.0
+
+
+async def _safe_aclose_stream(iterator: Any) -> None:
+    """best-effort 关闭 async 流迭代器（F2 块 3 取消坑防堵）。
+
+    - 正常/已关闭的迭代器 aclose 立即完成（幂等）；
+    - __anext__ 在飞时 async generator 的 aclose 会同步抛 RuntimeError
+      （"asynchronous generator is already running"）——吞掉，等 fetch 取消
+      收口后 finally 里的下一次 aclose 生效；
+    - aclose 自身挂起（生成器收尾 await 死锁）时用 asyncio.wait 限时放弃，
+      不阻断消费端超时/取消收口；
+    - 不吞 CancelledError：自身被取消时必须传播。
+    """
+    try:
+        aclose_task: asyncio.Task = asyncio.ensure_future(iterator.aclose())
+    except Exception:
+        # 迭代器没有 aclose 或已释放
+        return
+    try:
+        done, _pending = await asyncio.wait(
+            {aclose_task}, timeout=_ST_ACLOSE_TIMEOUT_SECONDS
+        )
+        if not done:
+            aclose_task.cancel()
+            logger.warning(
+                "[LLM] 流迭代器 aclose 在 %ss 内未收口（生成器收尾挂起），放弃等待",
+                _ST_ACLOSE_TIMEOUT_SECONDS,
+            )
+            return
+        aclose_task.result()  # 取回结果（异常同样记录，不外抛）
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("[LLM] 流迭代器 aclose 失败（非致命）", exc_info=True)
+
+
 class AgentType(Enum):
     """Agent 类型"""
     ORCHESTRATOR = "orchestrator"
@@ -331,6 +373,10 @@ class BaseAgent(ABC):
         # 时间预算软停止（与取消语义分离，见 fix-audit-time-budget-2026-08）
         self._soft_stop = False
         self._soft_stop_consumed = False
+        # F2 补丁③：当前 in-flight 流式 LLM 迭代器（_consume 挂、退出清）。
+        # hard_interrupt_stream() 据此直接 aclose 生成器（线程桥 stop_event
+        # 随之置位），供 watchdog hard-cancel 兜底；正常路径无外部调用。
+        self._stream_iter: Any = None
         # LLM 输出截断标志：最近一轮 stream_llm_call 是否 finish_reason=length
         # （每轮调用开始时重置；Final Answer 解析失败路径据此归因"疑似 max_tokens 截断"）
         self._last_llm_truncated = False
@@ -599,6 +645,24 @@ class BaseAgent(ABC):
         self._soft_stop = False
         self._soft_stop_consumed = True
         return True
+
+    async def hard_interrupt_stream(self) -> None:
+        """强制关闭 in-flight 流式 LLM 迭代器（F2 补丁③，watchdog 兜底调用）。
+
+        与 cancel() 的协作标志语义互补：cancel() 只置标志、靠 await 点抛
+        CancelledError 逐层传播；本方法直接 aclose 当前 _consume 挂在
+        self._stream_iter 上的 async generator——线程桥（sync_stream_bridge）
+        收到 aclose 后 finally 置 stop_event，工作线程在下个 chunk 边界退出；
+        普通 async 流收到 GeneratorExit 立即收口。
+
+        限制：__anext__ 在飞时 async generator 的 aclose 同步抛 RuntimeError
+        （"already running"），由 _safe_aclose_stream 吞掉——此时取消信号
+        才是可靠解堵手段（watchdog 顺序：先 cancel run_task 再调本方法，
+        待 fetch 收口后 aclose 生效）。best-effort，任何异常不外抛。
+        """
+        iterator = getattr(self, "_stream_iter", None)
+        if iterator is not None:
+            await _safe_aclose_stream(iterator)
 
     def _get_llm_rate_limiter(self):
         """获取 LLM 限流器。
@@ -1202,122 +1266,169 @@ class BaseAgent(ABC):
             )
             # 兼容不同版本的 python async generator
             iterator = stream.__aiter__()
+            # F2 补丁③：挂 self 供 hard_interrupt_stream（watchdog 兜底）强制关闭
+            self._stream_iter = iterator
 
             import time
             first_token_received = False
             last_activity = time.time()
+            fetch_task: Optional[asyncio.Task] = None
 
-            while True:
-                # 检查取消
-                if self.is_cancelled:
-                    logger.info(f"[{self.name}] Cancelled during LLM streaming loop")
-                    break
-                
-                try:
-                    # 🔥 使用用户配置的超时时间
-                    # 第一个 token 使用首Token超时，后续 token 使用流式超时
-                    first_token_timeout = float(self._timeout_config.get('llm_first_token_timeout', 30))
-                    stream_timeout = float(self._timeout_config.get('llm_stream_timeout', 60))
-                    timeout = first_token_timeout if not first_token_received else stream_timeout
-
-                    chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
-
-                    last_activity = time.time()
-                    
-                    if chunk["type"] == "token":
-                        first_token_received = True
-                        token = chunk["content"]
-                        # structured-output-protocol Task 4：按 chunk kind 分流。
-                        # adapter（Task 3）对 reasoning_content/content 两个独立通道
-                        # 分别 yield 并带 accumulated_content/accumulated_reasoning 累计键；
-                        # 旧后端/NATIVE_ONLY 伪流式 chunk 无 kind，保持全量走思考流（兼容）。
-                        kind = chunk.get("kind")
-                        # 拼接累计键（新协议=思考+正文按序拼接，旧后端=全文）：
-                        # 必须在分支发射前读取——旧路径思考流的 accumulated 即此值；
-                        # 新路径它只作 error/timeout 兜底返回值（done 时被 content 覆盖）
-                        if "accumulated" in chunk:
-                            accumulated = chunk["accumulated"]
-                        if kind == "reasoning":
-                            stream_has_kind = True
-                            # 信任 adapter 的通道累计键（同旧逻辑信任 accumulated），缺失则自拼
-                            if "accumulated_reasoning" in chunk:
-                                accumulated_reasoning = chunk["accumulated_reasoning"]
-                            else:
-                                accumulated_reasoning += token
-                            await self.emit_thinking_token(token, accumulated_reasoning)
-                        elif kind == "content":
-                            stream_has_kind = True
-                            content_emitted = True
-                            if "accumulated_content" in chunk:
-                                accumulated_content = chunk["accumulated_content"]
-                            else:
-                                accumulated_content += token
-                            await self.emit_content_token(token, accumulated_content)
-                        else:
-                            # 无 kind（旧后端/伪流式）：全部走思考流，行为同 Task 4 前
-                            if not accumulated and token:
-                                accumulated += token  # adapter 未返回 accumulated 时的 fallback
-                            await self.emit_thinking_token(token, accumulated)
-
-                        # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
-                        await asyncio.sleep(0)
-
-                    elif chunk["type"] == "done":
-                        # Task 3 语义：done.content 仅正文（旧后端/伪流式无 reasoning 键，
-                        # content 即全文）；新协议 done 另带 reasoning 仅思考累计。
-                        accumulated = chunk["content"]
-                        if "reasoning" in chunk:
-                            stream_has_kind = True
-                            accumulated_content = chunk["content"]
-                            accumulated_reasoning = chunk["reasoning"]
-                        # Task 7：原生 tool_calls 聚合结果（adapter done 块携带）；
-                        # 无该键时保持开头重置的 None（文本协议轮）
-                        if chunk.get("tool_calls"):
-                            self._last_tool_calls = chunk["tool_calls"]
-                        if chunk.get("usage"):
-                            total_tokens = chunk["usage"].get("total_tokens", 0)
-                            # Task 14：token 拆分落 trace（usage 缺失时保持 0）
-                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
-                            completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
-                        # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
-                        if chunk.get("finish_reason") == "length":
-                            self._last_llm_truncated = True
-                            await self._record_llm_truncation(max_tokens)
+            try:
+                while True:
+                    # 检查取消
+                    if self.is_cancelled:
+                        logger.info(f"[{self.name}] Cancelled during LLM streaming loop")
                         break
 
-                    elif chunk["type"] == "error":
-                        accumulated = chunk.get("accumulated", "")
-                        error_msg = chunk.get("error", "Unknown error")
-                        error_type = chunk.get("error_type", "unknown")
-                        # 🔥 优先用 adapter 提供的 user_message；缺失时用安全占位，避免 raw error（可能含 API Key）泄露到日志/SSE
-                        user_message = chunk.get("user_message") or f"[{error_type} 错误，无详细消息]"
-                        logger.error(f"[{self.name}] Stream error ({error_type}): {error_msg}")
+                    try:
+                        # 🔥 使用用户配置的超时时间
+                        # 第一个 token 使用首Token超时，后续 token 使用流式超时
+                        first_token_timeout = float(self._timeout_config.get('llm_first_token_timeout', 30))
+                        stream_timeout = float(self._timeout_config.get('llm_stream_timeout', 60))
+                        timeout = first_token_timeout if not first_token_received else stream_timeout
 
-                        if chunk.get("usage"):
-                            total_tokens = chunk["usage"].get("total_tokens", 0)
-                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
-                            completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+                        # F2 块 3（Py3.12 wait_for 取消坑）：wait_for 直接包裹
+                        # iterator.__anext__() 时，若 async-generator 吞掉超时
+                        # 取消（__anext__ 内 except CancelledError 后 return/
+                        # continue），TimeoutError 会丢失（实测：吞后 return 时
+                        # wait_for 折成 StopAsyncIteration 被误判正常结束；吞后
+                        # 继续时迟到 chunk 被当成功返回）。用 shield 保证超时控制
+                        # 权必回消费端；超时后在 except TimeoutError 显式取消在飞
+                        # fetch 并 aclose 生成器（线程桥 stop_event 随之置位）。
+                        fetch_task = asyncio.ensure_future(iterator.__anext__())
+                        chunk = await asyncio.wait_for(
+                            asyncio.shield(fetch_task), timeout=timeout
+                        )
 
-                        # 使用特殊前缀标记 API 错误，让调用方能够识别
-                        # 格式：[API_ERROR:error_type] user_message
-                        if error_type in ("rate_limit", "quota_exceeded", "authentication", "connection"):
-                            accumulated = f"[API_ERROR:{error_type}] {user_message}"
-                            raise _LLMCriticalStreamError(error_type, user_message)
-                        elif not accumulated:
-                            accumulated = f"[系统错误: {error_msg}] 请重新思考并输出你的决策。"
-                        break
-
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    timeout_type = "First Token" if not first_token_received else "Stream"
-                    logger.error(f"[{self.name}] LLM {timeout_type} Timeout ({timeout}s)")
-                    error_msg = f"LLM 响应超时 ({timeout_type}, {timeout}s)"
-                    await self.emit_event("error", error_msg)
-                    if not accumulated:
-                         accumulated = f"[超时错误: {timeout}s 无响应] 请尝试简化请求或重试。"
-                    break
+                        last_activity = time.time()
                     
+                        if chunk["type"] == "token":
+                            first_token_received = True
+                            token = chunk["content"]
+                            # structured-output-protocol Task 4：按 chunk kind 分流。
+                            # adapter（Task 3）对 reasoning_content/content 两个独立通道
+                            # 分别 yield 并带 accumulated_content/accumulated_reasoning 累计键；
+                            # 旧后端/NATIVE_ONLY 伪流式 chunk 无 kind，保持全量走思考流（兼容）。
+                            kind = chunk.get("kind")
+                            # 拼接累计键（新协议=思考+正文按序拼接，旧后端=全文）：
+                            # 必须在分支发射前读取——旧路径思考流的 accumulated 即此值；
+                            # 新路径它只作 error/timeout 兜底返回值（done 时被 content 覆盖）
+                            if "accumulated" in chunk:
+                                accumulated = chunk["accumulated"]
+                            if kind == "reasoning":
+                                stream_has_kind = True
+                                # 信任 adapter 的通道累计键（同旧逻辑信任 accumulated），缺失则自拼
+                                if "accumulated_reasoning" in chunk:
+                                    accumulated_reasoning = chunk["accumulated_reasoning"]
+                                else:
+                                    accumulated_reasoning += token
+                                await self.emit_thinking_token(token, accumulated_reasoning)
+                            elif kind == "content":
+                                stream_has_kind = True
+                                content_emitted = True
+                                if "accumulated_content" in chunk:
+                                    accumulated_content = chunk["accumulated_content"]
+                                else:
+                                    accumulated_content += token
+                                await self.emit_content_token(token, accumulated_content)
+                            else:
+                                # 无 kind（旧后端/伪流式）：全部走思考流，行为同 Task 4 前
+                                if not accumulated and token:
+                                    accumulated += token  # adapter 未返回 accumulated 时的 fallback
+                                await self.emit_thinking_token(token, accumulated)
+
+                            # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
+                            await asyncio.sleep(0)
+
+                        elif chunk["type"] == "done":
+                            # Task 3 语义：done.content 仅正文（旧后端/伪流式无 reasoning 键，
+                            # content 即全文）；新协议 done 另带 reasoning 仅思考累计。
+                            accumulated = chunk["content"]
+                            if "reasoning" in chunk:
+                                stream_has_kind = True
+                                accumulated_content = chunk["content"]
+                                accumulated_reasoning = chunk["reasoning"]
+                            # Task 7：原生 tool_calls 聚合结果（adapter done 块携带）；
+                            # 无该键时保持开头重置的 None（文本协议轮）
+                            if chunk.get("tool_calls"):
+                                self._last_tool_calls = chunk["tool_calls"]
+                            if chunk.get("usage"):
+                                total_tokens = chunk["usage"].get("total_tokens", 0)
+                                # Task 14：token 拆分落 trace（usage 缺失时保持 0）
+                                prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
+                                completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+                            # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
+                            if chunk.get("finish_reason") == "length":
+                                self._last_llm_truncated = True
+                                await self._record_llm_truncation(max_tokens)
+                            break
+
+                        elif chunk["type"] == "error":
+                            accumulated = chunk.get("accumulated", "")
+                            error_msg = chunk.get("error", "Unknown error")
+                            error_type = chunk.get("error_type", "unknown")
+                            # 🔥 优先用 adapter 提供的 user_message；缺失时用安全占位，避免 raw error（可能含 API Key）泄露到日志/SSE
+                            user_message = chunk.get("user_message") or f"[{error_type} 错误，无详细消息]"
+                            logger.error(f"[{self.name}] Stream error ({error_type}): {error_msg}")
+
+                            if chunk.get("usage"):
+                                total_tokens = chunk["usage"].get("total_tokens", 0)
+                                prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
+                                completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+
+                            # 使用特殊前缀标记 API 错误，让调用方能够识别
+                            # 格式：[API_ERROR:error_type] user_message
+                            if error_type in ("rate_limit", "quota_exceeded", "authentication", "connection"):
+                                accumulated = f"[API_ERROR:{error_type}] {user_message}"
+                                raise _LLMCriticalStreamError(error_type, user_message)
+                            elif not accumulated:
+                                accumulated = f"[系统错误: {error_msg}] 请重新思考并输出你的决策。"
+                            break
+
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        # shield 已保证超时控制权必回此处（Py3.12 取消坑）。
+                        # 显式取消在飞 fetch 并限时等其收口（吞取消的协程无法
+                        # 强制杀死，到点即放弃等待），再 aclose 生成器强制释放
+                        # （线程桥 stop_event 随之置位）；finally 会再 aclose 一次
+                        # （幂等），这里先关是为了错误处理 await 期间不留悬挂流。
+                        if fetch_task is not None and not fetch_task.done():
+                            fetch_task.cancel()
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(fetch_task),
+                                    timeout=_ST_FETCH_CANCEL_SETTLE_SECONDS,
+                                )
+                            except asyncio.CancelledError:
+                                # 外层（watchdog/用户）取消必须传播；fetch 自我
+                                # 取消经 shield 折出的 CancelledError（current task
+                                # 无 cancel 请求）则继续超时收口
+                                if asyncio.current_task().cancelling() > 0:
+                                    raise
+                            except Exception:
+                                # fetch 收口的 StopAsyncIteration/TimeoutError 等：
+                                # 吞掉，继续 aclose 与超时收口
+                                pass
+                        await _safe_aclose_stream(iterator)
+                        timeout_type = "First Token" if not first_token_received else "Stream"
+                        logger.error(f"[{self.name}] LLM {timeout_type} Timeout ({timeout}s)")
+                        error_msg = f"LLM 响应超时 ({timeout_type}, {timeout}s)"
+                        await self.emit_event("error", error_msg)
+                        if not accumulated:
+                             accumulated = f"[超时错误: {timeout}s 无响应] 请尝试简化请求或重试。"
+                        break
+                    
+            finally:
+                # F2 块 3：任何退出路径（正常 done/StopAsyncIteration/
+                # 超时/外部取消）都释放 in-flight fetch 与迭代器——
+                # aclose 触发线程桥 finally 置 stop_event，无悬挂流。
+                self._stream_iter = None
+                if fetch_task is not None and not fetch_task.done():
+                    fetch_task.cancel()
+                await _safe_aclose_stream(iterator)
+
             return accumulated, total_tokens
 
         try:

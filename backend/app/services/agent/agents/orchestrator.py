@@ -1032,6 +1032,49 @@ class OrchestratorAgent(BaseAgent):
         self._deadline_hit = True
         self.cancel()
 
+    async def _hard_interrupt(self) -> None:
+        """F2 补丁③：watchdog hard-cancel 兜底——强制关闭本任务所有 agent 的
+        in-flight LLM 流迭代器。
+
+        run_task.cancel 的 CancelledError 被某层吞掉/收口协程又发起新流时，
+        本方法在资源层直接 aclose 各 agent 的 _stream_iter（线程桥 stop_event
+        随之置位，工作线程在下个 chunk 边界退出），把卡在等下一个 chunk 的
+        协程解除。best-effort：任何异常不外抛（watchdog 兜底不得被二次故障
+        阻断）；__anext__ 在飞时 aclose 抛 RuntimeError 由底层 _safe_aclose
+        吞掉（见 BaseAgent.hard_interrupt_stream 限制说明）。
+        """
+        from app.services.agent.core.registry import agent_registry
+
+        try:
+            await self.hard_interrupt_stream()
+        except Exception:
+            logger.warning(
+                f"[{self.name}] _hard_interrupt self aclose failed", exc_info=True
+            )
+
+        task_id = (getattr(self, "_runtime_context", None) or {}).get("task_id")
+        if not task_id:
+            return
+        try:
+            for agent_id in agent_registry.get_task_agent_ids(task_id):
+                inst = agent_registry.get_agent(agent_id)
+                if inst is None or inst is self:
+                    continue
+                close = getattr(inst, "hard_interrupt_stream", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        logger.warning(
+                            f"[{self.name}] _hard_interrupt aclose failed "
+                            f"for agent {agent_id}",
+                            exc_info=True,
+                        )
+        except Exception:
+            logger.warning(
+                f"[{self.name}] _hard_interrupt registry walk failed", exc_info=True
+            )
+
     def _apply_deadline_bypass(self, reason: str) -> None:
         """按预算治理语义设置覆盖率安全阀 metadata（复用 5 字段唯一构造点）。"""
         if self._coverage_bypassed:

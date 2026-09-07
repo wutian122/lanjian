@@ -34,7 +34,16 @@ import pytest
 from app.api.v1.endpoints import agent_tasks
 from app.api.v1.endpoints.agent_tasks import _run_orchestrator_with_budget_watchdog
 from app.core.config import settings
+from app.services.agent.agents import base as agent_base_module
 from app.services.agent.agents.base import AgentResult
+from app.services.agent.agents.orchestrator import OrchestratorAgent
+from app.services.agent.agents.recon import ReconAgent
+from app.services.agent.core.circuit_breaker import (
+    CircuitState,
+    CircuitStats,
+    get_llm_circuit,
+)
+from app.services.agent.core.rate_limiter import get_llm_rate_limiter
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +261,200 @@ class TestWatchdogCancelSemanticsBoundary:
         orch.mark_deadline_hit.assert_not_called()
         assert not run_task.cancelled()
         emitter.emit_warning.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 块 3：per-chunk 取消坑防堵（BaseAgent.stream_llm_call._consume）
+# ---------------------------------------------------------------------------
+
+
+class _TrackingStream:
+    """包装 async generator 的假流：记录 aclose 调用（_consume 必须显式关闭）。"""
+
+    def __init__(self, gen):
+        self._gen = gen
+        self.aclosed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._gen.__anext__()
+
+    async def aclose(self):
+        # __anext__ 在飞时底层 gen.aclose() 会同步抛 RuntimeError
+        # （"async generator is already running"），原样抛出供上层验证
+        await self._gen.aclose()
+        self.aclosed = True
+
+
+def _reset_resilience():
+    c = get_llm_circuit()
+    c._state = CircuitState.CLOSED
+    c._stats = CircuitStats()
+    c._half_open_calls = 0
+    lim = get_llm_rate_limiter()
+    lim.tokens = float(lim.burst)
+    lim.last_update = time.monotonic()
+
+
+@pytest.fixture(autouse=True)
+def _reset_circuit():
+    _reset_resilience()
+    yield
+    _reset_resilience()
+
+
+def _make_streaming_agent(tracker, first_token_timeout=0.5):
+    emitter = MagicMock()
+    emitter.emit = AsyncMock()
+    emitter.emit_thinking_start = AsyncMock()
+    emitter.emit_thinking_token = AsyncMock()
+    emitter.emit_content_token = AsyncMock()
+    emitter.emit_thinking_end = AsyncMock()
+    emitter.emit_content_end = AsyncMock()
+    service = MagicMock()
+    service.get_agent_timeout_config = MagicMock(return_value={
+        "llm_first_token_timeout": first_token_timeout,
+        "llm_stream_timeout": 60,
+        "agent_timeout": 1800,
+        "sub_agent_timeout": 600,
+        "tool_timeout": 60,
+    })
+    service.config.max_tokens = 8192
+    service.chat_completion_stream = MagicMock(return_value=tracker)
+    return ReconAgent(llm_service=service, tools={}, event_emitter=emitter), emitter
+
+
+def _hang_then_done_gen():
+    """第一个 chunk 永远不到达（模拟 LLM 卡住），取消语义正常（不吞取消）。"""
+
+    async def _gen():
+        await asyncio.sleep(9999)
+        yield {"type": "done", "content": "late"}
+
+    return _gen()
+
+
+def _swallow_cancel_gen():
+    """取消坑模拟：__anext__ 内吞掉 CancelledError 后 return（生成器关闭）。
+
+    实测 Py3.12：wait_for 直接包裹时超时取消被吞，TimeoutError 折成
+    StopAsyncIteration（误判正常结束），超时防护静默失效。
+    """
+
+    async def _gen():
+        try:
+            await asyncio.sleep(9999)
+            yield {"type": "token", "content": "late"}
+        except asyncio.CancelledError:
+            return
+
+    return _gen()
+
+
+@pytest.mark.asyncio
+async def test_per_chunk_timeout_accloses_iterator(monkeypatch):
+    """块 3①：per-chunk 超时后必须显式 aclose in-flight 迭代器（无悬挂流，
+    线程桥 stop_event 随之置位），且超时错误照常发射。"""
+    monkeypatch.setattr(agent_base_module, "_ST_FETCH_CANCEL_SETTLE_SECONDS", 1.0)
+    monkeypatch.setattr(agent_base_module, "_ST_ACLOSE_TIMEOUT_SECONDS", 1.0)
+
+    tracker = _TrackingStream(_hang_then_done_gen())
+    agent, emitter = _make_streaming_agent(tracker)
+
+    t0 = time.monotonic()
+    content, _tokens = await agent.stream_llm_call(agent._conversation_history)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 5.0, f"per-chunk 超时未收口，等了 {elapsed:.1f}s"
+    assert tracker.aclosed, "per-chunk 超时后必须 aclose 迭代器"
+    assert "超时" in content, f"超时错误文案应返回给调用方，实际：{content!r}"
+    error_calls = [
+        c for c in emitter.emit.await_args_list
+        if c.args and getattr(c.args[0], "event_type", None) == "error"
+    ]
+    assert error_calls, "超时必须发射 error 事件"
+
+
+@pytest.mark.asyncio
+async def test_swallowed_cancel_timeout_still_enforced(monkeypatch):
+    """块 3②：生成器吞掉超时取消（Py3.12 wait_for 坑）时，超时防护仍生效：
+    shield 保证 TimeoutError 回到消费端，error 事件照常、迭代器显式关闭。"""
+    monkeypatch.setattr(agent_base_module, "_ST_FETCH_CANCEL_SETTLE_SECONDS", 1.0)
+    monkeypatch.setattr(agent_base_module, "_ST_ACLOSE_TIMEOUT_SECONDS", 1.0)
+
+    tracker = _TrackingStream(_swallow_cancel_gen())
+    agent, emitter = _make_streaming_agent(tracker)
+
+    t0 = time.monotonic()
+    content, _tokens = await agent.stream_llm_call(agent._conversation_history)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 5.0, f"吞取消后超时防护失效，等了 {elapsed:.1f}s"
+    assert tracker.aclosed, "吞取消场景仍必须 aclose 迭代器"
+    assert "超时" in content, f"超时文案应生效（旧代码静默结束返回空串）：{content!r}"
+    error_calls = [
+        c for c in emitter.emit.await_args_list
+        if c.args and getattr(c.args[0], "event_type", None) == "error"
+    ]
+    assert error_calls, "吞取消场景超时 error 事件不得丢失"
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_accloses_iterator(monkeypatch):
+    """块 3③：watchdog 取消（CancelledError 从外部打入）时，finally 必须
+    aclose 迭代器（线程桥 stop_event 置位），CancelledError 照常 re-raise。"""
+    monkeypatch.setattr(agent_base_module, "_ST_FETCH_CANCEL_SETTLE_SECONDS", 1.0)
+    monkeypatch.setattr(agent_base_module, "_ST_ACLOSE_TIMEOUT_SECONDS", 1.0)
+
+    tracker = _TrackingStream(_hang_then_done_gen())
+    agent, _emitter = _make_streaming_agent(tracker)
+
+    async def _call():
+        return await agent.stream_llm_call(agent._conversation_history)
+
+    call_task = asyncio.create_task(_call())
+    # 等流真正进入 in-flight 等待后取消
+    await asyncio.sleep(0.3)
+    call_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call_task, timeout=5.0)
+
+    assert tracker.aclosed, "外部取消路径必须 aclose 迭代器（线程桥 stop_event）"
+
+
+@pytest.mark.asyncio
+async def test_hard_interrupt_stream_accloses_iterator():
+    """补丁③：BaseAgent.hard_interrupt_stream() 直接 aclose 在飞迭代器；
+    无在飞迭代器时 no-op 不抛异常；orchestrator._hard_interrupt 路由本任务
+    全部 agent 的同一方法（best-effort 不外抛）。"""
+    tracker = _TrackingStream(_swallow_cancel_gen())
+    agent, _emitter = _make_streaming_agent(tracker)
+
+    # 无在飞迭代器：no-op
+    await agent.hard_interrupt_stream()
+
+    # 模拟 _consume 挂上迭代器引用
+    agent._stream_iter = tracker
+
+    async def _call():
+        return await agent.stream_llm_call(agent._conversation_history)
+
+    call_task = asyncio.create_task(_call())
+    await asyncio.sleep(0.3)
+    # watchdog 顺序：先 cancel run_task（在飞 fetch 收到取消），
+    # 再 _hard_interrupt 关流
+    call_task.cancel()
+    await asyncio.wait({call_task}, timeout=2.0)
+    await agent.hard_interrupt_stream()
+
+    assert tracker.aclosed, "hard_interrupt_stream 必须 aclose 在飞迭代器"
+    if not call_task.done():
+        call_task.cancel()
+
+    # orchestrator 路由：_runtime_context 无 task_id 时只关自身，不抛异常
+    orch = OrchestratorAgent(llm_service=SimpleNamespace(), tools={})
+    orch._stream_iter = None
+    await orch._hard_interrupt()
+
