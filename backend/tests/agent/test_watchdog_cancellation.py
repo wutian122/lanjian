@@ -45,7 +45,6 @@ from app.services.agent.core.circuit_breaker import (
 )
 from app.services.agent.core.rate_limiter import get_llm_rate_limiter
 
-
 # ---------------------------------------------------------------------------
 # 块 2：watchdog 取消语义
 # ---------------------------------------------------------------------------

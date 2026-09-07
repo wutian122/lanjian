@@ -22,7 +22,7 @@ finally 置 threading.Event，工作线程在下个 chunk 边界退出并在 fin
 import asyncio
 import threading
 import time
-from typing import Any, List
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import litellm
@@ -36,7 +36,6 @@ from app.services.llm.types import (
     LLMProvider,
     LLMRequest,
 )
-
 
 # ---------------------------------------------------------------------------
 # 假的同步流（模拟 litellm.completion(stream=True) 返回的同步可迭代对象）
@@ -177,7 +176,7 @@ class TestChunkIntegrity:
     @pytest.mark.asyncio
     async def test_chunks_preserved_in_order(self):
         chunks = list(range(50))
-        received: List[int] = []
+        received: list[int] = []
         async for c in iter_sync_stream(lambda: iter(chunks)):
             received.append(c)
         assert received == chunks

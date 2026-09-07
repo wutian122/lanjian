@@ -36,7 +36,8 @@ async httpx 调用，不存在同步读事件循环问题，不走本桥接。
 import asyncio
 import logging
 import threading
-from typing import Any, AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ async def iter_sync_stream(
         litellm.exceptions.RateLimitError 等跨线程投递后类型不变）。
     """
     loop = asyncio.get_running_loop()
-    queue: "asyncio.Queue[Any]" = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
     stop_event = threading.Event()
 
     def _post(item: Any) -> None:
