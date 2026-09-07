@@ -205,6 +205,46 @@ def _canonicalize_semgrep_fallback_type(raw_type: Any, rule_id: str) -> str:
     return "sql_injection"
 
 
+# A1（Task 19 follow-up）：EL 表达式注入 / SSTI / 模板注入类"非标准注入类"
+# 识别。生产实证（tomcat 审计）：ELProcessor.java 的 Semgrep 规则 check_id 含
+# "injection"（如 javax.el-expression-injection），_map 泛化为 "injection" 后
+# 经 _canonicalize 误分流为 sql_injection → 走 SQL 专用模板（sink 硬编码
+# execute/raw/query/sql），EL/模板代码零命中 → NO_SINK → not_reproducible，
+# 沙箱白跑烧验证预算。这类漏洞在 verification._gen_sandbox_command 的
+# cmd_templates 中无专用 PoC 模板，确定性验证不成立——兜底构建层直接归
+# "unverifiable" 排除出沙箱（记独立 observation，不与 F1 配置类 filtered 混档）。
+# 匹配一律对小写字符串做词边界（\b）匹配：短词 "el" 不得误伤 model/level/
+# panel/cancel 等含 "el" 子串的词（\b 要求两侧为非字母数字边界）。
+_UNVERIFIABLE_EXPR_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    # 引擎/方言专名优先（最具体信号），通用族名（ssti/template_injection/el/
+    # expression）依次兜底——返回首个命中类别，保证 observation 分布可定位。
+    ("ognl", re.compile(r"\bognl\b")),
+    ("spel", re.compile(r"\bspel\b")),
+    ("mvel", re.compile(r"\bmvel\b")),
+    ("freemarker", re.compile(r"\bfreemarker\b")),
+    ("thymeleaf", re.compile(r"\bthymeleaf\b")),
+    ("velocity", re.compile(r"\bvelocity\b")),
+    ("ssti", re.compile(r"\bssti\b")),
+    ("template_injection", re.compile(r"template[\s._-]injection\b")),
+    ("el", re.compile(r"\bel\b")),
+    ("expression", re.compile(r"\bexpression\b")),
+)
+
+
+def _classify_unverifiable_semgrep_fallback(raw_type: Any, rule_id: str) -> str | None:
+    """识别 EL 表达式/SSTI/模板注入等无确定性 PoC 模板的 Semgrep 命中。
+
+    命中返回特征类别名（el/expression/ssti/template_injection/ognl/spel/mvel/
+    freemarker/thymeleaf/velocity），否则 None。判定信号为 rule_id（check_id）
+    与预扫映射的 raw vuln_type 拼接小写串；词边界匹配防短词误伤。
+    """
+    haystack = f"{rule_id or ''} {raw_type or ''}".lower()
+    for kind, pattern in _UNVERIFIABLE_EXPR_PATTERNS:
+        if pattern.search(haystack):
+            return kind
+    return None
+
+
 # 兜底候选严重度下限：INFO/LOW 不送沙箱（低严重度命中无确定性验证价值）。
 _SEMGREP_FALLBACK_SEVERITY_ORDER: dict[str, int] = {
     "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
@@ -749,8 +789,15 @@ class OrchestratorAgent(BaseAgent):
             message = sf.get("description") or rule_id or "Semgrep 静态扫描发现"
             title = message if len(message) <= 120 else message[:120]
             raw_type = sf.get("vulnerability_type") or _map_semgrep_to_vuln_type(rule_id)
-            vuln_type = _canonicalize_semgrep_fallback_type(raw_type, rule_id)
-            candidates.append({
+            # A1: EL/SSTI/模板注入类无确定性 PoC 模板且易被误分流为
+            # sql_injection 白跑沙箱——在 canonicalize 之前拦截，归
+            # unverifiable（unverifiable_kind 标记特征类别），不送沙箱。
+            unverifiable_kind = _classify_unverifiable_semgrep_fallback(raw_type, rule_id)
+            if unverifiable_kind is not None:
+                vuln_type: Any = "unverifiable"
+            else:
+                vuln_type = _canonicalize_semgrep_fallback_type(raw_type, rule_id)
+            candidate = {
                 "title": title or rule_id,
                 "description": f"[静态扫描兜底候选] {message}（Semgrep 规则: {rule_id}）",
                 "file_path": file_path,
@@ -764,7 +811,10 @@ class OrchestratorAgent(BaseAgent):
                 "source": "semgrep_fallback",
                 "semgrep_rule_id": rule_id,
                 "is_verified": False,
-            })
+            }
+            if unverifiable_kind is not None:
+                candidate["unverifiable_kind"] = unverifiable_kind
+            candidates.append(candidate)
         return candidates
 
     async def _apply_semgrep_fallback(self) -> int:
@@ -785,13 +835,36 @@ class OrchestratorAgent(BaseAgent):
             # F1: 落库前过滤——只保留有确定性 PoC 专用模板且 severity ≥ medium
             # 的候选；配置类/default 模板类型不送沙箱（Task 19 生产实证：配置类
             # 候选只能产出 NO_SINK，白烧验证预算拖垮 Verification 循环）。
+            # A1: EL/SSTI/模板注入类先于 F1 分流——无确定性 PoC 模板且会误走
+            # SQL 模板白跑，归 unverifiable 单独记 observation（不混入 F1
+            # filtered 的配置类口径）。
             verifiable: list[dict[str, Any]] = []
             filtered: list[dict[str, Any]] = []
+            unverifiable: list[dict[str, Any]] = []
             for candidate in candidates:
-                if _is_verifiable_semgrep_candidate(candidate):
+                if candidate.get("unverifiable_kind"):
+                    unverifiable.append(candidate)
+                elif _is_verifiable_semgrep_candidate(candidate):
                     verifiable.append(candidate)
                 else:
                     filtered.append(candidate)
+            if unverifiable:
+                kind_counts: dict[str, int] = {}
+                for c in unverifiable:
+                    kind = str(c.get("unverifiable_kind") or "unknown")
+                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                kind_breakdown = ", ".join(f"{k}×{n}" for k, n in sorted(kind_counts.items()))
+                self._record_gate_observation(
+                    "semgrep_fallback_unverifiable",
+                    f"{len(unverifiable)} 条 Semgrep 兜底候选为 EL 表达式/模板注入（SSTI）"
+                    f"类，无确定性 PoC 专用模板（特征分布: {kind_breakdown}），"
+                    "不进验证队列、不送沙箱（误走 SQL/命令模板必出 NO_SINK 白跑）；"
+                    "仅保留静态扫描结论，不进 semgrep_fallback_filtered 口径",
+                )
+                logger.info(
+                    f"[Orchestrator] Semgrep fallback excluded {len(unverifiable)} "
+                    f"unverifiable EL/SSTI candidates (kinds: {kind_breakdown})"
+                )
             if filtered:
                 type_counts: dict[str, int] = {}
                 low_sev_counts: dict[str, int] = {}
