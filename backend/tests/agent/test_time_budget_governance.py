@@ -336,8 +336,14 @@ async def test_budget_watchdog_graceful_wrap(monkeypatch):
     )
     emitter = SimpleNamespace(emit_warning=AsyncMock())
 
+    # F2 补丁①后：watchdog 到点除 mark_deadline_hit 外立即 run_task.cancel()。
+    # fake 模拟生产 orchestrator 的优雅消费（except CancelledError → break →
+    # finalize 返回结果）——不消费取消的 run 会被按 COMPLETED_WITH_GAPS 兜底。
     async def slow_run():
-        await asyncio.sleep(0.4)
+        try:
+            await asyncio.sleep(0.4)
+        except asyncio.CancelledError:
+            return AgentResult(success=True, data={"findings": []}, metadata={})
         return AgentResult(success=True, data={"findings": []}, metadata={})
 
     run_task = asyncio.create_task(slow_run())

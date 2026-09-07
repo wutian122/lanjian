@@ -68,6 +68,15 @@ _running_tasks: dict[str, Any] = {}
 # 🔥 运行中的 asyncio Tasks（用于强制取消）
 _running_asyncio_tasks: dict[str, asyncio.Task] = {}
 
+# F2 块 2：watchdog hard-cancel 收口常量。
+# hard cancel 后等待 run_task 优雅退出的二次时限（秒）：内层吞掉
+# CancelledError 永久循环时 asyncio.wait 到点即放弃等待并落盘卡住栈
+# （不能用 wait_for——其内部 _cancel_and_wait 会同样永久等待）。
+_HARD_CANCEL_SETTLE_SECONDS = 3.0
+# hard-cancel 分支中 orchestrator._hard_interrupt（aclose in-flight LLM 流）
+# 的调用时限（best-effort，超时不阻断兜底）。
+_HARD_INTERRUPT_TIMEOUT_SECONDS = 2.0
+
 
 # P2-5: 后台任务异常保护 —— fire-and-forget 的 asyncio.create_task 如果内部抛异常，
 # 只留一条 "Task exception was never retrieved" warning 就静默丢失，SSE 客户端和
@@ -536,51 +545,34 @@ async def _run_orchestrator_with_budget_watchdog(
 ) -> tuple[AgentResult, bool]:
     """任务超时 watchdog 化（fix-audit-time-budget-2026-08，方案 A1）。
 
-    - 到 task_timeout 先 mark_deadline_hit()（置 deadline 标志并传播取消），给
-      TIME_BUDGET_GRACE_SECONDS 宽限让 orchestrator 优雅收口（保全已发现与产出）；
-    - wait_for 上限放宽为 task_timeout + grace：Py3.12 wait_for 语义下内层协程
-      吞掉取消并正常返回时 TimeoutError 丢失（原 916-936 兜底成死代码），故由
-      deadline 标志在正常返回路径注入 task_timeout bypass metadata；
-    - 宽限耗尽仍不返回 → hard-cancel 兜底（保存已有发现，completed_with_gaps）。
+    - 到 task_timeout 先 mark_deadline_hit()（置 deadline 标志并传播取消），
+      **同时立即 run_task.cancel()**（F2 补丁①）：协作标志只在 orchestrator
+      loop 边界被消费，若 run 卡在等下一个 chunk 的 LLM 流上（事件循环冻结
+      根治前的事故形态），标志再久也没人看；cancel 把 CancelledError 注入
+      当前 await 点，orchestrator 主循环/子 agent 调度的 except CancelledError
+      走优雅收口（break→finalize，保全已发现）；
+    - wait_for 上限 task_timeout + grace：grace 给优雅收口预留时间；
+    - grace 耗尽仍不返回 → hard-cancel 后 **asyncio.wait 二次时限**
+      （F2 补丁②）：内层吞 CancelledError 永久循环时旧代码 ``await run_task``
+      永久挂死（wait_for 内部 _cancel_and_wait 同病，不能用）；二次时限到点
+      落盘卡住栈（get_stack）后按 COMPLETED_WITH_GAPS 兜底，不再等待；
+    - deadline 注入的 cancel 若未被优雅消费而使 run_task 异常死亡，按预算
+      超时兜底收口；用户取消（is_task_cancelled）/自身被取消则照常传播
+      （外层标 CANCELLED）。
 
     返回 (result, deadline_hit_flag)。
     """
     import time
+    import traceback
 
     from app.core.config import settings
 
     grace = int(getattr(settings, "TIME_BUDGET_GRACE_SECONDS", 45))
     deadline_hit = {"flag": False}
 
-    async def _budget_timeout_watchdog() -> None:
-        await asyncio.sleep(task_timeout)
-        deadline_hit["flag"] = True
-        try:
-            orchestrator.mark_deadline_hit()
-        except Exception:
-            logger.warning(
-                f"[AgentTask] watchdog mark_deadline_hit failed for {task_id}",
-                exc_info=True,
-            )
-
-    watchdog_task = asyncio.create_task(_budget_timeout_watchdog())
-    try:
-        result = await asyncio.wait_for(run_task, timeout=task_timeout + grace)
-    except TimeoutError:
-        logger.warning(
-            f"[AgentTask] Task {task_id} exceeded budget+grace "
-            f"({task_timeout}+{grace}s), hard-cancelling and marking as COMPLETED_WITH_GAPS"
-        )
-        run_task.cancel()
-        try:
-            await run_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        # Wave 1 §2.2 修复：此处必须用 emit_warning（emit_event 会抛 AttributeError）
-        await event_emitter.emit_warning(
-            f"任务超时（{task_timeout}秒+{grace}秒宽限），已强制结束并保存已有发现"
-        )
-        result = AgentResult(
+    def _build_timeout_gap_result() -> AgentResult:
+        """hard-cancel/取消未优雅收口时的兜底结果（唯一构造点，保发现）。"""
+        return AgentResult(
             success=True,
             data={"findings": getattr(orchestrator, "_all_findings", [])},
             iterations=getattr(orchestrator, "_iteration", 0),
@@ -600,12 +592,119 @@ async def _run_orchestrator_with_budget_watchdog(
                 },
             },
         )
+
+    def _log_stuck_stack() -> None:
+        """二次时限到点仍不退出：落盘 run_task 的卡住栈，供事后定位（F2 补丁②）。"""
+        try:
+            frames = run_task.get_stack(limit=12)
+            if frames:
+                stack_str = "".join(traceback.format_stack(frames[-1], limit=12))
+            else:
+                stack_str = "<no frames>"
+        except Exception:
+            stack_str = "<stack unavailable>"
+        logger.error(
+            f"[AgentTask] Task {task_id} did not settle within "
+            f"{_HARD_CANCEL_SETTLE_SECONDS}s after hard cancel "
+            f"(cancellation swallowed); stuck stack:\n{stack_str}"
+        )
+
+    async def _hard_interrupt_best_effort() -> None:
+        """F2 补丁③（best-effort）：直接关闭 in-flight LLM 流迭代器——
+        cancel 信号被吞/收口协程又发起新流时，orchestrator._hard_interrupt
+        aclose 各 agent 的 _stream_iter（线程桥 stop_event 随之置位）。"""
+        hard_interrupt = getattr(orchestrator, "_hard_interrupt", None)
+        if not callable(hard_interrupt):
+            return
+        try:
+            await asyncio.wait_for(
+                hard_interrupt(), timeout=_HARD_INTERRUPT_TIMEOUT_SECONDS
+            )
+        except Exception:
+            logger.warning(
+                f"[AgentTask] _hard_interrupt failed for {task_id}", exc_info=True
+            )
+
+    async def _budget_timeout_watchdog() -> None:
+        await asyncio.sleep(task_timeout)
+        deadline_hit["flag"] = True
+        try:
+            orchestrator.mark_deadline_hit()
+        except Exception:
+            logger.warning(
+                f"[AgentTask] watchdog mark_deadline_hit failed for {task_id}",
+                exc_info=True,
+            )
+        # F2 补丁①：立即把 CancelledError 注入 run_task 当前 await 点，
+        # 不等 wait_for 到 task_timeout+grace。run_task 在调用前已创建
+        # （_execute_agent_task:1114 create_task → 本函数），作用域确定。
+        if not run_task.done():
+            run_task.cancel()
+
+    watchdog_task = asyncio.create_task(_budget_timeout_watchdog())
+    try:
+        try:
+            # shield：吞掉 CancelledError 永久循环的任务会让 wait_for 超时后的
+            # _cancel_and_wait 永久挂死（同补丁②的坑）；shield 让 wait_for 到点
+            # 必抛 TimeoutError，硬取消由补丁②显式控制。
+            result = await asyncio.wait_for(
+                asyncio.shield(run_task), timeout=task_timeout + grace
+            )
+        except TimeoutError:
+            logger.warning(
+                f"[AgentTask] Task {task_id} exceeded budget+grace "
+                f"({task_timeout}+{grace}s), hard-cancelling and marking as COMPLETED_WITH_GAPS"
+            )
+            run_task.cancel()
+            await _hard_interrupt_best_effort()
+            # F2 补丁②：asyncio.wait 纯限时（不 cancel/不内部 await）——
+            # wait_for 超时后的 _cancel_and_wait 会永久等待吞取消的任务，
+            # 故这里不能用 wait_for(run_task, timeout)。
+            done, _pending = await asyncio.wait(
+                {run_task}, timeout=_HARD_CANCEL_SETTLE_SECONDS
+            )
+            if not done:
+                _log_stuck_stack()
+            elif not run_task.cancelled():
+                # 取回异常，避免 "Task exception was never retrieved"
+                try:
+                    run_task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # Wave 1 §2.2 修复：此处必须用 emit_warning（emit_event 会抛 AttributeError）
+            await event_emitter.emit_warning(
+                f"任务超时（{task_timeout}秒+{grace}秒宽限），已强制结束并保存已有发现"
+            )
+            result = _build_timeout_gap_result()
+        except (asyncio.CancelledError, Exception) as exc:
+            # F2 补丁①语义边界：deadline 注入的 cancel 未被优雅消费而使
+            # run_task 异常死亡（CancelledError 或收尾期异常）→ 按预算超时
+            # 兜底（保发现）；用户取消/本协程自身被取消 → 传播（外层标 CANCELLED）；
+            # deadline 未命中时的其它异常按原样传播（不得借兜底掩盖真实故障）。
+            if (
+                asyncio.current_task().cancelling() > 0
+                or is_task_cancelled(task_id)
+                or not deadline_hit["flag"]
+            ):
+                raise
+            logger.warning(
+                f"[AgentTask] Task {task_id} aborted after deadline cancel "
+                f"({type(exc).__name__}); wrapping up as COMPLETED_WITH_GAPS"
+            )
+            await event_emitter.emit_warning(
+                f"任务超时（{task_timeout}秒），已强制结束并保存已有发现"
+            )
+            result = _build_timeout_gap_result()
     finally:
         watchdog_task.cancel()
         try:
             await watchdog_task
         except (asyncio.CancelledError, Exception):
             pass
+        # shield 不把外层取消传播给 run_task；外层协程自身被取消（服务关闭等）
+        # 时补一刀取消，避免 orchestrator run 成为孤儿继续运行
+        if not run_task.done() and asyncio.current_task().cancelling() > 0:
+            run_task.cancel()
 
     if deadline_hit["flag"] and isinstance(getattr(result, "metadata", None), dict):
         # 优先级链收口：task_timeout 为最高 reason。已置 bypass（如 finalize 先于
