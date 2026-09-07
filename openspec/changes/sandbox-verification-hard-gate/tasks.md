@@ -128,6 +128,17 @@
 - Interfaces: StatsPanel 时间格（运行中=剩余、完成=耗时）；attempt 三徽章（fabricated/static_evidence/poc_error）
 - TDD: 组件测试 → 实现 → 通过 → commit
 
+## Phase 6.5: Task 19 期间 follow-up 修复（2026-09-06/07 生产实证吸收）
+
+### F1: Semgrep 兜底过滤可验证类型（Task 11 follow-up）
+- [x] **F1 完成**（04d4189 + 二次分流修复 1d190dc，review 初审 NEEDS_FIX（Important：injection 别名一刀切误标命令注入候选走错 SQL 模板致 NO_SINK 假阴）→ 重审 CLEAN（9 组边界实测 + 模板分派独立验证）；VERIFIABLE_SEMGREP_TYPES 十类过滤（other/配置类/低严重度不送沙箱防预算拖垮）+ severity≥medium；生产实证：v4 任务 40 配置类 → v6.4.6 重验只剩代码类）
+
+### A1: Semgrep 兜底 EL/SSTI 非可验证类型排除（F1 follow-up）
+- [x] **A1 完成**（commit 94e8b4f，review CLEAN——EL/SSTI 非可验证类型排除（unverifiable 拦截在 canonicalize 之前），词边界 11 反例实证、拦截时序、三档 observation 分档、F1 并存零改动；生产根因（ELProcessor EL 类落 sql_injection 白跑）拦截链闭合；3 Minor 记账：expression 泛词 ReDoS 误归口径（无功能损失，backlog）、融合词缝隙（理论）、测试冗余）
+
+### F2: watchdog 收口失效（事件循环同步阻塞冻结——独立修复待审）
+- [ ] **F2 待审查**（三 commit 6c7fc6a/576254d/c491a95：litellm 出站线程池剥离根治同步阻塞（sync-iterable 分支冻结 uvicorn 单 worker 10h04m，watchdog/三层超时全失效——生产任务 c286b0c1 实证）+ watchdog 强杀补丁（mark_deadline_hit 同时 cancel/shield/3s 二次时限/never-retrieved 防护）+ per-chunk 取消坑防堵（ensure_future+shield+aclose+_hard_interrupt）；回归 1181 passed/4 failed）
+
 ## Phase 6: 台账治理与端到端
 
 ### Task 18: OpenSpec 台账治理
