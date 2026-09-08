@@ -85,6 +85,11 @@ _HARD_INTERRUPT_TIMEOUT_SECONDS = 2.0
 #   - 保留强引用避免被 GC（asyncio.create_task 只弱引用 task 本身，coro 也可能被 GC）
 _background_task_refs: set[asyncio.Task] = set()
 
+# D2: pending 任务启动防重入占位。start 端点 launch 前占位、包装协程退出时释放，
+# 覆盖"_execute_agent_task 已启动但 early heartbeat 尚未把 registry alive 键刷上"
+# 的亚秒窗口（沙箱初始化在状态翻 INITIALIZING 之前，status 检查也挡不住）。
+_task_start_slots: set[str] = set()
+
 
 def _launch_task_bg(coro, task_name: str) -> asyncio.Task:
     """
@@ -2644,6 +2649,80 @@ async def _save_agent_tree(db: AsyncSession, task_id: str) -> None:
 
 
 # ============ API Endpoints ============
+
+async def _is_task_alive_in_registry(task_id: str) -> bool:
+    """任务在 registry（Redis 共享，跨 worker）中是否仍有存活证据。
+
+    与 recover 端点的存活判定同源：early heartbeat 在 _execute_agent_task
+    入口即刷 alive 键（早于沙箱初始化与状态翻转），因此可识别"实际已在
+    启动/运行中但 DB 状态仍是 pending"的任务，防重复启动。任何异常视为
+    无证据（不阻断启动，后续状态机与 watchdog 兜底）。
+    """
+    try:
+        from app.services.agent.core.orchestrator_registry import get_registry
+
+        registry = await get_registry()
+        return bool(await registry.is_alive(task_id))
+    except Exception as e:
+        logger.debug(f"[StartTask] is_alive check failed for {task_id}: {e}")
+        return False
+
+
+@router.post("/{task_id}/start")
+async def start_agent_task(
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """启动待启动（pending）的 Agent 审计任务。
+
+    用于创建时后台调度丢失（Starlette BackgroundTasks 不保证执行）后搁浅的
+    pending 任务恢复。仅 pending 可启动；paused 走 /resume，stale running 走
+    /recover。
+    """
+    task = await db.get(AgentTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    project = await db.get(Project, task.project_id)
+    assert_can_access_project(current_user, project)
+
+    if task.status != AgentTaskStatus.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail="只有待启动（pending）任务可以启动；已暂停任务请使用继续，运行中任务无需重复启动",
+        )
+
+    # 防重复启动：本进程启动协程在途 / orchestrator 协程在册 / registry 仍有
+    # 存活证据（跨 worker）任一成立即拒绝。
+    if task_id in _task_start_slots or _running_asyncio_tasks.get(task_id):
+        raise HTTPException(status_code=400, detail="任务正在启动或运行中，无需重复启动")
+    if await _is_task_alive_in_registry(task_id):
+        raise HTTPException(status_code=400, detail="任务实际正在运行中（registry 存活），无需重复启动")
+
+    task.status = AgentTaskStatus.RUNNING
+    task.paused = False
+    task.paused_at = None
+    task.pause_reason = None
+    await db.commit()
+
+    task_name = f"start-{task_id}"
+    _task_start_slots.add(task_id)
+
+    async def _guarded_start() -> None:
+        try:
+            await _execute_agent_task(task_id)
+        finally:
+            _task_start_slots.discard(task_id)
+
+    # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception
+    _launch_task_bg(_guarded_start(), task_name=task_name)
+
+    return {
+        "message": "任务已启动",
+        "task_id": task_id,
+    }
+
 
 @router.post("/", response_model=AgentTaskResponse)
 async def create_agent_task(

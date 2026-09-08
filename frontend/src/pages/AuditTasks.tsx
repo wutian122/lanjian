@@ -51,7 +51,7 @@ import CreateTaskDialog from "@/components/audit/CreateTaskDialog";
 import TerminalProgressDialog from "@/components/audit/TerminalProgressDialog";
 import ExportReportDialog from "@/components/reports/ExportReportDialog";
 import { calculateTaskProgress } from "@/shared/utils/utils";
-import { getAgentTasks, pauseAgentTask, resumeAgentTask, deleteAgentTask, getAgentFindings, type AgentTask, type AgentFinding } from "@/shared/api/agentTasks";
+import { getAgentTasks, pauseAgentTask, resumeAgentTask, startAgentTask, deleteAgentTask, getAgentFindings, type AgentTask, type AgentFinding } from "@/shared/api/agentTasks";
 import ReportExportDialog from "@/components/reports/AgentReportExportDialog";
 
 // Zombie task detection config
@@ -92,6 +92,7 @@ export default function AuditTasks() {
   const [agentLoading, setAgentLoading] = useState(true);
   const [pausingAgentTaskId, setPausingAgentTaskId] = useState<string | null>(null);
   const [resumingAgentTaskId, setResumingAgentTaskId] = useState<string | null>(null);
+  const [startingAgentTaskId, setStartingAgentTaskId] = useState<string | null>(null);
   const [exportingTaskId, setExportingTaskId] = useState<string | null>(null);
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [exportTask, setExportTask] = useState<AuditTask | null>(null);
@@ -260,6 +261,22 @@ export default function AuditTasks() {
       toast.error(error?.response?.data?.detail || "继续Agent任务失败");
     } finally {
       setResumingAgentTaskId(null);
+    }
+  };
+
+  const handleStartAgentTask = async (taskId: string) => {
+    if (startingAgentTaskId || resumingAgentTaskId || pausingAgentTaskId) return;
+
+    try {
+      setStartingAgentTaskId(taskId);
+      await startAgentTask(taskId);
+      toast.success("Agent任务已启动");
+      await loadAgentTasks(false);
+    } catch (error: any) {
+      console.error('启动Agent任务失败:', error);
+      toast.error(error?.response?.data?.detail || "启动Agent任务失败");
+    } finally {
+      setStartingAgentTaskId(null);
     }
   };
 
@@ -754,6 +771,17 @@ export default function AuditTasks() {
                             查看实时流
                           </Button>
                         </Link>
+                      )}
+                      {task.status === 'pending' && (
+                        <Button
+                          size="sm"
+                          className="h-9"
+                          onClick={() => handleStartAgentTask(task.id)}
+                          disabled={startingAgentTaskId === task.id}
+                        >
+                          <Play className="w-4 h-4 mr-2" />
+                          {startingAgentTaskId === task.id ? '启动中...' : '启动'}
+                        </Button>
                       )}
                       {task.status === 'paused' && (
                         <Button

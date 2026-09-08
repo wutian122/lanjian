@@ -20,6 +20,7 @@ import {
   getAgentFindings,
   pauseAgentTask,
   resumeAgentTask,
+  startAgentTask,
   reAuditAgentTask,
   recoverAgentTask,
   reverifyFinding,
@@ -79,6 +80,7 @@ function AgentAuditPageContent() {
     phase: string; current: number; total: number;
   } | null>(null);
   const [isResuming, setIsResuming] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [statusVerb, setStatusVerb] = useState(ACTION_VERBS[0]);
   const [statusDots, setStatusDots] = useState(0);
@@ -1201,6 +1203,29 @@ function AgentAuditPageContent() {
     }
   };
 
+  const handleStart = async () => {
+    if (!taskId || isStarting) return;
+    setIsStarting(true);
+    dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '正在启动待执行任务...' } });
+
+    try {
+      const result = await startAgentTask(taskId);
+      toast.success(result.message || '任务已启动');
+      dispatch({ type: 'ADD_LOG', payload: { type: 'info', title: '任务已启动，正在重新建立实时连接' } });
+      hasConnectedRef.current = false;
+      hasTransitionedRef.current = false;
+      hasCompletedViaSSE.current = false;
+      await Promise.all([loadTask(), loadFindings(), loadAgentTree()]);
+    } catch (error) {
+      const detail = isAxiosError(error) ? (error.response?.data as { detail?: string } | undefined)?.detail : undefined;
+      const errorMessage = detail || (error instanceof Error ? error.message : 'Unknown error');
+      toast.error(`启动任务失败: ${errorMessage}`);
+      dispatch({ type: 'ADD_LOG', payload: { type: 'error', title: `启动失败: ${errorMessage}` } });
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
   const handleResume = async () => {
     if (!taskId || isResuming) return;
     setIsResuming(true);
@@ -1415,6 +1440,21 @@ function AgentAuditPageContent() {
             </div>
             <Button variant="outline" size="sm" onClick={() => window.location.reload()}>
               刷新页面
+            </Button>
+          </div>
+        )}
+
+        {/* D2: pending 搁浅任务（无存活证据）手动启动入口 */}
+        {task?.status === 'pending' && task?.orchestrator_alive === false && (
+          <div className="absolute top-0 left-0 right-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-blue-600" />
+              <span className="text-sm text-blue-700">
+                任务处于待启动状态且未检测到执行进程（后台调度可能丢失），可手动启动。
+              </span>
+            </div>
+            <Button size="sm" onClick={handleStart} disabled={isStarting}>
+              {isStarting ? "启动中..." : "启动任务"}
             </Button>
           </div>
         )}
