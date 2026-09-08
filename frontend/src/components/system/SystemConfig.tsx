@@ -3,7 +3,7 @@
  * Enterprise Blue-White UI
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -57,10 +57,25 @@ interface SystemConfigData {
   llmApiKeySet?: boolean;
 }
 
+// 加载失败/后端空响应时的兜底表单值
+const FALLBACK_CONFIG: SystemConfigData = {
+  llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
+  llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
+  llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
+  agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
+  githubToken: '', gitlabToken: '', giteaToken: '',
+  maxAnalyzeFiles: 0, llmConcurrency: 3, llmGapMs: 2000, llmRatePerMinute: 60, outputLanguage: 'zh-CN',
+  sandboxNetworkEnabled: false,
+};
+
 export function SystemConfig() {
   const [config, setConfig] = useState<SystemConfigData | null>(null);
   const [loading, setLoading] = useState(true);
   const [hasChanges, setHasChanges] = useState(false);
+  // W5（llmMaxTokens 回写陷阱）：最近一次从服务端加载/保存成功的配置快照。
+  // 保存时仅回写与快照不一致的字段——未修改字段（如用户只改 temperature 时的
+  // llmMaxTokens）不进 payload，避免加载时旧快照在 PUT 合并语义下覆盖 DB 现值。
+  const loadedConfigRef = useRef<SystemConfigData | null>(null);
   const [testingLLM, setTestingLLM] = useState(false);
   const [llmTestResult, setLlmTestResult] = useState<{ success: boolean; message: string; debug?: Record<string, unknown> } | null>(null);
   const [showDebugInfo, setShowDebugInfo] = useState(true);
@@ -168,6 +183,7 @@ export function SystemConfig() {
 
         console.log('[SystemConfig] 解析后的配置:', newConfig);
         setConfig(newConfig);
+        loadedConfigRef.current = newConfig;
 
         console.log('✓ 配置已加载:', {
           provider: llmConfig.llmProvider,
@@ -176,27 +192,13 @@ export function SystemConfig() {
         });
       } else {
         console.warn('[SystemConfig] 后端返回空数据，使用默认配置');
-        setConfig({
-          llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
-          llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
-          llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
-          agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
-          githubToken: '', gitlabToken: '', giteaToken: '',
-          maxAnalyzeFiles: 0, llmConcurrency: 3, llmGapMs: 2000, llmRatePerMinute: 60, outputLanguage: 'zh-CN',
-          sandboxNetworkEnabled: false,
-        });
+        setConfig(FALLBACK_CONFIG);
+        loadedConfigRef.current = FALLBACK_CONFIG;
       }
     } catch (error) {
       console.error('Failed to load config:', error);
-      setConfig({
-        llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
-        llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
-        llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
-        agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
-        githubToken: '', gitlabToken: '', giteaToken: '',
-        maxAnalyzeFiles: 0, llmConcurrency: 3, llmGapMs: 2000, llmRatePerMinute: 60, outputLanguage: 'zh-CN',
-        sandboxNetworkEnabled: false,
-      });
+      setConfig(FALLBACK_CONFIG);
+      loadedConfigRef.current = FALLBACK_CONFIG;
     } finally {
       setLoading(false);
     }
@@ -305,32 +307,66 @@ export function SystemConfig() {
     }
 
     try {
-      const savedConfig = await api.updateUserConfig({
-        llmConfig: {
-          llmProvider: config.llmProvider, llmApiKey: config.llmApiKey,
-          llmModel: config.llmModel, llmBaseUrl: config.llmBaseUrl,
-          llmTimeout: config.llmTimeout, llmTemperature: config.llmTemperature,
-          llmMaxTokens: config.llmMaxTokens,
-          repetitionPenalty: config.repetitionPenalty,
-          // Agent超时配置
-          llmFirstTokenTimeout: config.llmFirstTokenTimeout,
-          llmStreamTimeout: config.llmStreamTimeout,
-          agentTimeout: config.agentTimeout,
-          subAgentTimeout: config.subAgentTimeout,
-          toolTimeout: config.toolTimeout,
-        },
-        otherConfig: {
-          githubToken: config.githubToken, gitlabToken: config.gitlabToken, giteaToken: config.giteaToken,
-          maxAnalyzeFiles: config.maxAnalyzeFiles, llmConcurrency: config.llmConcurrency,
-          llmGapMs: config.llmGapMs, llmRatePerMinute: config.llmRatePerMinute, outputLanguage: config.outputLanguage,
-          sandboxNetworkEnabled: config.sandboxNetworkEnabled,
-        },
-      });
+      // W5（回写陷阱）：仅回写相对加载快照发生变化的字段。未修改字段不进
+      // payload——后端 PUT 为合并语义（payload 未含的键保留 DB 现值），
+      // 全量回写会把加载时旧快照（如 llmMaxTokens=4096）盖掉 DB 现值
+      // （如管理员已在别处改为 32768）。密钥字段脱敏后为空串、未重新输入时
+      // 与快照一致，天然不进 payload（后端 strip_empty_sensitive 为双保险）。
+      const loaded = loadedConfigRef.current;
+      const pickChanged = (keys: (keyof SystemConfigData)[]): Record<string, unknown> => {
+        const patch: Record<string, unknown> = {};
+        if (!loaded) return patch;
+        for (const key of keys) {
+          if (config[key] !== loaded[key]) {
+            patch[key] = config[key];
+          }
+        }
+        return patch;
+      };
+
+      const llmPatch = loaded
+        ? pickChanged([
+            'llmProvider', 'llmApiKey', 'llmModel', 'llmBaseUrl', 'llmTimeout',
+            'llmTemperature', 'llmMaxTokens', 'repetitionPenalty',
+            'llmFirstTokenTimeout', 'llmStreamTimeout', 'agentTimeout',
+            'subAgentTimeout', 'toolTimeout',
+          ])
+        : {
+            // 无加载快照（极端兜底）：回退旧的全量行为
+            llmProvider: config.llmProvider, llmApiKey: config.llmApiKey,
+            llmModel: config.llmModel, llmBaseUrl: config.llmBaseUrl,
+            llmTimeout: config.llmTimeout, llmTemperature: config.llmTemperature,
+            llmMaxTokens: config.llmMaxTokens,
+            repetitionPenalty: config.repetitionPenalty,
+            llmFirstTokenTimeout: config.llmFirstTokenTimeout,
+            llmStreamTimeout: config.llmStreamTimeout,
+            agentTimeout: config.agentTimeout,
+            subAgentTimeout: config.subAgentTimeout,
+            toolTimeout: config.toolTimeout,
+          };
+      const otherPatch = loaded
+        ? pickChanged([
+            'githubToken', 'gitlabToken', 'giteaToken', 'maxAnalyzeFiles',
+            'llmConcurrency', 'llmGapMs', 'llmRatePerMinute', 'outputLanguage',
+            'sandboxNetworkEnabled',
+          ])
+        : {
+            githubToken: config.githubToken, gitlabToken: config.gitlabToken, giteaToken: config.giteaToken,
+            maxAnalyzeFiles: config.maxAnalyzeFiles, llmConcurrency: config.llmConcurrency,
+            llmGapMs: config.llmGapMs, llmRatePerMinute: config.llmRatePerMinute, outputLanguage: config.outputLanguage,
+            sandboxNetworkEnabled: config.sandboxNetworkEnabled,
+          };
+
+      const payload: { llmConfig?: Record<string, unknown>; otherConfig?: Record<string, unknown> } = {};
+      if (Object.keys(llmPatch).length > 0) payload.llmConfig = llmPatch;
+      if (Object.keys(otherPatch).length > 0) payload.otherConfig = otherPatch;
+
+      const savedConfig = await api.updateUserConfig(payload);
 
       if (savedConfig) {
         const llmConfig = savedConfig.llmConfig || {};
         const otherConfig = savedConfig.otherConfig || {};
-        setConfig({
+        const nextConfig: SystemConfigData = {
           llmProvider: llmConfig.llmProvider || config.llmProvider,
           llmApiKey: llmConfig.llmApiKey || '',
           llmApiKeySet: llmConfig.llmApiKeySet ?? false,
@@ -355,7 +391,10 @@ export function SystemConfig() {
           llmRatePerMinute: otherConfig.llmRatePerMinute || 60,
           outputLanguage: otherConfig.outputLanguage || 'zh-CN',
           sandboxNetworkEnabled: otherConfig.sandboxNetworkEnabled ?? false,
-        });
+        };
+        setConfig(nextConfig);
+        // 保存成功后以服务端归一化结果刷新快照，后续 dirty-check 基线同步
+        loadedConfigRef.current = nextConfig;
       }
 
       setHasChanges(false);
