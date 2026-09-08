@@ -8,14 +8,13 @@ W1: 分阶段 max_tokens——按 Agent 类型差异化输出预算
 
 单一全局值无法同时满足「中间轮要短稳」与「报告轮要空间」，落地映射：
 - orchestrator / recon = 2048（调度决策/侦察短输出，防长输出漂移）；
-- analysis / verification = 8192（验证结论与 submit_findings 报告需空间：
-  单 finding ≈900 tokens × 8 ≈ 7200 + JSON 结构 < 8192）；
+- analysis / verification = 4096（P1 折中：8192 长生成漂移实证；大报告走强制总结 32768 兜底）；
 - analysis 强制总结轮（guided_json 一次性全量 findings JSON）= 32768
   （schema 约束漂移面小，预算留大防截断）；
 - 显式传参优先于映射；未知类型无映射 → None 回退用户全局 llmMaxTokens。
 
 submit_findings 轮与中间 ReAct 轮在请求时同构（都是 tools 形态工具调用），
-无法请求时区分，故 analysis 中间轮统一 8192；极端大报告由强制总结轮 32768 兜底。
+无法请求时区分，故 analysis 中间轮统一 4096（P1）；极端大报告由强制总结轮 32768 兜底。
 """
 from types import SimpleNamespace
 from typing import Any
@@ -98,8 +97,8 @@ def _agent(cls, calls):
     [
         ("orchestrator", 2048),
         ("recon", 2048),
-        ("analysis", 8192),
-        ("verification", 8192),
+        ("analysis", 4096),
+        ("verification", 4096),
     ],
 )
 def test_agent_type_max_tokens_mapping(agent_type: str, expected: int):
@@ -130,20 +129,20 @@ async def test_recon_stream_uses_2048():
 
 
 @pytest.mark.asyncio
-async def test_analysis_intermediate_round_uses_8192():
-    """analysis ReAct 中间轮（含 submit_findings 工具轮）= 8192。"""
+async def test_analysis_intermediate_round_uses_4096():
+    """analysis ReAct 中间轮（含 submit_findings 工具轮）= 4096（P1 折中）。"""
     calls: list[dict[str, Any]] = []
     agent = _agent(AnalysisAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "analyze"}])
-    assert calls[-1]["max_tokens"] == 8192
+    assert calls[-1]["max_tokens"] == 4096
 
 
 @pytest.mark.asyncio
-async def test_verification_round_uses_8192():
+async def test_verification_round_uses_4096():
     calls: list[dict[str, Any]] = []
     agent = _agent(VerificationAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "verify"}])
-    assert calls[-1]["max_tokens"] == 8192
+    assert calls[-1]["max_tokens"] == 4096
 
 
 @pytest.mark.asyncio

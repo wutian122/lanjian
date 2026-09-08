@@ -155,7 +155,7 @@ class TestRepetitionPenaltyConfigChain:
         """用户未配置 → 回退 settings.LLM_REPETITION_PENALTY（默认 1.15）"""
         service = _service_with_llm_config()
         assert service.config.repetition_penalty == float(settings.LLM_REPETITION_PENALTY)
-        assert service.config.repetition_penalty == 1.15
+        assert service.config.repetition_penalty == 1.2
 
     def test_user_temperature_flows_to_config(self):
         """用户配置 llmTemperature=0.6 → config.temperature=0.6（不被代码层覆盖）"""
@@ -192,7 +192,7 @@ class TestNativePathInjection:
             await adapter._send_request(_make_request())
 
         body = fake_client.created_kwargs
-        assert body["extra_body"] == {"repetition_penalty": 1.15}
+        assert body["extra_body"] == {"repetition_penalty": 1.2}
         # provider 特有参数绝不能展开到 create() 顶层（真实 SDK 无此形参，会 TypeError）
         assert "repetition_penalty" not in body
 
@@ -251,7 +251,7 @@ class TestLiteLLMNonStreamInjection:
             response = await adapter._send_request(_make_request())
 
         assert response.content == "ok"
-        assert captured["extra_body"] == {"repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"repetition_penalty": 1.2}
 
     @pytest.mark.asyncio
     async def test_send_request_merges_request_extra_params(self):
@@ -269,7 +269,7 @@ class TestLiteLLMNonStreamInjection:
                 _make_request(extra_params={"top_k": 20})
             )
 
-        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2}
 
     @pytest.mark.asyncio
     async def test_send_request_explicit_extra_params_rp_takes_precedence(self):
@@ -328,7 +328,7 @@ class TestLiteLLMStreamInjection:
             chunks = [c async for c in adapter.stream_complete(_make_request(stream=True))]
 
         assert chunks[-1]["type"] == "done"
-        assert captured["extra_body"] == {"repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"repetition_penalty": 1.2}
 
     @pytest.mark.asyncio
     async def test_stream_merges_request_extra_params(self):
@@ -349,7 +349,7 @@ class TestLiteLLMStreamInjection:
             ]
 
         assert chunks[-1]["type"] == "done"
-        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2}
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +366,7 @@ class TestSamplingParamsSummary:
         assert summary["provider"] == "openai"
         assert summary["model"] == "qwen-test"
         assert summary["temperature"] == 0.6
-        assert summary["repetition_penalty"] == 1.15
+        assert summary["repetition_penalty"] == 1.2
         assert summary["max_tokens"] == service.config.max_tokens
 
     def test_summary_reflects_user_configured_rp(self):

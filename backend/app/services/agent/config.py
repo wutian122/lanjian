@@ -64,8 +64,9 @@ class AgentConfig(BaseSettings):
     # W1（分阶段 max_tokens）：单一全局输出预算无法同时满足「ReAct 中间轮短决策
     # 防漂移」与「报告轮大 JSON 防截断」——fp8 内网推理实测 2048 中间轮胡乱输出
     # 大减、32768 长输出漂移 + KV 累积误差、4096 reasoning 吃光预算空响应。
-    # 按 Agent 类型差异化：调度/侦察短决策 2048；分析/验证报告轮 8192
-    # （单 finding ≈900 tokens × 8 ≈ 7200 + JSON 结构 < 8192）；
+    # 按 Agent 类型差异化：调度/侦察短决策 2048；分析/验证报告轮 4096
+    # （P1 折中：8192 长输出漂移实证——同义词链/字符集墙；4096 保 2-3 finding
+    #   报告空间且漂移空间减半；4+ findings 大报告由强制总结轮 32768 兜底）；
     # analysis 强制总结轮一次性输出全量 findings JSON，预算留大 32768。
     # 未知类型无映射 → 回退用户全局 llmMaxTokens。
     llm_max_tokens_orchestrator: int = Field(
@@ -77,12 +78,12 @@ class AgentConfig(BaseSettings):
         description="Per-call max_tokens for recon（短侦察输出）"
     )
     llm_max_tokens_analysis: int = Field(
-        default=8192,
-        description="Per-call max_tokens for analysis（submit_findings 报告需空间）"
+        default=4096,
+        description="Per-call max_tokens for analysis（P1 折中：8192 长生成漂移实证；大报告走强制总结 32768 兜底）"
     )
     llm_max_tokens_verification: int = Field(
-        default=8192,
-        description="Per-call max_tokens for verification（验证结论需空间）"
+        default=4096,
+        description="Per-call max_tokens for verification（P1 折中防长生成漂移）"
     )
     llm_max_tokens_forced_summary: int = Field(
         default=32768,
