@@ -817,10 +817,16 @@ class AnalysisAgent(BaseAgent):
         if backend_caps is not None and getattr(backend_caps, "guided_json", False):
             summary_response_format = self._build_findings_response_format()
 
+        # W1（分阶段 max_tokens）：强制总结轮一次性输出全量 findings JSON
+        # （与 submit_findings arguments 同 schema），显式给大预算防截断——
+        # guided json_schema 约束下自由漂移面小，不存在中间轮长输出累积问题。
+        from app.services.agent.config import get_agent_config
+        summary_max_tokens = get_agent_config().llm_max_tokens_forced_summary
+
         summary_output, _ = await self.stream_llm_call(
             self._conversation_history,
             response_format=summary_response_format,
-            # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+            max_tokens=summary_max_tokens,
         )
         raw_output = summary_output or ""
         parsed_result: Dict[str, Any] = {"findings": [], "summary": ""}

@@ -142,7 +142,12 @@ async def test_length_finish_reason_emits_warning_sets_flag_and_history_hint():
     assert "输出被 max_tokens 截断" in joined
     assert "Recon" in joined
     assert "第 3 轮" in joined
-    assert "8192" in joined
+    # W1（分阶段 max_tokens）：recon 轮实际生效的是 per-agent 映射预算 2048
+    # （service.config.max_tokens=8192 不再被 recon 使用），归因消息展示生效值
+    from app.services.agent.config import get_agent_type_config
+    recon_budget = get_agent_type_config("recon").max_tokens
+    assert str(recon_budget) in joined
+    assert "8192" not in joined
     # 对话历史注入截断提示（user 角色，供下一轮 LLM 知晓）
     assert history[-1]["role"] == "user"
     assert "截断" in history[-1]["content"]

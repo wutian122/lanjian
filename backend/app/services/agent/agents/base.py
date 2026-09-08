@@ -1218,6 +1218,15 @@ class BaseAgent(ABC):
         if auto_compress:
             messages = self.compress_messages_if_needed(messages)
 
+        # W1（分阶段 max_tokens）：调用方未显式指定输出预算时，按 Agent 类型
+        # 注入差异化默认——orchestrator/recon 2048 短决策防长输出漂移，
+        # analysis/verification 8192 给报告/验证结论留空间；未知类型无映射
+        # （None）时保持 None，由 LLMService 回退用户全局 llmMaxTokens。
+        # 显式传参（如 analysis 强制总结轮 32768）优先，绝不覆盖。
+        if max_tokens is None:
+            from app.services.agent.config import get_agent_type_config
+            max_tokens = get_agent_type_config(self.config.agent_type.value).max_tokens
+
         accumulated = ""
         # structured-output-protocol Task 4：思考/正文通道各自累计。
         # accumulated_content 仅正文（返回值/Final Answer 解析视角），

@@ -61,6 +61,33 @@ class AgentConfig(BaseSettings):
         default=0.4,
         description="Temperature for Orchestrator (v3.0: 建议 0.3-0.5，避免过低导致格式错误)"
     )
+    # W1（分阶段 max_tokens）：单一全局输出预算无法同时满足「ReAct 中间轮短决策
+    # 防漂移」与「报告轮大 JSON 防截断」——fp8 内网推理实测 2048 中间轮胡乱输出
+    # 大减、32768 长输出漂移 + KV 累积误差、4096 reasoning 吃光预算空响应。
+    # 按 Agent 类型差异化：调度/侦察短决策 2048；分析/验证报告轮 8192
+    # （单 finding ≈900 tokens × 8 ≈ 7200 + JSON 结构 < 8192）；
+    # analysis 强制总结轮一次性输出全量 findings JSON，预算留大 32768。
+    # 未知类型无映射 → 回退用户全局 llmMaxTokens。
+    llm_max_tokens_orchestrator: int = Field(
+        default=2048,
+        description="Per-call max_tokens for orchestrator（短调度决策，防长输出漂移）"
+    )
+    llm_max_tokens_recon: int = Field(
+        default=2048,
+        description="Per-call max_tokens for recon（短侦察输出）"
+    )
+    llm_max_tokens_analysis: int = Field(
+        default=8192,
+        description="Per-call max_tokens for analysis（submit_findings 报告需空间）"
+    )
+    llm_max_tokens_verification: int = Field(
+        default=8192,
+        description="Per-call max_tokens for verification（验证结论需空间）"
+    )
+    llm_max_tokens_forced_summary: int = Field(
+        default=32768,
+        description="max_tokens for analysis 强制总结轮（guided_json 全量 findings JSON）"
+    )
     llm_use_structured_output: bool = Field(
         default=False,
         description="v3.0: 启用结构化输出（OpenAI Function Calling / Anthropic Tool Use）"
@@ -410,6 +437,8 @@ class AgentTypeConfig:
     timeout_seconds: int
     tools: List[str] = field(default_factory=list)
     knowledge_modules: List[str] = field(default_factory=list)
+    # W1：per-agent 输出预算（None=无映射，调用链回退用户全局 llmMaxTokens）
+    max_tokens: Optional[int] = None
 
 
 # ============ Configuration Factory ============
@@ -491,6 +520,7 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
             max_iterations=config.orchestrator_max_iterations,
             timeout_seconds=config.orchestrator_timeout_seconds,
             tools=["think", "reflect", "dispatch_agent", "finish"],
+            max_tokens=config.llm_max_tokens_orchestrator,
         ),
         "recon": AgentTypeConfig(
             agent_type="recon",
@@ -498,6 +528,7 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
             timeout_seconds=config.sub_agent_timeout_seconds,
             tools=["list_files", "read_file", "search_code"],
             knowledge_modules=["project_analysis"],
+            max_tokens=config.llm_max_tokens_recon,
         ),
         "analysis": AgentTypeConfig(
             agent_type="analysis",
@@ -508,6 +539,7 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
                 "read_file", "search_code", "semgrep_scan", "bandit_scan"
             ],
             knowledge_modules=["sql_injection", "xss", "command_injection"],
+            max_tokens=config.llm_max_tokens_analysis,
         ),
         "verification": AgentTypeConfig(
             agent_type="verification",
@@ -515,6 +547,7 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
             timeout_seconds=config.sub_agent_timeout_seconds,
             tools=["verify_vulnerability", "dataflow_analysis", "sandbox_exec"],
             knowledge_modules=["vulnerability_verification"],
+            max_tokens=config.llm_max_tokens_verification,
         ),
     }
 
