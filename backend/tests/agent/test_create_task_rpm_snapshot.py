@@ -49,6 +49,8 @@ async def test_create_agent_task_persists_rpm_from_user_config(monkeypatch):
         AsyncMock(return_value={"otherConfig": {"llmRatePerMinute": 5}}),
     )
     monkeypatch.setattr(module, "_execute_agent_task", AsyncMock())
+    # D1: 创建端点改走 _launch_task_bg，调度包装必须 mock（否则 create_task 吞 AsyncMock）
+    monkeypatch.setattr(module, "_launch_task_bg", MagicMock())
 
     captured = {}
 
@@ -62,9 +64,8 @@ async def test_create_agent_task_persists_rpm_from_user_config(monkeypatch):
 
     current_user = SimpleNamespace(id="user-1")
     request = _make_request()
-    background_tasks = MagicMock()
 
-    await module.create_agent_task(request, background_tasks, db=db, current_user=current_user)
+    await module.create_agent_task(request, db=db, current_user=current_user)
 
     assert captured["agent_config"] == {"llm_rate_per_minute": 5}
 
@@ -81,6 +82,8 @@ async def test_create_agent_task_defaults_when_no_user_config(monkeypatch):
 
     monkeypatch.setattr(module, "_get_user_config", AsyncMock(return_value=None))
     monkeypatch.setattr(module, "_execute_agent_task", AsyncMock())
+    # D1: 创建端点改走 _launch_task_bg，调度包装必须 mock（否则 create_task 吞 AsyncMock）
+    monkeypatch.setattr(module, "_launch_task_bg", MagicMock())
 
     captured = {}
     original_init = module.AgentTask.__init__
@@ -93,8 +96,7 @@ async def test_create_agent_task_defaults_when_no_user_config(monkeypatch):
 
     current_user = SimpleNamespace(id="user-1")
     request = _make_request()
-    background_tasks = MagicMock()
 
-    await module.create_agent_task(request, background_tasks, db=db, current_user=current_user)
+    await module.create_agent_task(request, db=db, current_user=current_user)
 
     assert captured["agent_config"] is None

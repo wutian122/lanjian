@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy import case
@@ -2648,7 +2648,6 @@ async def _save_agent_tree(db: AsyncSession, task_id: str) -> None:
 @router.post("/", response_model=AgentTaskResponse)
 async def create_agent_task(
     request: AgentTaskCreate,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
@@ -2702,8 +2701,13 @@ async def create_agent_task(
     await db.commit()
     await db.refresh(task)
 
-    # 在后台启动任务（项目根目录在任务内部获取）
-    background_tasks.add_task(_execute_agent_task, task.id)
+    # D1: 用 _launch_task_bg 直接调度——Starlette BackgroundTasks 在 worker 忙于
+    # 前序任务时会丢失调度（生产 d177cc5c：连入口日志都没有，任务永久 pending）。
+    # _launch_task_bg 强引用防 GC + done_callback 打 logger.exception。
+    _launch_task_bg(
+        _execute_agent_task(task.id),
+        task_name=f"execute-{task.id}",
+    )
 
     logger.info(f"Created agent task {task.id} for project {project.name}")
 
