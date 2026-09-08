@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     TIME_BUDGET_MIN_EFFECTIVE_ANALYSIS: int = 300     # analysis 最小有效工作时长（秒）
     TIME_BUDGET_MIN_EFFECTIVE_VERIFICATION: int = 300  # verification 最小有效工作时长（秒，PoC 验证耗时长）
     TIME_BUDGET_MIN_EFFECTIVE_RECON: int = 120        # recon 最小有效工作时长（秒，侦察较轻量）；未知类型保守取 300
+    # B1 (F3): verification 预算预留——Analysis 已产出待验证项后，剩余预算低于该值
+    # 时拒发新 analysis，把时间留给 verification 完成验证（生产实证：主循环耗尽预算
+    # 掐断 verification，半途 findings 丢失、无 attempt 落库）。
+    VERIFICATION_RESERVE_SECONDS: int = 900
 
     # 鍚凩LM鎻愪緵鍟嗙殑API Key閰嶇疆锛堝吋瀹瑰崟鐙厤缃級
     OPENAI_API_KEY: Optional[str] = None

@@ -1086,6 +1086,28 @@ class OrchestratorAgent(BaseAgent):
                 f"拒发 {agent_name}：剩余 {remaining:.0f}s <= 最小有效工作时长 {required}s，提前收口",
             )
             return message
+
+        # B1 (F3): verification 预算预留——Analysis 已产出待验证项后，剩余预算低于
+        # 预留量时拒发新 analysis：生产实证 verification 深入验证被主循环耗尽预算
+        # 掐断，半途 findings 丢失、无 attempt 落库。仅约束 analysis；verification
+        # 自身照常派发（预留窗口内完成验证，超时由 watchdog/弹性退出收口）。
+        if agent_name == "analysis":
+            reserve_seconds = int(getattr(settings, "VERIFICATION_RESERVE_SECONDS", 900))
+            if remaining < reserve_seconds:
+                actionable = self._actionable_findings()
+                if actionable:
+                    message = (
+                        f"⏰ 任务时间预算将尽（剩余 {remaining:.0f}s），需为 verification "
+                        f"验证阶段预留 {reserve_seconds}s 预算：不再发起新的 analysis 调度，"
+                        f"请立即派发 verification 验证已产出的 {len(actionable)} 项发现，"
+                        f"或 finish 交卷"
+                    )
+                    self._record_gate_observation(
+                        "verification_reserve",
+                        f"拒发 analysis：剩余 {remaining:.0f}s < 验证预留 {reserve_seconds}s，"
+                        f"待验证产出 {len(actionable)} 条，预算预留验证阶段",
+                    )
+                    return message
         return None
 
     def _maybe_request_soft_stop(self, agent: BaseAgent, agent_name: str) -> bool:
