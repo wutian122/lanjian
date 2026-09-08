@@ -139,6 +139,22 @@
 ### F2: watchdog 收口失效（事件循环同步阻塞冻结——独立修复待审）
 - [x] **F2 完成**（三 commit 6c7fc6a/576254d/c491a95，review CLEAN——根因代码行亲验（litellm streaming_handler sync next 分支）+ 线程桥绕行根治（事件循环线程零 LLM 网络读、150s 兜底链逐环确认、取消语义协作 Event+daemon 线程）+ watchdog 补丁（同时 cancel/shield/3s 二次时限/栈落盘/语义边界三判别）+ per-chunk shield 防堵（Py3.12 吞取消实锤堵漏/_safe_aclose/_hard_interrupt 链贯通）；20 例新测试亲跑全过、全量 1218 passed/4 failed、A1 并行零冲突；4 Minor 记账：冗余 except/双 close 注释/测试数对账/放弃等待兜底）+ watchdog 强杀补丁（mark_deadline_hit 同时 cancel/shield/3s 二次时限/never-retrieved 防护）+ per-chunk 取消坑防堵（ensure_future+shield+aclose+_hard_interrupt）；回归 1181 passed/4 failed）
 
+### F3: 综合修复包（2026-09-07 老板确认：A1+B1/B3+F2 + 新发现）
+
+#### W5: llmMaxTokens 回写陷阱（最高优先）
+- [x] **W5 完成**（commit 1229b37，review CLEAN——根因：前端 saveConfig 无条件全量回写加载快照 + 后端 PUT 合并语义旧值覆盖 DB 现值；修复：前端 22 字段字段级 dirty-check（仅变化项进 payload）+ 保存后快照刷新；后端"省略即保留"契约已成立零逻辑改动（exclude_none=True + existing.update），4 例契约测试锁定；3 Minor 记账：注释"全局 2048"实为 4096（路径不可达）、dirty-check 不防第二管理员并发编辑（乐观锁 backlog）、加载失败 fallback 快照极端场景）
+
+#### W1: 分阶段 max_tokens（老板关键观察：2048 胡乱输出大减/32768 胡乱输出/4096 空响应）
+- [x] **W1 完成**（commit cbf876b，review CLEAN——设计推演确认 submit_findings 轮与中间 ReAct 轮请求同构无法请求时区分，故按 Agent 类型映射落地：orch/recon=2048（短决策防漂移）、analysis/verification=8192（单 finding≈900t×8+JSON 结构）、forced summary 显式 32768（兜底重汇总）；注入点 base.py stream_llm_call 开头（显式传参优先/未知类型回退全局 llmMaxTokens）；四类 agent 6 处调用点无一旁路；12 例测试 RED 11→GREEN；**台账偏差 R17 记账：台账原文 submit_findings 轮 32768，实现为 analysis 统一 8192+forced summary 32768 兜底**（工具轮与 ReAct 轮请求同构无法区分，截断有 warning+32768 重汇总三层兜底）——review 判定合理工程决策，已在代码注释论证）
+- 根因：Qwen3 thinking 长输出漂移 + SGLang fp8_e5m2 KV cache 长序列累积误差（服务端参数不动，蓝鉴侧适配）
+
+#### D1+D2: pending 启动入口
+- [ ] D1 待实施：创建端点 background_tasks.add_task 改 _launch_task_bg（P2-5 异常保护，d177cc5c 类搁浅根治）
+- [ ] D2 待实施：pending 任务启动入口（API+前端启动按钮）
+
+#### B1: verification 预算预留
+- [ ] B1 待实施：Analysis 完成后为 verification 强制保留最小预算（剩余<预留则收口不派新 analysis）
+
 ## Phase 6: 台账治理与端到端
 
 ### Task 18: OpenSpec 台账治理
