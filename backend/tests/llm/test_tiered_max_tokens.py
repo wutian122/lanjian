@@ -95,8 +95,8 @@ def _agent(cls, calls):
 @pytest.mark.parametrize(
     "agent_type,expected",
     [
-        ("orchestrator", 2048),
-        ("recon", 2048),
+        ("orchestrator", 4096),
+        ("recon", 4096),
         ("analysis", 4096),
         ("verification", 4096),
     ],
@@ -113,19 +113,19 @@ def test_unknown_agent_type_has_no_mapping():
 # ---------- stream_llm_call 端到端 ----------
 
 @pytest.mark.asyncio
-async def test_orchestrator_stream_uses_2048():
+async def test_orchestrator_stream_uses_4096():
     calls: list[dict[str, Any]] = []
     agent = _agent(OrchestratorAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "dispatch decision"}])
-    assert calls[-1]["max_tokens"] == 2048
+    assert calls[-1]["max_tokens"] == 4096
 
 
 @pytest.mark.asyncio
-async def test_recon_stream_uses_2048():
+async def test_recon_stream_uses_4096():
     calls: list[dict[str, Any]] = []
     agent = _agent(ReconAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "recon step"}])
-    assert calls[-1]["max_tokens"] == 2048
+    assert calls[-1]["max_tokens"] == 4096
 
 
 @pytest.mark.asyncio
