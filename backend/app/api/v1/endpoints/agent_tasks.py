@@ -85,10 +85,71 @@ _HARD_INTERRUPT_TIMEOUT_SECONDS = 2.0
 #   - 保留强引用避免被 GC（asyncio.create_task 只弱引用 task 本身，coro 也可能被 GC）
 _background_task_refs: set[asyncio.Task] = set()
 
-# D2: pending 任务启动防重入占位。start 端点 launch 前占位、包装协程退出时释放，
-# 覆盖"_execute_agent_task 已启动但 early heartbeat 尚未把 registry alive 键刷上"
-# 的亚秒窗口（沙箱初始化在状态翻 INITIALIZING 之前，status 检查也挡不住）。
+# D2: pending 任务启动防重入占位。start 端点函数体第一行同步占位（检查+add 之间
+# 无 await，事件循环不会在同步段中间让出，两并发请求只有一个能占位成功），创建
+# 端点 launch 前同样占位；包装协程退出/启动失败时释放。覆盖"协程已创建但 early
+# heartbeat 尚未把 registry alive 键刷上、_running_asyncio_tasks 要到沙箱/RAG
+# 后才注册（生产实证可达 10+ 分钟）"的双跑窗口。
 _task_start_slots: set[str] = set()
+
+# early heartbeat 协程句柄（_execute_agent_task 入口创建、orchestrator 启动前
+# cancel）。启动协程早段异常（进主 try 前）时由 _guarded_execute_task 兜底
+# cancel，防 while-True 心跳泄漏。
+_early_heartbeat_tasks: dict[str, asyncio.Task] = {}
+
+
+def _try_acquire_start_slot(task_id: str) -> bool:
+    """同步原子占位：检查与 add 在同一无 await 段内，并发请求恰一个成功。"""
+    if task_id in _task_start_slots:
+        return False
+    _task_start_slots.add(task_id)
+    return True
+
+
+async def _reset_task_to_pending_after_start_failure(task_id: str) -> None:
+    """启动协程早段失败（未进 orchestrator 主循环）时把任务回置 pending。
+
+    主循环内失败由 _execute_agent_task 自身置 FAILED/CANCELLED（不 re-raise），
+    本函数仅处理"任务已被 start/创建端点翻成 RUNNING/INITIALIZING 但协程在沙箱
+    初始化等早段崩溃"的搁浅态——回 pending 后用户可经 /start 重试。
+    """
+    try:
+        async with async_session_factory() as db:
+            task = await db.get(AgentTask, task_id)
+            if not task:
+                return
+            if _running_asyncio_tasks.get(task_id) is not None:
+                return  # 主循环已注册，状态由主循环收口
+            if task.status in (AgentTaskStatus.RUNNING, AgentTaskStatus.INITIALIZING):
+                task.status = AgentTaskStatus.PENDING
+                task.current_phase = None
+                await db.commit()
+                logger.info(f"[BgTask] task {task_id} failed during early startup, reset to pending")
+    except Exception:
+        logger.exception(f"[BgTask] reset task {task_id} to pending after start failure failed")
+
+
+async def _guarded_execute_task(task_id: str) -> None:
+    """_execute_agent_task 的启动包装（创建/start 两入口共用）：
+
+    - finally 释放 _task_start_slots；
+    - 早段异常（进 _execute_agent_task 主 try 前，如沙箱初始化/DB 不可用）：
+      cancel 泄漏的 early heartbeat、回置 pending 供重试，再 re-raise
+      （_launch_task_bg 的 done_callback 落 logger.exception）。
+    """
+    try:
+        await _execute_agent_task(task_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(f"[BgTask] execute-{task_id} failed during early startup")
+        hb = _early_heartbeat_tasks.pop(task_id, None)
+        if hb is not None and not hb.done():
+            hb.cancel()
+        await _reset_task_to_pending_after_start_failure(task_id)
+        raise
+    finally:
+        _task_start_slots.discard(task_id)
 
 
 def _launch_task_bg(coro, task_name: str) -> asyncio.Task:
@@ -800,6 +861,9 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
 
     try:
         _early_alive_task = asyncio.create_task(_early_pump_alive(), name=f"early-alive-{task_id}")
+        # 登记句柄：启动协程早段异常（进主 try 前）时 _guarded_execute_task
+        # 据此兜底 cancel，防 while-True 心跳泄漏。
+        _early_heartbeat_tasks[task_id] = _early_alive_task
     except Exception as _spawn_err:
         logger.debug(f"[AgentTask] early heartbeat spawn failed for {task_id}: {_spawn_err}")
     await sandbox_manager.initialize()
@@ -1227,6 +1291,7 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 except (asyncio.CancelledError, Exception):
                     pass
                 _early_alive_task = None
+            _early_heartbeat_tasks.pop(task_id, None)
 
             try:
                 # Fix: 总体超时保护，防止任务无限运行
@@ -1410,6 +1475,7 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
             # 也要 cancel early heartbeat，避免协程泄漏。
             if _early_alive_task is not None and not _early_alive_task.done():
                 _early_alive_task.cancel()
+            _early_heartbeat_tasks.pop(task_id, None)
 
             # C1: 只清理本任务的注册表作用域（包括所有子 Agent），不影响并发任务
             agent_registry.clear_task(task_id)
@@ -2680,48 +2746,56 @@ async def start_agent_task(
     pending 任务恢复。仅 pending 可启动；paused 走 /resume，stale running 走
     /recover。
     """
-    task = await db.get(AgentTask, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    # 同步原子占位（函数体第一行，此前无 await）：两并发请求恰一个成功，
+    # 失败者 409 且不触碰 DB/registry。
+    if not _try_acquire_start_slot(task_id):
+        raise HTTPException(status_code=409, detail="任务正在启动中，请勿重复启动")
 
-    project = await db.get(Project, task.project_id)
-    assert_can_access_project(current_user, project)
+    launched = False
+    try:
+        task = await db.get(AgentTask, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
 
-    if task.status != AgentTaskStatus.PENDING:
-        raise HTTPException(
-            status_code=400,
-            detail="只有待启动（pending）任务可以启动；已暂停任务请使用继续，运行中任务无需重复启动",
+        project = await db.get(Project, task.project_id)
+        assert_can_access_project(current_user, project)
+
+        if task.status != AgentTaskStatus.PENDING:
+            raise HTTPException(
+                status_code=400,
+                detail="只有待启动（pending）任务可以启动；已暂停任务请使用继续，运行中任务无需重复启动",
+            )
+
+        # 防重复启动：orchestrator 协程在册 / registry 仍有存活证据（跨 worker）
+        # 任一成立即拒绝（slot 闸已在同步段拦截本进程并发启动）。
+        if _running_asyncio_tasks.get(task_id):
+            raise HTTPException(status_code=400, detail="任务正在启动或运行中，无需重复启动")
+        if await _is_task_alive_in_registry(task_id):
+            raise HTTPException(status_code=400, detail="任务实际正在运行中（registry 存活），无需重复启动")
+
+        task.status = AgentTaskStatus.RUNNING
+        task.paused = False
+        task.paused_at = None
+        task.pause_reason = None
+        await db.commit()
+
+        # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception；
+        # slot 所有权随 launch 转移给 _guarded_execute_task（其 finally 释放）
+        _launch_task_bg(
+            _guarded_execute_task(task_id),
+            task_name=f"start-{task_id}",
         )
+        launched = True
 
-    # 防重复启动：本进程启动协程在途 / orchestrator 协程在册 / registry 仍有
-    # 存活证据（跨 worker）任一成立即拒绝。
-    if task_id in _task_start_slots or _running_asyncio_tasks.get(task_id):
-        raise HTTPException(status_code=400, detail="任务正在启动或运行中，无需重复启动")
-    if await _is_task_alive_in_registry(task_id):
-        raise HTTPException(status_code=400, detail="任务实际正在运行中（registry 存活），无需重复启动")
-
-    task.status = AgentTaskStatus.RUNNING
-    task.paused = False
-    task.paused_at = None
-    task.pause_reason = None
-    await db.commit()
-
-    task_name = f"start-{task_id}"
-    _task_start_slots.add(task_id)
-
-    async def _guarded_start() -> None:
-        try:
-            await _execute_agent_task(task_id)
-        finally:
+        return {
+            "message": "任务已启动",
+            "task_id": task_id,
+        }
+    finally:
+        # 任何拒绝/失败路径（launch 未发生）同步释放占位；launch 成功后由
+        # 包装协程退出时释放，此处不得 discard。
+        if not launched:
             _task_start_slots.discard(task_id)
-
-    # P2-5: 用 _launch_task_bg 包装，异常自动打 logger.exception
-    _launch_task_bg(_guarded_start(), task_name=task_name)
-
-    return {
-        "message": "任务已启动",
-        "task_id": task_id,
-    }
 
 
 @router.post("/", response_model=AgentTaskResponse)
@@ -2783,10 +2857,18 @@ async def create_agent_task(
     # D1: 用 _launch_task_bg 直接调度——Starlette BackgroundTasks 在 worker 忙于
     # 前序任务时会丢失调度（生产 d177cc5c：连入口日志都没有，任务永久 pending）。
     # _launch_task_bg 强引用防 GC + done_callback 打 logger.exception。
-    _launch_task_bg(
-        _execute_agent_task(task.id),
-        task_name=f"execute-{task.id}",
-    )
+    # Important-2: launch 前同步占 slot——协程被事件循环延迟期间（early heartbeat
+    # 未刷、_running_asyncio_tasks 要到沙箱/RAG 后才注册，可达 10+ 分钟），
+    # 用户走 /start 恢复会三闸全空导致双跑（双沙箱/双 orchestrator）。
+    if _try_acquire_start_slot(task.id):
+        _launch_task_bg(
+            _guarded_execute_task(task.id),
+            task_name=f"execute-{task.id}",
+        )
+    else:
+        logger.warning(
+            f"[CreateTask] start slot already held for new task {task.id}, skip launch"
+        )
 
     logger.info(f"Created agent task {task.id} for project {project.name}")
 

@@ -128,6 +128,7 @@ def test_reserve_seconds_overridable_via_settings(monkeypatch):
     assert agent._budget_refusal("analysis") is None  # 400 >= 覆盖后的 300s
 
     agent = _make_agent(monkeypatch, remaining=250.0, findings=[_finding()])
-    # 250 < 300 预留（同时 <= analysis 最小有效 300，两闸皆拒；预留闸先判）
+    # 250 <= analysis 最小有效时长 300s：dispatch_budget 闸先拒（预留闸不及触发）
     refusal = agent._budget_refusal("analysis")
     assert refusal is not None
+    assert agent._gate_observations[-1]["gate"] == "dispatch_budget"
