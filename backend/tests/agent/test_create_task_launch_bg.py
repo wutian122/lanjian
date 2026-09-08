@@ -4,10 +4,10 @@
 忙于前序任务时会丢失调度（连入口日志都没有），任务永久 pending。创建端点改用
 ``_launch_task_bg``（强引用 + 异常 logger.exception 的 fire-and-forget 包装）。
 """
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from pathlib import Path
-import sys
 
 import pytest
 

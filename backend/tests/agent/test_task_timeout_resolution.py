@@ -22,7 +22,6 @@ from pydantic import ValidationError
 
 from app.core.config import settings
 
-
 # ---------- Schema：未显式传值时不得落默认 1800 ----------
 
 
@@ -79,6 +78,8 @@ async def _create_task_capturing_kwargs(monkeypatch, request):
 
     monkeypatch.setattr(module, "_get_user_config", AsyncMock(return_value=None))
     monkeypatch.setattr(module, "_execute_agent_task", AsyncMock())
+    # D1: 创建端点改走 _launch_task_bg，调度包装必须 mock
+    monkeypatch.setattr(module, "_launch_task_bg", MagicMock())
 
     captured: dict = {}
     original_init = module.AgentTask.__init__
@@ -91,7 +92,6 @@ async def _create_task_capturing_kwargs(monkeypatch, request):
 
     await module.create_agent_task(
         request,
-        MagicMock(),
         db=db,
         current_user=SimpleNamespace(id="user-1"),
     )

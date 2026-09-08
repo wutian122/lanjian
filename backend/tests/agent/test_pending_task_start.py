@@ -7,10 +7,10 @@
 - 任务不存在 → 404；无项目权限 → ProjectAccessDenied(404)；
 - registry 仍有存活证据（任务实际在启动/运行中）→ 400 防重复启动。
 """
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from pathlib import Path
-import sys
 
 import pytest
 from fastapi import HTTPException

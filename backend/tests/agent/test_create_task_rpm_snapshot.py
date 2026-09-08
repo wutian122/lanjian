@@ -4,21 +4,16 @@
 - Scenario: 任务创建时从 UserConfig 快照 RPM
 - Scenario: 无用户配置时 RPM 用默认值
 """
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from pathlib import Path
-import sys
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.api.v1.endpoints import agent_tasks as module
-from app.api.v1.endpoints.config import (
-    decrypt_config,
-    SENSITIVE_LLM_FIELDS,
-    SENSITIVE_OTHER_FIELDS,
-)
 
 
 def _make_project():
