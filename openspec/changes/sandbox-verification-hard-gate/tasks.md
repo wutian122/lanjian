@@ -149,11 +149,11 @@
 - 根因：Qwen3 thinking 长输出漂移 + SGLang fp8_e5m2 KV cache 长序列累积误差（服务端参数不动，蓝鉴侧适配）
 
 #### D1+D2: pending 启动入口
-- [ ] D1 待实施：创建端点 background_tasks.add_task 改 _launch_task_bg（P2-5 异常保护，d177cc5c 类搁浅根治）
-- [ ] D2 待实施：pending 任务启动入口（API+前端启动按钮）
+- [x] **D1 完成**（commit e4a23a2，review CLEAN——创建端点移除 BackgroundTasks 形参改 _launch_task_bg（P2-5 异常保护）；现有测试签名适配）
+- [x] **D2 完成**（commit 8790ec9 + TOCTOU 原子化修复 3923d5a，review 初审 NEEDS_FIX（2 Important：三重闸 TOCTOU 双 start 竞态 + 创建路径不占 slot 双跑窗口）→ 重审 CLEAN（同步原子段占位 + 并发测试 5 连跑 + 变异自证）；前端列表 footer「启动」按钮 + 详情搁浅横幅（orchestrator_alive===false）；3 Minor 记账：早段失败回滚 reset 三重保护、early heartbeat 句柄登记、never-awaited 收尾）
 
 #### B1: verification 预算预留
-- [ ] B1 待实施：Analysis 完成后为 verification 强制保留最小预算（剩余<预留则收口不派新 analysis）
+- [x] **B1 完成**（commit 5c62773，review CLEAN——VERIFICATION_RESERVE_SECONDS=900 + _budget_refusal 扩展闸（仅 analysis + actionable 非空 + remaining<900）；B1×Task 8 语义闭环亲验（拒发后 finish → 证据门禁强制重派 → R4 补发无死路）；与 Task 5 dispatch_budget 分闸区间衔接无空洞；B1 测试注释顺序修正）
 
 ## Phase 6: 台账治理与端到端
 
