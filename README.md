@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.4.1-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.5.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -26,6 +26,7 @@
 - **任务临时目录清理**（v6.2.4）：agent 审计任务进入终态后自动清理 `/tmp/lanjian/<task_id>` 临时源码目录（此前 46 个历史目录累积 13G 塞满 tmpfs 致任务 No space 失败、db/redis 误报 unhealthy）；重验 finding（reverify）在目录已清理时 ZIP 项目自动重新解压源码、仓库项目返回明确提示；删除任务同步清理临时目录
 - **E2E 六项缺陷修复**（v6.2.5）：EventQueue 生产端零阻塞 + thinking_token 聚合降频（消除 1493 条事件各等满 5s ≈ 124 分钟阻塞）；reverify 接入确定性证据引擎（重放真实沙箱证据，PoC 崩溃不再误降 not_reproducible）；统一路径解析器修复多语言 finding 落库丢失（src/ 层级误杀）；沙箱项目源码挂载一律只读；仪表盘统计聚合 agent_tasks；删除任务前取消收尾协程
 - **大项目审计时间预算治理**（v6.3.0）：根治"大项目审计正常结束但漏洞为 0"的结构性缺陷（nacos/tomcat 5 千文件级任务实证诊断）——任务超时 watchdog 化（到点先优雅收口 + 45s 宽限 + hard-cancel 兜底，修复 Python 3.12 吞取消导致超时兜底失效）；analysis 时间预算将尽**软停止交卷**（已完成的调查强制总结为 findings，不再被硬杀清零）；子 Agent 调度超时 = min(类型上限, 剩余预算) 且调度前复位取消锁存（一次超时不再永久废掉同类型 Agent 的补发调度）；失败子 Agent 已声明的发现保全落库；0 发现 + 调度失败如实标 `completed_with_gaps`（不再误报"发现 0 个漏洞"）
+- **沙箱验证硬门禁与产出下限**（v6.5.0）：封堵十条绕过沙箱直达终态的豁免路径（Semgrep 静态短路先执行确定性 PoC、软证据升级前置真实尝试、弹性退出/预算耗尽/兜底遍历三路径收口、三次放行未验证清单强制标记并在报告呈现"未沙箱验证"段落）；基础设施故障分离 `infra_error` 语义（Docker 缺席/镜像缺失不再伪装"漏洞未复现"）；Analysis 分层候选制（低置信候选交沙箱验证，替代"宁可漏报"）+ 维度级产出下限 + Semgrep 兜底落库（配置类不送沙箱防预算拖垮）；audit_trace 全链路闭环（工具/LLM/验证写点补全 + volume 持久化 + 执行轨迹摘要注入子 Agent 上下文）；LLM 调用韧性（空响应分型重试、无效 tool_calls 强引导自愈、litellm 出站线程池剥离根治事件循环同步阻塞、watchdog 强杀补丁）；LLM 预算治理（按 Agent 类型分阶段 max_tokens、repetition_penalty 治理、llmConfig 保存防回写陷阱）；任务管理（pending 搁浅任务手动启动入口、verification 预算预留）；前端预算输入项 / 时间预算显示 / 沙箱证据三标记可视化
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -116,7 +117,7 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）：**backend `v6.4.1`**（本次发布，hotfix：修复 `orchestrator.py` 未导入 `get_agent_config` 导致代码审计任务在编排器初始化阶段 100% 崩溃的致命缺陷）、frontend `v6.4.0`（本次无变更）、sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）：**backend `v6.5.0`**（本次发布：沙箱验证硬门禁与产出下限、audit_trace 闭环、LLM 调用韧性与预算治理）、**frontend `v6.5.0`**（任务预算输入项 / 时间预算显示 / 沙箱证据三标记 / 搁浅任务启动入口）、sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 

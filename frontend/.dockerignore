@@ -6,3 +6,4 @@ dist
 .env*
 .vscode
 .DS_Store
+pnpm-workspace.yaml
