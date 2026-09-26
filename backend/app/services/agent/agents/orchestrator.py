@@ -1556,6 +1556,20 @@ class OrchestratorAgent(BaseAgent):
                 # 🔥 检测空响应（tool_calls 形态正文为空属正常，不判空）
                 if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     logger.warning(f"[{self.name}] Empty LLM response")
+                    # R-C1：truncated 形态（思考流吃光输出预算）连续 3 轮即止损——
+                    # 系统性工况下重试大概率同样截断，避免每轮约 100 秒的空转烧资源
+                    # （2026-09-26 生产实证：任务 c0c6182f 连续 6 轮空转后才兜底）
+                    if self.record_empty_round():
+                        logger.error(
+                            f"[{self.name}] 连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 "
+                            "输出预算被思考流耗尽（truncated 空响应），止损停止重试"
+                        )
+                        await self.emit_event(
+                            "error",
+                            f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 LLM 输出预算被思考流耗尽，"
+                            "已止损停止重试（建议为模型关闭思考模式或调大 max_tokens）",
+                        )
+                        break
                     empty_retry_count = getattr(self, '_empty_retry_count', 0) + 1
                     self._empty_retry_count = empty_retry_count
                     if empty_retry_count >= 5:  # 🔥 增加重试次数到5次
@@ -1599,6 +1613,8 @@ Action Input: {{"参数": "值"}}
 
                 # 重置空响应计数器
                 self._empty_retry_count = 0
+                # R-C1：有效产出轮（正文/工具调用）重置连续 truncated 计数
+                self.reset_empty_streak()
 
                 # 🔥 检查是否是 API 错误（而非格式错误）
                 if llm_output.startswith("[API_ERROR:"):

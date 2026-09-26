@@ -1569,6 +1569,29 @@ class BaseAgent(ABC):
             )
         return ""
 
+    # R-C1（2026-09-26）：truncated 空响应连续止损。生产实证（任务 c0c6182f）
+    # Qwen3.8-27B 思考流吃光 max_tokens 属系统性工况——重试大概率同样截断，
+    # 既有累计 5 次上限会空转 5 轮（每轮约 100 秒 / 4k-10k tokens）才兜底。
+    # 连续 3 轮 truncated 即止损，非空轮重置计数（模型恢复即重新计数）。
+    TRUNCATED_EMPTY_STOP_LIMIT = 3
+
+    def record_empty_round(self) -> bool:
+        """记录一次空响应轮，返回是否触发止损。
+
+        仅 truncated 形态（finish_reason=length 且正文空——思考流耗尽输出预算）
+        计入连续计数；reasoning_only / other 等其他形态不计入也不打断计数
+        （沿用既有累计 5 次上限兜底）。止损返回 True 后由调用方终止重试。
+        """
+        kind = getattr(self, "_last_empty_kind", None)
+        if kind != "truncated":
+            return False
+        self._truncated_empty_streak = getattr(self, "_truncated_empty_streak", 0) + 1
+        return self._truncated_empty_streak >= self.TRUNCATED_EMPTY_STOP_LIMIT
+
+    def reset_empty_streak(self) -> None:
+        """非空轮（正常产出正文/工具调用）调用：重置连续 truncated 计数。"""
+        self._truncated_empty_streak = 0
+
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """
         统一的工具执行方法 - 支持取消和超时
