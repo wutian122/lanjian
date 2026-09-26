@@ -1368,6 +1368,21 @@ class BaseAgent(ABC):
                             # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
                             await asyncio.sleep(0)
 
+                            # L2：崩坏萌芽检测（每 chunk 后毫秒级尾部窗口检查）——
+                            # 字符墙/循环刚萌芽即掐断本轮：丢弃全部内容走"无效轮"
+                            # 静默重试（nudge/止损），崩坏文本不对用户固化展示。
+                            if self._detect_output_degeneracy(accumulated):
+                                logger.warning(
+                                    f"[{self.name}] Degenerate output detected "
+                                    "(charwall/loop), discarding round for silent retry"
+                                )
+                                self._last_empty_kind = "degenerate"
+                                accumulated = ""
+                                accumulated_content = ""
+                                accumulated_reasoning = ""
+                                self._last_tool_calls = None
+                                break
+
                         elif chunk["type"] == "done":
                             # Task 3 语义：done.content 仅正文（旧后端/伪流式无 reasoning 键，
                             # content 即全文）；新协议 done 另带 reasoning 仅思考累计。
@@ -1495,7 +1510,10 @@ class BaseAgent(ABC):
             # sandbox-verification-hard-gate Task 20：空响应形态分类，供上层
             # 空响应重试按形态选 nudge 文案（_empty_response_nudge）。
             # tool_calls 轮正文空属正常（调用参数在 tool_calls 中），不判空响应。
-            if self._last_tool_calls:
+            # L2：degenerate（崩坏萌芽掐断）形态在检测点已置位，此处保留不覆盖。
+            if self._last_empty_kind == "degenerate":
+                pass
+            elif self._last_tool_calls:
                 self._last_empty_kind = None
             elif self._last_llm_truncated:
                 # 形态 A：finish_reason=length 且正文空——reasoning 思考流吃光
@@ -1593,6 +1611,46 @@ class BaseAgent(ABC):
     # 连续 3 轮 truncated 即止损，非空轮重置计数（模型恢复即重新计数）。
     TRUNCATED_EMPTY_STOP_LIMIT = 3
 
+    # L2（2026-09-26）：生成崩坏萌芽检测阈值。模型采样崩坏（字符墙/循环）
+    # 概率性发生（梯度实验实证蓝鉴侧输入无法消除），萌芽即掐断本轮静默重试，
+    # 崩坏文本不对用户展示。阈值保守：正常审计文本（含 '----' 分隔线）同字符
+    # run 极少超过 30；25 字符重复子串在正常文本中几乎不出现。
+    DEGENERACY_CHAR_RUN_LIMIT = 30
+    DEGENERACY_LOOP_MIN = 25
+    DEGENERACY_LOOP_CHECK_INTERVAL = 1024
+
+    def _detect_output_degeneracy(self, text: str) -> bool:
+        """检测生成文本的崩坏萌芽特征（字符墙 / 循环），命中即丢弃本轮静默重试。
+
+        - F1 字符墙：同字符连续 run >= DEGENERACY_CHAR_RUN_LIMIT（尾 200 窗口，
+          每 chunk 后调用，毫秒级）；
+        - F2 循环：尾 500 窗口存在 >= DEGENERACY_LOOP_MIN 字符重复子串
+          （节流：文本每增长 DEGENERACY_LOOP_CHECK_INTERVAL 才查一次）。
+        正常文本（含 '----' 分隔线、常规重复强调）不触发。
+        """
+        if not text or len(text) < self.DEGENERACY_CHAR_RUN_LIMIT:
+            return False
+        tail = text[-200:]
+        cur = 1
+        prev = ""
+        for ch in tail:
+            if ch == prev:
+                cur += 1
+                if cur >= self.DEGENERACY_CHAR_RUN_LIMIT:
+                    return True
+            else:
+                cur = 1
+                prev = ch
+        if len(text) >= 120 and len(text) - getattr(self, "_deg_last_loop_check", 0) >= 64:
+            self._deg_last_loop_check = len(text)
+            tail500 = text[-500:]
+            loop_min = self.DEGENERACY_LOOP_MIN
+            for i in range(0, max(0, min(len(tail500) - loop_min, 220))):
+                frag = tail500[i:i + loop_min]
+                if frag in tail500[i + loop_min:]:
+                    return True
+        return False
+
     def record_empty_round(self) -> bool:
         """记录一次空响应轮，返回是否触发止损。
 
@@ -1601,7 +1659,7 @@ class BaseAgent(ABC):
         （沿用既有累计 5 次上限兜底）。止损返回 True 后由调用方终止重试。
         """
         kind = getattr(self, "_last_empty_kind", None)
-        if kind != "truncated":
+        if kind not in ("truncated", "degenerate"):
             return False
         self._truncated_empty_streak = getattr(self, "_truncated_empty_streak", 0) + 1
         return self._truncated_empty_streak >= self.TRUNCATED_EMPTY_STOP_LIMIT
