@@ -32,7 +32,8 @@ def _make_verification_agent() -> VerificationAgent:
     agent = VerificationAgent.__new__(VerificationAgent)
     agent.config = MagicMock()
     agent.config.name = "Verification"
-    agent.config.agent_type = MagicMock(value="verification")
+    # 生产实况：AgentConfig.agent_type 是 str（非枚举）——必须按 str 匹配
+    agent.config.agent_type = "verification"
     agent.event_emitter = MagicMock()
     agent.event_emitter.emit = AsyncMock()
     agent._timeout_config = MagicMock()

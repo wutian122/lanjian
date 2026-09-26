@@ -1201,9 +1201,10 @@ class BaseAgent(ABC):
         # 降级收口）。按 agent 类型集中注入：verification 显式请求开思考，adapter
         # setdefault 语义保证覆盖全局注入的 False；其余 agent 维持全局关思考。
         if extra_params is None:
-            agent_type_value = getattr(
-                getattr(self.config, "agent_type", None), "value", ""
-            )
+            # AgentConfig.agent_type 为 str；兼容枚举类型（防未来改型回归）
+            agent_type_value = getattr(self.config, "agent_type", "")
+            if not isinstance(agent_type_value, str):
+                agent_type_value = getattr(agent_type_value, "value", "")
             if agent_type_value == "verification":
                 extra_params = {"chat_template_kwargs": {"enable_thinking": True}}
         """
