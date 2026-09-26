@@ -135,13 +135,19 @@ def _clean_text_node(text: str, path: str, hits: List[str], *, allow_no_think: b
     return result
 
 
-def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think: bool = False) -> Any:
+def _strip_thinking_off(
+    node: Any, path: str, hits: List[str], *, allow_no_think: bool = False,
+    allow_switch: bool = False,
+) -> Any:
     """递归剥除 dict/list/str 节点中的关思考参数与提示词标记（原地修改容器）。
 
     - dict：键名（大小写不敏感）为 enable_thinking 且值为关语义 → 删键并记录；
-      形如 chat message 的 dict（同时含 role 与 content 键）按 role 决定 content
-      子树是否允许清洗 /no_think（仅 system/user）；其余值递归；
-    - list：逐元素递归（messages 列表、多模态 content parts），allow_no_think 透传；
+      allow_switch=True（LLM_DISABLE_THINKING 开启，服务端已修复关思考缺陷）
+      时放行该键不剥；形如 chat message 的 dict（同时含 role 与 content 键）
+      按 role 决定 content 子树是否允许清洗 /no_think（仅 system/user）；其余
+      值递归；
+    - list：逐元素递归（messages 列表、多模态 content parts），allow_no_think
+      透传；<|think_off|> 防注入清洗不受 allow_switch 影响；
     - str：按 _clean_text_node 规则清洗。
 
     allow_no_think 仅在 system/user 消息的 content 子树内为 True；tools 描述、
@@ -160,21 +166,26 @@ def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think
                 and key.lower() == _THINK_SWITCH_KEY
                 and _is_thinking_off_value(node[key])
             ):
+                if allow_switch:
+                    continue
                 hits.append(f"{child_path}={node[key]!r}（关思考参数已剥除）")
                 del node[key]
             elif is_chat_message and key == "content":
                 node[key] = _strip_thinking_off(
-                    node[key], child_path, hits, allow_no_think=content_allows_no_think
+                    node[key], child_path, hits, allow_no_think=content_allows_no_think,
+                    allow_switch=allow_switch,
                 )
             else:
                 node[key] = _strip_thinking_off(
-                    node[key], child_path, hits, allow_no_think=allow_no_think
+                    node[key], child_path, hits, allow_no_think=allow_no_think,
+                    allow_switch=allow_switch,
                 )
         return node
     if isinstance(node, list):
         for idx, item in enumerate(node):
             node[idx] = _strip_thinking_off(
-                item, f"{path}[{idx}]", hits, allow_no_think=allow_no_think
+                item, f"{path}[{idx}]", hits, allow_no_think=allow_no_think,
+                allow_switch=allow_switch,
             )
         return node
     if isinstance(node, str):
@@ -182,9 +193,27 @@ def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think
     return node
 
 
-def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str, Any]:
-    """关思考护栏：在请求构造的最后出口对即将出站的 kwargs 调用，原地剥除一切
+def _thinking_off_allowed() -> bool:
+    """LLM_DISABLE_THINKING 开关读取（延迟 import 避免模块加载环）。
+
+    True：向端点注入 chat_template_kwargs={"enable_thinking": False}（无思考
+    模式，Qwen3.8-27B 思考失控的根治开关，2026-09-26 实测服务端已支持），并
+    放行护栏对 enable_thinking 键的剥除。
+    """
+    from app.core.config import settings
+
+    return bool(getattr(settings, "LLM_DISABLE_THINKING", False))
+
+
+def _assert_no_thinking_off(
+    params: Dict[str, Any], *, source: str, allow: bool = False,
+) -> Dict[str, Any]:
+    """关思考护栏：在请求构造的最后出口对即将出站的 kwargs 调用，默认剥除一切
     关思考参数/提示词标记，保证请求以思考模式发出。
+
+    allow=True（LLM_DISABLE_THINKING 开启，服务端已修复关思考缺陷）时放行
+    enable_thinking 键的剥除——配置注入的 chat_template_kwargs 原样到达端点；
+    <|think_off|> / /no_think 的防注入清洗不受 allow 影响，恒生效。
 
     背景：Qwen3 thinking 经 SGLang（--reasoning-parser qwen3）服务端在 parser
     修正前，关思考会导致正文被吞进 reasoning_content、content 恒空（老板实测，
@@ -203,16 +232,20 @@ def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str,
     零命中时不修改 params、不输出日志（正常请求零行为变化）。
 
     解除条件：服务端 reasoning-parser 修正并实测验证后本护栏可移除。
+    2026-09-26：条件已实测满足（SGLang 关思考后 content/tool_calls 正常），
+    按 R-C1 折中为 allow 开关——LLM_DISABLE_THINKING 全局放行，护栏其余
+    防注入职责保留。
 
     Args:
         params: 即将发往端点的请求 kwargs（litellm/acompletion 或 openai create 风格）。
         source: 触发位置标识（"_send_request" / "stream_complete" / "_native_openai_call"）。
+        allow: True 时放行 enable_thinking 键（LLM_DISABLE_THINKING 开启）。
 
     Returns:
         {"stripped": [剥除项描述, ...]}；空列表表示零命中。
     """
     hits: List[str] = []
-    _strip_thinking_off(params, "", hits)
+    _strip_thinking_off(params, "", hits, allow_switch=allow)
     if hits:
         logger.warning(
             "关思考护栏拦截（位置=%s）：检测到 %d 处关思考参数/标记，已剥除并强制以思考模式"
@@ -413,6 +446,13 @@ class LiteLLMAdapter(BaseLLMAdapter):
         rp = self.config.repetition_penalty
         if rp is not None:
             merged.setdefault("repetition_penalty", rp)
+        # R-C1：LLM_DISABLE_THINKING 开启时注入关思考参数（Qwen3.8-27B 思考流
+        # 吃光输出预算的根治开关；服务端已修复关思考缺陷，实测 2026-09-26）。
+        # 注入于 merge 层——native/litellm 非流式/litellm 流式三条出站路径统一
+        # 呈现；护栏经 allow 通道放行该键（_assert_no_thinking_off）。
+        if _thinking_off_allowed():
+            chat_template_kwargs = merged.setdefault("chat_template_kwargs", {})
+            chat_template_kwargs.setdefault("enable_thinking", False)
         return merged
 
     async def _native_openai_call(self, **kwargs: Any):
@@ -422,7 +462,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
         """
         # 关思考护栏（structured-output-protocol）：native 路径最后出口。
         # 与 _send_request 出口那道幂等双保险——未来若有新调用方直接调本方法也绕不过。
-        _assert_no_thinking_off(kwargs, source="_native_openai_call")
+        _assert_no_thinking_off(kwargs, source="_native_openai_call", allow=_thinking_off_allowed())
 
         import openai
 
@@ -556,7 +596,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
         # 关思考护栏（structured-output-protocol）：非流式路径最后出口。
         # kwargs 已完全成型，native/litellm 两个分支都在其后发出，统一在此清洗；
         # native 分支内 _native_openai_call 还有一道幂等双保险。
-        _assert_no_thinking_off(kwargs, source="_send_request")
+        _assert_no_thinking_off(kwargs, source="_send_request", allow=_thinking_off_allowed())
 
         try:
             # 当使用 OPENAI + 自定义 base_url 时，直接使用原生 OpenAI 客户端
@@ -726,7 +766,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         # 关思考护栏（structured-output-protocol）：流式路径最后出口，
         # kwargs 已完全成型，在 litellm.acompletion 发出前统一清洗
-        _assert_no_thinking_off(kwargs, source="stream_complete")
+        _assert_no_thinking_off(kwargs, source="stream_complete", allow=_thinking_off_allowed())
 
         # structured-output-protocol Task 3：思考流/正文流在 chunk 层分离。
         # accumulated_content 仅累计 delta.content（正文），accumulated_reasoning

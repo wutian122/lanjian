@@ -105,6 +105,15 @@ class Settings(BaseSettings):
     # structured-output-protocol 层次 6：repetition_penalty（SGLang/vLLM 接受，
     # 经 extra_params→extra_body/native body 透传；用户配置 llmConfig.repetitionPenalty 优先）
     LLM_REPETITION_PENALTY: float = 1.2
+    # 关思考开关（R-C1，2026-09-26）：True 时三条出站路径向 extra_body 注入
+    # chat_template_kwargs={"enable_thinking": False}（SGLang/vLLM 端点按请求体
+    # 顶层键接受），并放行护栏对 enable_thinking 键的剥除（<|think_off|> /
+    # /no_think 防注入清洗不受影响）。
+    # 解除护栏的历史依据：旧护栏（2026-09-03 实测）要求强制思考的原因是服务端
+    # reasoning-parser 未修正——关思考会让 content 恒空；2026-09-26 实测当前
+    # SGLang 镜像已修复（关思考后 content/tool_calls 正常、同一决策 96 vs 1364
+    # tokens），满足护栏注释预留的解除条件。默认 False 保持现状零变化。
+    LLM_DISABLE_THINKING: bool = False
 
     # Agent 娴佸紡瓒呮椂閰嶇疆锛堢锛?
     LLM_FIRST_TOKEN_TIMEOUT: int = 180  # 首Token超时时间（秒），推理模型需要更长时间  # 绛夊緟棣栦釜Token鐨勮秴鏃舵椂闂?
