@@ -29,11 +29,19 @@ THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
 
 
 def _make_verification_agent() -> VerificationAgent:
+    # 生产同构：真实 AgentConfig（agent_type 为枚举——与 verification.py 构造一致）
+    from app.services.agent.agents.base import AgentConfig, AgentPattern
+
+    from app.services.agent.agents.base import AgentType
+
     agent = VerificationAgent.__new__(VerificationAgent)
-    agent.config = MagicMock()
-    agent.config.name = "Verification"
-    # 生产实况：AgentConfig.agent_type 是 str（非枚举）——必须按 str 匹配
-    agent.config.agent_type = "verification"
+    agent.config = AgentConfig(
+        name="Verification",
+        agent_type=AgentType.VERIFICATION,
+        pattern=AgentPattern.REACT,
+        max_iterations=10,
+        system_prompt="test",
+    )
     agent.event_emitter = MagicMock()
     agent.event_emitter.emit = AsyncMock()
     agent._timeout_config = MagicMock()
