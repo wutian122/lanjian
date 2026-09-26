@@ -123,7 +123,7 @@ def _scripted_chat_stream(rounds):
     state = {"i": 0}
 
     async def _stream(messages=None, temperature=None, max_tokens=None, tools=None,
-                      response_format=None):
+                      response_format=None, extra_params=None):
         spec = rounds[state["i"]]
         state["i"] += 1
         form = spec["form"]

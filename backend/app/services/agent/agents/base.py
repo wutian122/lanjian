@@ -1277,15 +1277,20 @@ class BaseAgent(ABC):
             nonlocal accumulated, accumulated_content, accumulated_reasoning
             nonlocal stream_has_kind, content_emitted, total_tokens
             nonlocal prompt_tokens, completion_tokens
-            # 获取流式迭代器（传入 None 时使用用户配置）
-            stream = self.llm_service.chat_completion_stream(
+            # 获取流式迭代器（传入 None 时使用用户配置）。
+            # R-C2 兼容性：extra_params 仅在非 None 时透传——None 不出现在调用
+            # 签名里（等价 chat_completion_stream 的默认值），保持既有 mock 断言
+            # 与调用形态兼容（存量测试对调用参数做精确匹配）。
+            stream_kwargs: Dict[str, Any] = dict(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
                 response_format=response_format,
-                extra_params=extra_params,
             )
+            if extra_params is not None:
+                stream_kwargs["extra_params"] = extra_params
+            stream = self.llm_service.chat_completion_stream(**stream_kwargs)
             # 兼容不同版本的 python async generator
             iterator = stream.__aiter__()
             # F2 补丁③：挂 self 供 hard_interrupt_stream（watchdog 兜底）强制关闭

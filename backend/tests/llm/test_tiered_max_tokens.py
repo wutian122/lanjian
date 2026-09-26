@@ -60,6 +60,7 @@ def _capturing_stream(calls: list[dict[str, Any]]):
         max_tokens=None,
         tools=None,
         response_format=None,
+        extra_params=None,
     ):
         calls.append({
             "max_tokens": max_tokens,
