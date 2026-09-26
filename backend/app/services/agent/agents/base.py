@@ -1193,7 +1193,19 @@ class BaseAgent(ABC):
         auto_compress: bool = True,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, int]:
+        # R-C2（2026-09-26）：差异化关思考——Verification 深度验证任务保留思考。
+        # 全局 LLM_DISABLE_THINKING 下 verification 会"秒停空转"（生产实证：
+        # 2 秒/轮连环 Empty 44 连发，无沙箱证据 → 门禁拒绝 → completed_with_gaps
+        # 降级收口）。按 agent 类型集中注入：verification 显式请求开思考，adapter
+        # setdefault 语义保证覆盖全局注入的 False；其余 agent 维持全局关思考。
+        if extra_params is None:
+            agent_type_value = getattr(
+                getattr(self.config, "agent_type", None), "value", ""
+            )
+            if agent_type_value == "verification":
+                extra_params = {"chat_template_kwargs": {"enable_thinking": True}}
         """
         统一的流式 LLM 调用方法
 
@@ -1272,6 +1284,7 @@ class BaseAgent(ABC):
                 max_tokens=max_tokens,
                 tools=tools,
                 response_format=response_format,
+                extra_params=extra_params,
             )
             # 兼容不同版本的 python async generator
             iterator = stream.__aiter__()

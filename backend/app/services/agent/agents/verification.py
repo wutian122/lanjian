@@ -1381,6 +1381,8 @@ class VerificationAgent(BaseAgent):
                         self._conversation_history,
                         tools=verification_tools,
                         # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+                        # R-C2：verification 的思考保留由 base.stream_llm_call
+                        # 按 agent 类型集中注入（见 base.py R-C2 注释）
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
