@@ -96,7 +96,7 @@ def _tool_call(name, arguments="{}"):
 def _stream_of(*chunks):
     """单轮固定 chunk 序列。"""
     async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
-                   response_format=None):
+                   response_format=None, extra_params=None):
         for chunk in chunks:
             yield chunk
     return _gen

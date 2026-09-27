@@ -1185,6 +1185,24 @@ class BaseAgent(ABC):
     
     # ============ 统一的流式 LLM 调用 ============
 
+    @staticmethod
+    def _thinking_override_for(agent_type: Any) -> Optional[Dict[str, Any]]:
+        """思考矩阵（选项 a，2026-09-27）：按 agent 类型返回思考覆盖参数。
+
+        - recon/analysis/verification → {"chat_template_kwargs":
+          {"enable_thinking": True}}（27B 关思考下技术栈误判/候选产出保守/
+          验证秒停——生产三连实证，需思考深度）；
+        - orchestrator（调度短决策）→ None（维持全局关思考）；
+        - 未知类型 → None（保守默认，与全局一致）。
+
+        agent_type 兼容 AgentType 枚举与 str（AgentConfig 声明为枚举，历史
+        mock/直接构造可能传 str）。
+        """
+        t = agent_type if isinstance(agent_type, str) else getattr(agent_type, "value", "")
+        if t in ("verification", "analysis", "recon"):
+            return {"chat_template_kwargs": {"enable_thinking": True}}
+        return None
+
     async def stream_llm_call(
         self,
         messages: List[Dict[str, str]],
@@ -1201,12 +1219,9 @@ class BaseAgent(ABC):
         # 降级收口）。按 agent 类型集中注入：verification 显式请求开思考，adapter
         # setdefault 语义保证覆盖全局注入的 False；其余 agent 维持全局关思考。
         if extra_params is None:
-            # AgentConfig.agent_type 为 str；兼容枚举类型（防未来改型回归）
-            agent_type_value = getattr(self.config, "agent_type", "")
-            if not isinstance(agent_type_value, str):
-                agent_type_value = getattr(agent_type_value, "value", "")
-            if agent_type_value == "verification":
-                extra_params = {"chat_template_kwargs": {"enable_thinking": True}}
+            extra_params = self._thinking_override_for(
+                getattr(self.config, "agent_type", None)
+            )
         """
         统一的流式 LLM 调用方法
 

@@ -275,7 +275,7 @@ def _make_service(caps=None):
     service.backend_capabilities = caps or BackendCapabilities(tools=True, guided_json=False)
 
     async def _stream(messages=None, temperature=None, max_tokens=None, tools=None,
-                      response_format=None):
+                      response_format=None, extra_params=None):
         yield {"type": "done", "content": "", "reasoning": "", "tool_calls": [],
                "usage": {"total_tokens": 10}, "finish_reason": "stop"}
 
@@ -289,7 +289,7 @@ def _tool_call(name, arguments):
 
 def _done_with_tool_calls(tool_calls):
     async def _stream(messages=None, temperature=None, max_tokens=None, tools=None,
-                      response_format=None):
+                      response_format=None, extra_params=None):
         yield {
             "type": "done", "content": "", "reasoning": "",
             "tool_calls": tool_calls,

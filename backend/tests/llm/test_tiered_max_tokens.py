@@ -97,9 +97,10 @@ def _agent(cls, calls):
     "agent_type,expected",
     [
         ("orchestrator", 4096),
-        ("recon", 4096),
-        ("analysis", 4096),
-        ("verification", 4096),
+        # 选项 a（2026-09-27）：recon/analysis/verification 恢复思考，预算同步 8192
+        ("recon", 8192),
+        ("analysis", 8192),
+        ("verification", 8192),
     ],
 )
 def test_agent_type_max_tokens_mapping(agent_type: str, expected: int):
@@ -122,28 +123,28 @@ async def test_orchestrator_stream_uses_4096():
 
 
 @pytest.mark.asyncio
-async def test_recon_stream_uses_4096():
+async def test_recon_stream_uses_8192():
     calls: list[dict[str, Any]] = []
     agent = _agent(ReconAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "recon step"}])
-    assert calls[-1]["max_tokens"] == 4096
+    assert calls[-1]["max_tokens"] == 8192
 
 
 @pytest.mark.asyncio
-async def test_analysis_intermediate_round_uses_4096():
-    """analysis ReAct 中间轮（含 submit_findings 工具轮）= 4096（P1 折中）。"""
+async def test_analysis_intermediate_round_uses_8192():
+    """analysis 中间轮（恢复思考，选项 a）= 8192；极端大报告由强制总结轮 32768 兜底。"""
     calls: list[dict[str, Any]] = []
     agent = _agent(AnalysisAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "analyze"}])
-    assert calls[-1]["max_tokens"] == 4096
+    assert calls[-1]["max_tokens"] == 8192
 
 
 @pytest.mark.asyncio
-async def test_verification_round_uses_4096():
+async def test_verification_round_uses_8192():
     calls: list[dict[str, Any]] = []
     agent = _agent(VerificationAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "verify"}])
-    assert calls[-1]["max_tokens"] == 4096
+    assert calls[-1]["max_tokens"] == 8192
 
 
 @pytest.mark.asyncio

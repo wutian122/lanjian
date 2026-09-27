@@ -65,6 +65,58 @@ def _make_llm_service_capture(captured: Dict[str, Any]):
     return svc
 
 
+class TestThinkingMatrix:
+    """思考矩阵（2026-09-27 选项 a）：recon/analysis/verification 开思考，
+    仅 orchestrator（调度决策）与未知类型维持关思考。
+    直接测纯函数 `_thinking_override_for`（无 mock 依赖，稳定）。"""
+
+    def _agent_cls(self, name: str):
+        from app.services.agent.agents.analysis import AnalysisAgent
+        from app.services.agent.agents.orchestrator import OrchestratorAgent
+        from app.services.agent.agents.recon import ReconAgent
+        from app.services.agent.agents.verification import VerificationAgent
+
+        return {"analysis": AnalysisAgent, "orchestrator": OrchestratorAgent,
+                "recon": ReconAgent, "verification": VerificationAgent}[name]
+
+    @pytest.mark.parametrize("agent_name,agent_type", [
+        ("recon", "recon"),
+        ("analysis", "analysis"),
+        ("verification", "verification"),
+    ])
+    def test_deep_agents_request_thinking(self, agent_name: str, agent_type):
+        """recon/analysis/verification 的请求级思考覆盖（枚举与 str 双形态）"""
+        from app.services.agent.agents.base import BaseAgent
+
+        agent_cls = self._agent_cls(agent_name)
+        agent = agent_cls.__new__(agent_cls)
+        agent.config = MagicMock()
+        agent.config.agent_type = agent_type
+        override = BaseAgent._thinking_override_for(agent.config.agent_type)
+        assert override == {"chat_template_kwargs": {"enable_thinking": True}}, \
+            f"{agent_name} 必须开思考"
+        # str 形态等价
+        assert BaseAgent._thinking_override_for(agent_type) == override
+
+    def test_orchestrator_stays_thinking_off(self):
+        """orchestrator（调度短决策）维持关思考——注入返回 None（走全局）"""
+        from app.services.agent.agents.base import BaseAgent, AgentType
+        from app.services.agent.agents.orchestrator import OrchestratorAgent
+
+        agent = OrchestratorAgent.__new__(OrchestratorAgent)
+        agent.config = MagicMock()
+        agent.config.agent_type = AgentType.ORCHESTRATOR
+        assert BaseAgent._thinking_override_for(agent.config.agent_type) is None
+        assert BaseAgent._thinking_override_for("orchestrator") is None
+
+    def test_unknown_type_stays_thinking_off(self):
+        """未知类型保守默认 None（与全局一致，不意外开思考）"""
+        from app.services.agent.agents.base import BaseAgent
+
+        assert BaseAgent._thinking_override_for("mystery-agent") is None
+        assert BaseAgent._thinking_override_for(None) is None
+
+
 class TestVerificationThinkingOverride:
     @pytest.mark.asyncio
     async def test_verification_requests_thinking(self):

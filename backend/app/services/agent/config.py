@@ -74,16 +74,16 @@ class AgentConfig(BaseSettings):
         description="Per-call max_tokens for orchestrator（P1.1：2048 下 thinking reasoning 占用后决策被截，10 连格式错误实证）"
     )
     llm_max_tokens_recon: int = Field(
-        default=4096,
-        description="Per-call max_tokens for recon（P1.1 与 orchestrator 统一，防侦察总结截断）"
+        default=8192,
+        description="Per-call max_tokens for recon（2026-09-27 选项 a：recon 恢复思考后预算翻倍——4096 下思考+产出被截；空响应/止损兜底）"
     )
     llm_max_tokens_analysis: int = Field(
-        default=4096,
-        description="Per-call max_tokens for analysis（P1 折中：8192 长生成漂移实证；大报告走强制总结 32768 兜底）"
+        default=8192,
+        description="Per-call max_tokens for analysis（2026-09-27 选项 a：analysis 恢复思考后预算翻倍——4096 下思考吃光致 0 候选实证；大报告走强制总结 32768 兜底）"
     )
     llm_max_tokens_verification: int = Field(
-        default=4096,
-        description="Per-call max_tokens for verification（P1 折中防长生成漂移）"
+        default=8192,
+        description="Per-call max_tokens for verification（2026-09-27 选项 a：verification 已恢复思考，预算同步 8192）"
     )
     llm_max_tokens_forced_summary: int = Field(
         default=32768,

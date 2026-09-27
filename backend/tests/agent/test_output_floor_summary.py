@@ -443,7 +443,7 @@ def _scripted_chat_stream(texts):
     state = {"i": 0}
 
     async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
-                   response_format=None):
+                   response_format=None, extra_params=None):
         text = texts[state["i"]]
         state["i"] += 1
         yield {
