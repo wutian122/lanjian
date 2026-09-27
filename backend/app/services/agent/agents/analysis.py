@@ -753,38 +753,43 @@ class AnalysisAgent(BaseAgent):
     def _final_step_from_tool_calls(
         self, tool_calls: Optional[List[Dict[str, Any]]]
     ) -> Optional[AnalysisStep]:
-        """tool_calls 响应映射为 Final Answer 步骤（与文本协议 _parse_llm_response 对等）。
+        """tool_calls 响应映射为步骤（X1/X2/X3 泛化，2026-09-27）。
 
-        仅 submit_findings 视为终态：function.arguments 由服务端 tool-call-parser
-        保证合法 JSON，直接 json.loads 作为 final_answer（不走 json-repair）。
-        其他函数名 / 坏 JSON / 非对象参数 → None，调用方降级文本解析路径
-        （同轮混合形态 tool_calls 优先，Task 7 边界）。
+        生产实证（任务 2ccc598a/059300c9）：sglang qwen3_coder parser 流式分片
+        概率性损坏 tool_calls（arguments 丢失/半截 JSON），而旧实现只认
+        submit_findings 终态——中间工具（read_file 等）全部降级为空 step 空名
+        执行（missing positional argument）、收口 findings 因半截 JSON 全丢。
+
+        泛化后三路：
+        - submit_findings（X2：坏 JSON 先 json-repair 抢救）→ 终态 final_answer；
+        - 其他已知工具（X3：name 损坏先修复）→ 非终态 step（action/action_input），
+          由主循环既有 execute_tool 链执行；
+        - 无法识别/无法抢救 → None（调用方降级文本解析）。
         """
         if not tool_calls:
             return None
         call = tool_calls[0] or {}
-        name = str(call.get("name") or "").strip()
-        if name != "submit_findings":
+        known = list(self.tools.keys()) + ["submit_findings"]
+        name = self._repair_tool_call_name(str(call.get("name") or ""), known)
+        parsed = self._parse_tool_call_arguments(call.get("arguments"))
+        if not name or parsed is None:
             return None
-        arguments = call.get("arguments")
-        if isinstance(arguments, dict):
-            parsed: Any = arguments
-        elif isinstance(arguments, str) and arguments.strip():
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
+        if name == "submit_findings":
+            # 终态：与文本路径同构（findings 过滤非字典项）
+            if not isinstance(parsed.get("findings"), list):
                 return None
-        else:
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        # 与文本路径同构：findings 过滤非字典项
-        if isinstance(parsed.get("findings"), list):
             parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
-        step = AnalysisStep(thought="")
-        step.is_final = True
-        step.final_answer = parsed
-        return step
+            step = AnalysisStep(thought="")
+            step.is_final = True
+            step.final_answer = parsed
+            return step
+        # X1：中间工具泛化——走既有 execute_tool 链
+        if name in self.tools:
+            step = AnalysisStep(thought="")
+            step.action = name
+            step.action_input = parsed
+            return step
+        return None
 
     async def _warn_truncated_final_answer(
         self, findings_count: int, context: str = "Final Answer"
@@ -1269,6 +1274,13 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     # 造成后端对话状态混乱（同 Task 7 orchestrator 历史合成）
                     history_content = (
                         "Final Answer: " + json.dumps(step.final_answer, ensure_ascii=False)
+                    )
+                elif tool_calls_this_round and step is not None and step.action:
+                    # X1：中间工具 tool_calls 轮正文为空——合成 Action 文本入历史，
+                    # 保持多轮历史与文本协议自洽（避免 assistant 空 content）
+                    history_content = (
+                        f"Action: {step.action}\n"
+                        + json.dumps(step.action_input or {}, ensure_ascii=False)
                     )
                 else:
                     history_content = llm_output

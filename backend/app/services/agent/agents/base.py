@@ -1652,6 +1652,62 @@ class BaseAgent(ABC):
                     return True
         return False
 
+    # ============ X1/X2/X3：tool_calls 通道健壮化（2026-09-27） ============
+    # 生产实证（任务 2ccc598a/059300c9）：sglang qwen3_coder parser 流式分片
+    # 概率性损坏 tool_calls（name 混入空格如 "ve rification"、arguments 丢失/
+    # 半截 JSON），而蓝鉴四类 agent 的 tool_calls 通道只认 submit_findings
+    # 终态（recon 完全缺失）——中间工具与收口 findings 全部落空。
+
+    def _parse_tool_call_arguments(self, arguments: Any) -> Optional[Dict[str, Any]]:
+        """X2：tool_calls arguments 解析，坏 JSON 用 json-repair 抢救。
+
+        dict 直返；字符串先 json.loads，失败走 AgentJsonParser.repair_with_library
+        （修复半截/损坏 JSON——生产实证 submit_findings 的 findings 全集因半截
+        JSON 丢失，模型深挖数十轮成果在提交一步归零）；均失败返回 None。
+        """
+        if isinstance(arguments, dict):
+            return arguments
+        if not (isinstance(arguments, str) and arguments.strip()):
+            return None
+        try:
+            parsed = json.loads(arguments)
+            return parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            from app.services.agent.json_parser import AgentJsonParser
+
+            repaired = AgentJsonParser.repair_with_library(arguments)
+            if isinstance(repaired, dict):
+                logger.info(
+                    f"[{self.name}] tool_calls arguments 损坏，json-repair 抢救成功 "
+                    f"({len(arguments)} chars)"
+                )
+                return repaired
+        except Exception as e:  # 抢救失败降级，不掩盖原始路径
+            logger.debug(f"[{self.name}] json-repair 抢救失败: {e}")
+        return None
+
+    def _repair_tool_call_name(self, name: str, known: Any) -> str:
+        """X3：tool_calls function.name 损坏修复。
+
+        sglang parser 分片错位实测产生 "ve rification"（名字中间插空格）。
+        去空格/下划线归一后与已知工具名匹配；无法修复原样返回（交由调用方
+        的 unknown 分类/nudge 自愈）。
+        """
+        name = (name or "").strip()
+        if not name:
+            return ""
+        known_list = [k for k in (known or []) if k]
+        if name in known_list:
+            return name
+        compact = name.replace(" ", "").replace("_", "").lower()
+        for cand in known_list:
+            if compact == str(cand).replace("_", "").lower():
+                logger.info(f"[{self.name}] tool_calls 函数名损坏已修复: '{name}' -> '{cand}'")
+                return cand
+        return name
+
     def record_empty_round(self) -> bool:
         """记录一次空响应轮，返回是否触发止损。
 

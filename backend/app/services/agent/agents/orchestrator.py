@@ -2874,15 +2874,19 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         if not tool_calls:
             return None
         call = tool_calls[0] or {}
-        action = str(call.get("name") or "").strip()
+        # X3：name 损坏修复（生产实证 "ve rification" 空格插入形态）
+        action = self._repair_tool_call_name(
+            str(call.get("name") or "").strip(),
+            ["dispatch_agent", "summarize", "finish"],
+        )
         arguments = call.get("arguments")
         if isinstance(arguments, dict):
             parsed: dict[str, Any] = arguments
         elif isinstance(arguments, str) and arguments.strip():
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
-                parsed = {}
+            # X2：坏 JSON 先 json-repair 抢救（修复半截/损坏 dispatch 参数），
+            # 抢救成功则参数可读，Task 21 不再判 bad_json
+            repaired = self._parse_tool_call_arguments(arguments)
+            parsed = repaired if repaired is not None else {}
             if not isinstance(parsed, dict):
                 parsed = {}
         else:
