@@ -631,14 +631,23 @@ class OrchestratorAgent(BaseAgent):
                 continue
         return False
 
-    def _record_gate_observation(self, gate: str, reason: str) -> None:
-        """R6: 记录门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations。"""
+    def _record_gate_observation(
+        self, gate: str, reason: str, extra: dict[str, Any] | None = None
+    ) -> None:
+        """R6: 记录门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations。
+
+        extra（2026-09-29 层 5c）：可携带结构化明细（如被过滤 Semgrep 候选
+        的 candidates 列表），供报告渲染"未验证静态线索"段落。
+        """
         from datetime import datetime, timezone
-        self._gate_observations.append({
+        entry: dict[str, Any] = {
             "gate": gate,
             "reason": reason,
             "time": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if extra:
+            entry.update(extra)
+        self._gate_observations.append(entry)
 
     async def _maybe_dispatch_force_verification(self) -> None:
         """T6 (REQ-VC-2): R4 放行前的程序化收口——补发一次 verification 调度。
@@ -859,7 +868,19 @@ class OrchestratorAgent(BaseAgent):
                     f"{len(unverifiable)} 条 Semgrep 兜底候选为 EL 表达式/模板注入（SSTI）"
                     f"类，无确定性 PoC 专用模板（特征分布: {kind_breakdown}），"
                     "不进验证队列、不送沙箱（误走 SQL/命令模板必出 NO_SINK 白跑）；"
-                    "仅保留静态扫描结论，不进 semgrep_fallback_filtered 口径",
+                    "进报告「未验证静态线索」段（报告仅呈现，未执行验证）",
+                    extra={
+                        "candidates": [
+                            {
+                                "file_path": str(c.get("file_path") or ""),
+                                "line": c.get("line_start") or 0,
+                                "title": str(c.get("title") or "")[:120],
+                                "type": str(c.get("unverifiable_kind")
+                                            or c.get("vulnerability_type") or "unknown"),
+                            }
+                            for c in unverifiable
+                        ],
+                    },
                 )
                 logger.info(
                     f"[Orchestrator] Semgrep fallback excluded {len(unverifiable)} "
@@ -887,7 +908,18 @@ class OrchestratorAgent(BaseAgent):
                     "semgrep_fallback_filtered",
                     f"{len(filtered)} 条 Semgrep 兜底候选无确定性 PoC 验证条件"
                     f"（类型分布: {breakdown}{sev_detail}），"
-                    "不进验证队列、不送沙箱、不入兜底候选报告段落",
+                    "不进验证队列、不送沙箱；进报告「未验证静态线索」段",
+                    extra={
+                        "candidates": [
+                            {
+                                "file_path": str(c.get("file_path") or ""),
+                                "line": c.get("line_start") or 0,
+                                "title": str(c.get("title") or "")[:120],
+                                "type": str(c.get("vulnerability_type") or "unknown"),
+                            }
+                            for c in filtered
+                        ],
+                    },
                 )
                 logger.info(
                     f"[Orchestrator] Semgrep fallback filtered {len(filtered)} non-verifiable "
@@ -1755,6 +1787,29 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                 # 重置格式重试计数器
                 self._format_retry_count = 0
+
+                # 层 3a：截断轮乱码守门（2026-09-29）——本轮输出被 length 截断
+                # 且解析产物混入垃圾字符（生产实证乱码任务文本传给子 Agent 的
+                # 出口），丢弃本轮决策：不执行、不传子 Agent；历史中尚无本轮
+                # assistant 消息，仅追加一条压缩输出提示即重试。
+                if self._is_garbled_truncated_output(step, llm_output or ""):
+                    logger.warning(
+                        f"[{self.name}] 截断轮输出含乱码（字符异常墙），本轮决策丢弃"
+                    )
+                    await self.emit_event(
+                        "warning",
+                        "上一轮输出被截断且包含乱码，本轮决策已丢弃；"
+                        "要求大幅压缩输出后重试",
+                    )
+                    self._conversation_history.append({
+                        "role": "user",
+                        "content": (
+                            "[系统提示：上一轮输出被截断且包含乱码，已被丢弃。"
+                            "请大幅压缩输出——省略解释性文字，保留核心指令、"
+                            "文件路径清单与维度关键词——后重新输出。]"
+                        ),
+                    })
+                    continue
 
                 self._steps.append(step)
 
@@ -3041,6 +3096,67 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             ),
         })
 
+    # dispatch 任务描述字符预算（层 2b）：真实样本证据——任务描述常在 2-4K
+    # 字符并在 JSON 包装后突破 output token 预算，截断产生坏 JSON/乱码。
+    # 3500 字符（中英混合 ≈ 1.5-2.5K tokens）为 JSON 包装预留安全裕量。
+    DISPATCH_TASK_CHAR_BUDGET = 3500
+
+    @classmethod
+    def _compress_dispatch_task(cls, task: str) -> str:
+        """确定性兜底压缩：头 2/3 + 尾 1/3 + 省略统计（保留文件清单与收尾要求）。"""
+        budget = cls.DISPATCH_TASK_CHAR_BUDGET
+        if len(task) <= budget:
+            return task
+        head_len = budget * 2 // 3 - 40  # 为省略标记预留空间
+        tail_len = budget // 3 - 40
+        head = task[:head_len]
+        tail = task[-tail_len:]
+        omitted = len(task) - head_len - tail_len
+        marker = (
+            f"\n\n[…中间 {omitted} 字符已省略：保留目标文件清单与维度关键词；"
+            "完整要求见上文…]\n\n"
+        )
+        return head + marker + tail
+
+    async def _ensure_dispatch_task_budget(self, task: str) -> str:
+        """dispatch 任务文本出站前的预算守卫（层 2b，2026-09-29）。
+
+        未超限原样返回；超限时先尝试一次性 LLM 摘要（小预算、关思考），
+        摘要失败/为空/超长则回落确定性压缩。摘要目的：保留「文件路径清单 +
+        维度关键词」同时削掉解释性文字，让子 Agent 拿到完整有效指令。
+        """
+        if len(task) <= self.DISPATCH_TASK_CHAR_BUDGET:
+            return task
+        try:
+            summary = await self.llm_service.chat_completion(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "请把下面的审计子任务描述压缩到 800 字以内。"
+                            "必须保留：全部文件路径/文件名清单、漏洞维度关键词、"
+                            "验证/输出要求。删除：解释性文字、重复叙述。\n\n" + task
+                        ),
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+                extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            content = (summary or {}).get("content") or ""
+            if content and len(content) <= self.DISPATCH_TASK_CHAR_BUDGET:
+                return content.strip()
+            logger.warning(
+                f"[{getattr(self, 'name', None) or self.__class__.__name__}] "
+                f"dispatch 任务摘要不可用（len={len(content)}），回落确定性压缩"
+            )
+        except Exception as exc:  # 摘要失败不致命：回落到确定性压缩
+            logger.warning(
+                f"[{getattr(self, 'name', None) or self.__class__.__name__}] "
+                f"dispatch 任务摘要失败（{exc!r}），回落确定性压缩"
+            )
+        return self._compress_dispatch_task(task)
+
     async def _dispatch_agent(self, params: dict[str, Any]) -> str:
         """调度子 Agent（支持单个和批量并行）"""
 
@@ -3049,7 +3165,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             return await self._dispatch_agents_parallel(params["agents"])
 
         agent_name = params.get("agent", "")
-        task = params.get("task", "")
+        task = await self._ensure_dispatch_task_budget(params.get("task", "") or "")
         context = params.get("context", "")
 
         logger.debug(f"[Orchestrator] _dispatch_agent 被调用: agent_name='{agent_name}', task='{task[:50]}...'")

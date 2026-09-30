@@ -1377,8 +1377,32 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 # verified_count 仅统计 confirmed/verified/true_positive 且 is_verified=True。
                 await _recalc_task_counters_from_db(db, task, task_id)
 
+                # LLM 健康度（2026-09-29 层 5b）：统计任务全程 LLM 输出质量剖面，
+                # degraded 且任务以 completed 收口时升级为 completed_with_gaps——
+                # 结论不完整比假满分诚实（生产实证 c6d6cd09 双机 0 finding 满分）。
+                try:
+                    llm_health = await _compute_llm_health(db, task_id)
+                    observations_list = list(task.observations or [])
+                    observations_list.append({
+                        "llm_health": llm_health,
+                        "time": datetime.now(UTC).isoformat(),
+                    })
+                    task.observations = observations_list
+                    if (
+                        llm_health.get("degraded")
+                        and task.status == AgentTaskStatus.COMPLETED.value
+                    ):
+                        task.status = AgentTaskStatus.COMPLETED_WITH_GAPS.value
+                except Exception as exc:  # 健康度统计非致命：失败不阻断收口
+                    logger.warning(f"LLM 健康度统计失败（非致命）: {exc!r}")
+
                 # 计算安全评分
-                task.security_score = _calculate_security_score(findings)
+                scoring_gaps = (
+                    task.status == AgentTaskStatus.COMPLETED_WITH_GAPS.value
+                )
+                task.security_score = _calculate_security_score(
+                    findings, gaps=scoring_gaps
+                )
                 # P4: 质量评分（agent 流程之前恒为 0）
                 _cov_info = (_meta or {}).get("coverage_info", {}) if isinstance(_meta, dict) else {}
                 task.quality_score = _calculate_quality_score(
@@ -1387,6 +1411,7 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                     coverage_covered=_cov_info.get("covered_count", 0),
                     coverage_total=_cov_info.get("total_dimensions", 0) or 10,
                     saved_count=saved_count,
+                    gaps=scoring_gaps,
                 )
                 # 🔥 注意: progress_percentage 是计算属性，不需要手动设置
                 # 当 status = COMPLETED 时会自动返回 100.0
@@ -2419,10 +2444,60 @@ async def _save_findings(
     return saved_count
 
 
-def _calculate_security_score(findings: list[dict]) -> float:
-    """计算安全评分"""
+async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
+    """LLM 健康度统计（2026-09-29 层 5b）：从事件流还原 LLM 输出质量剖面。
+
+    llm_calls 以 thinking_start 数为准（每轮流式调用恰好发射一次）；
+    truncations/empty_responses/format_retries/garbled_drops 按事件消息
+    关键词归账（与 base.py/orchestrator.py 的告警文案同源）。degraded =
+    调用数>0 且 (截断+空响应) 占比 ≥ 0.5——达到该比例说明多数调用轮次
+    LLM 输出不可用，审计结论不可信（生产实证：任务 c6d6cd09/327b6430
+    截断率近 100% 且 0 finding）。
+    """
+    stmt = select(
+        AgentEvent.event_type, AgentEvent.message
+    ).where(AgentEvent.task_id == task_id)
+    rows = (await db.execute(stmt)).all()
+    llm_calls = 0
+    truncations = 0
+    empty_responses = 0
+    format_retries = 0
+    garbled_drops = 0
+    for event_type, message in rows:
+        msg = message or ""
+        if event_type == "thinking_start":
+            llm_calls += 1
+        if "max_tokens 截断" in msg:
+            truncations += 1
+        if "空响应" in msg and event_type in ("warning", "error", "info"):
+            # 一条事件消息只记一次（token 流事件不进此账）
+            empty_responses += 1
+        if "格式解析失败" in msg:
+            format_retries += 1
+        if "乱码" in msg:
+            garbled_drops += 1
+    degraded = llm_calls > 0 and (truncations + empty_responses) / llm_calls >= 0.5
+    return {
+        "llm_calls": llm_calls,
+        "truncations": truncations,
+        "empty_responses": empty_responses,
+        "format_retries": format_retries,
+        "garbled_drops": garbled_drops,
+        "degraded": degraded,
+    }
+
+
+def _calculate_security_score(
+    findings: list[dict], *, gaps: bool = False
+) -> float | None:
+    """计算安全评分。
+
+    2026-09-29 层 5a：无 findings 且任务以 completed_with_gaps 收口（审计
+    未完整——LLM 空响应/覆盖不足等）时返回 None（"无法评分"），拒绝把
+    "审计没跑通"呈现为"项目非常安全"的满分。正常完成且确实无发现维持 100。
+    """
     if not findings:
-        return 100.0
+        return None if gaps else 100.0
 
     # 基于发现的严重程度计算扣分
     deductions = {
@@ -2542,20 +2617,23 @@ def _calculate_quality_score(
     coverage_covered: int,
     coverage_total: int,
     saved_count: int | None = None,
-) -> float:
+    *,
+    gaps: bool = False,
+) -> float | None:
     """计算 agent 审计任务质量评分（P4）。
 
     组成：
     - 验证覆盖率（40%）：verified_count / findings_count
     - 误报率（30%）：1 - false_positive / findings_count
     - 平均置信度（30%）：finding 的 ai_confidence 均值
-    无 finding 时返回 100.0（无问题即满分）。
+    无 finding 时：gaps=True（审计未完整收口）返回 None（无法评分）；
+    正常完成返回 100.0（无问题即满分）。
 
     注意：findings_count 须用落库数（saved_count），与 verified_count 同口径，
     避免原始 findings 列表含幻觉 finding 导致分母虚大、质量分被压低。
     """
     if not findings:
-        return 100.0
+        return None if gaps else 100.0
 
     # P4-fix: 分母用落库数（与 verified_count 同口径），未提供时回退到 len(findings)
     findings_count = saved_count if saved_count is not None else len(findings)
@@ -3010,7 +3088,11 @@ async def get_agent_task(
             "high_count": task.high_count or 0,
             "medium_count": task.medium_count or 0,
             "low_count": task.low_count or 0,
-            "quality_score": float(task.quality_score or 0.0),
+            "quality_score": (
+                float(task.quality_score)
+                if task.quality_score is not None
+                else None
+            ),
             "security_score": float(task.security_score) if task.security_score is not None else None,
             "progress_percentage": progress,
             "created_at": task.created_at,
@@ -5076,6 +5158,50 @@ def _finding_source(finding: Any) -> str | None:
     return None
 
 
+def _build_unverified_static_leads_section(observations: list) -> list[str]:
+    """层 5c（2026-09-29）：渲染"未验证静态线索"报告段。
+
+    来源 = orchestrator gate observations 中被过滤的 Semgrep 兜底候选明细
+    （无确定性 PoC 模板 / 低严重度 / EL-SSTI 类）。这些线索不落库、不进
+    验证队列（预算保护），但绝不静默消失——报告读者能看到具体位置与规则。
+    """
+    leads: list[dict] = []
+    for obs in observations or []:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("gate") not in (
+            "semgrep_fallback_filtered",
+            "semgrep_fallback_unverifiable",
+        ):
+            continue
+        for cand in obs.get("candidates") or []:
+            if isinstance(cand, dict):
+                leads.append(cand)
+    if not leads:
+        return []
+    lines = [
+        "## 未验证静态线索（报告仅呈现，未执行验证）",
+        "",
+        f"以下 {len(leads)} 条静态扫描命中的线索缺少确定性 PoC 验证条件，"
+        "未进入沙箱验证流程；仅作为人工复核参考，不代表已确认漏洞：",
+        "",
+    ]
+    for c in leads:
+        title = str(c.get("title") or "未知线索")
+        file_path = str(c.get("file_path") or "")
+        line = c.get("line") or 0
+        ctype = str(c.get("type") or "unknown")
+        if file_path and line:
+            location = f"{file_path}:{line}"
+        elif file_path:
+            location = file_path
+        else:
+            location = "位置未知"
+        lines.append(f"- **{title}**（`{location}`，类型 {ctype}）— 未验证静态线索")
+    lines.append("")
+    return lines
+
+
 def _build_semgrep_fallback_section(findings: list) -> list[str]:
     """sandbox-verification-hard-gate Task 11: 构造"静态扫描兜底候选"报告段落。
 
@@ -5466,6 +5592,7 @@ async def generate_audit_report(
     # sandbox-verification-hard-gate Task 11: 静态扫描兜底候选清单（Analysis 0
     # 产出时 Semgrep 发现转待验证候选，与人工级发现区分标注）
     md_lines.extend(_build_semgrep_fallback_section(findings))
+    md_lines.extend(_build_unverified_static_leads_section(task.observations or []))
 
     # Remediation Priority
     if critical > 0 or high > 0:
