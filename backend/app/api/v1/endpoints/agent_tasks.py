@@ -3095,6 +3095,9 @@ async def get_agent_task(
             ),
             "security_score": float(task.security_score) if task.security_score is not None else None,
             "progress_percentage": progress,
+            # 层 5b（2026-09-29）：门禁/健康度观察明细随详情下发，
+            # 前端据此渲染 LLM 健康度横幅与静态线索段
+            "observations": task.observations or [],
             "created_at": task.created_at,
             "started_at": task.started_at,
             "completed_at": task.completed_at,

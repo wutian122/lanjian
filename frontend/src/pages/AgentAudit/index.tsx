@@ -111,6 +111,12 @@ function AgentAuditPageContent() {
     return () => clearTimeout(timer);
   }, [canRecover]);
 
+  // 层 5b（2026-09-29）：LLM 健康度横幅——observations 里的 llm_health.degraded
+  // 表示任务全程 LLM 截断/空响应占比过高，审计结论可能不完整（0 发现/缺口）。
+  const llmHealthDegraded = (task?.observations ?? []).some(
+    (o) => (o as { llm_health?: { degraded?: boolean } } | null)?.llm_health?.degraded === true,
+  );
+
   // 🔥 当 taskId 变化时立即重置状态（新建任务时清理旧日志）
   useEffect(() => {
     // 如果 taskId 发生变化，立即重置
@@ -1470,6 +1476,16 @@ function AgentAuditPageContent() {
             <Button size="sm" onClick={handleResume} disabled={isResuming}>
               {isResuming ? "继续中..." : "继续执行"}
             </Button>
+          </div>
+        )}
+
+        {/* 层 5b：LLM 健康度横幅（审计结论可能不完整） */}
+        {llmHealthDegraded && (
+          <div className="absolute top-0 left-0 right-0 z-10 bg-orange-50 border-b border-orange-200 px-4 py-2 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-orange-600 flex-shrink-0" />
+            <span className="text-sm text-orange-700">
+              LLM 输出质量异常（截断/空响应占比过高），本轮审计结论可能不完整，请谨慎采信。
+            </span>
           </div>
         )}
 

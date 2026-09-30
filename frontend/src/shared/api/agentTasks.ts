@@ -44,6 +44,8 @@ export interface AgentTask {
   };
   verification_coverage: number | null;
   observation_count: number | null;
+  // 层 5b（2026-09-29）：门禁/健康度观察明细（llm_health 等），详情接口下发
+  observations?: Array<Record<string, unknown>> | null;
 
   // Agent 统计
   total_iterations: number;
