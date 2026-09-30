@@ -194,15 +194,23 @@ def _strip_thinking_off(
 
 
 def _thinking_off_allowed() -> bool:
-    """LLM_DISABLE_THINKING 开关读取（延迟 import 避免模块加载环）。
+    """思考策略倒转（2026-09-29 层 2c）：默认强制关思考并放行注入。
 
-    True：向端点注入 chat_template_kwargs={"enable_thinking": False}（无思考
-    模式，Qwen3.8-27B 思考失控的根治开关，2026-09-26 实测服务端已支持），并
-    放行护栏对 enable_thinking 键的剥除。
+    True（默认）＝强制关思考生效：向端点注入 chat_template_kwargs=
+    {"enable_thinking": False}（覆盖请求级 True），并放行护栏对
+    enable_thinking 键的处理。仅当 LLM_ENABLE_THINKING 与
+    LLM_THINKING_SEPARATE_BUDGET 双开关齐 true（服务端已支持思考/正文
+    预算分离）时返回 False、放行请求级 True。
+
+    背景：实测 10.129.2.101（SGLang 部署 Qwen3_5 魔改权重）思考流
+    2048/8192 tokens 均不收敛、正文 0 字（任务 c6d6cd09 / 327b6430
+    双机实证 0 finding）；enable_thinking=False 时正文完整、自然停。
     """
     from app.core.config import settings
 
-    return bool(getattr(settings, "LLM_DISABLE_THINKING", False))
+    enable = bool(getattr(settings, "LLM_ENABLE_THINKING", False))
+    separate = bool(getattr(settings, "LLM_THINKING_SEPARATE_BUDGET", False))
+    return not (enable and separate)
 
 
 def _assert_no_thinking_off(
@@ -446,13 +454,14 @@ class LiteLLMAdapter(BaseLLMAdapter):
         rp = self.config.repetition_penalty
         if rp is not None:
             merged.setdefault("repetition_penalty", rp)
-        # R-C1：LLM_DISABLE_THINKING 开启时注入关思考参数（Qwen3.8-27B 思考流
-        # 吃光输出预算的根治开关；服务端已修复关思考缺陷，实测 2026-09-26）。
-        # 注入于 merge 层——native/litellm 非流式/litellm 流式三条出站路径统一
-        # 呈现；护栏经 allow 通道放行该键（_assert_no_thinking_off）。
+        # 思考策略倒转（2026-09-29 层 2c）：默认强制关思考。注入于 merge 层——
+        # native/litellm 非流式/litellm 流式三条出站路径统一呈现；护栏经 allow
+        # 通道放行该键（_assert_no_thinking_off）。强制赋值覆盖请求级显式
+        # True（思考矩阵已移除，但存量/未来调用方的 True 一律压制——单预算
+        # + 思考组合在服务端无分离预算支持时 = 思考烧光预算自毁）。
         if _thinking_off_allowed():
             chat_template_kwargs = merged.setdefault("chat_template_kwargs", {})
-            chat_template_kwargs.setdefault("enable_thinking", False)
+            chat_template_kwargs["enable_thinking"] = False
         return merged
 
     async def _native_openai_call(self, **kwargs: Any):

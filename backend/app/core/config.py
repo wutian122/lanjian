@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     # SGLang 镜像已修复（关思考后 content/tool_calls 正常、同一决策 96 vs 1364
     # tokens），满足护栏注释预留的解除条件。默认 False 保持现状零变化。
     LLM_DISABLE_THINKING: bool = False
+    # 2026-09-29 思考策略倒转：默认强制关思考（服务端实测思考流永不收敛，
+    # 见 tests/llm/test_thinking_policy.py）。两开关齐 true 才放行思考：
+    LLM_ENABLE_THINKING: bool = False
+    # 服务端支持思考/正文预算分离（如 reasoning-parser 独立 max_tokens）时置 true；
+    # 未支持时禁止开思考——单预算 + 思考组合 = 思考烧光预算自毁。
+    LLM_THINKING_SEPARATE_BUDGET: bool = False
 
     # Agent 娴佸紡瓒呮椂閰嶇疆锛堢锛?
     LLM_FIRST_TOKEN_TIMEOUT: int = 180  # 首Token超时时间（秒），推理模型需要更长时间  # 绛夊緟棣栦釜Token鐨勮秴鏃舵椂闂?

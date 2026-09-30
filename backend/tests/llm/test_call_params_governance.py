@@ -36,6 +36,9 @@ from app.services.llm.types import (
     LLMRequest,
 )
 
+# 思考策略倒转（2026-09-29 层 2c）：默认出站强制携带关思考参数
+THINKING_KWARGS = {"chat_template_kwargs": {"enable_thinking": False}}
+
 SRC = Path(__file__).resolve().parents[2] / "app" / "api" / "v1" / "endpoints" / "agent_tasks.py"
 
 
@@ -192,7 +195,7 @@ class TestNativePathInjection:
             await adapter._send_request(_make_request())
 
         body = fake_client.created_kwargs
-        assert body["extra_body"] == {"repetition_penalty": 1.2}
+        assert body["extra_body"] == {"repetition_penalty": 1.2, **THINKING_KWARGS}
         # provider 特有参数绝不能展开到 create() 顶层（真实 SDK 无此形参，会 TypeError）
         assert "repetition_penalty" not in body
 
@@ -206,7 +209,7 @@ class TestNativePathInjection:
         with patch("openai.AsyncOpenAI", return_value=fake_client):
             await adapter._send_request(_make_request())
 
-        assert fake_client.created_kwargs["extra_body"] == {"repetition_penalty": 1.2}
+        assert fake_client.created_kwargs["extra_body"] == {"repetition_penalty": 1.2, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_native_direct_call_without_config_rp_no_extra_body(self):
@@ -231,7 +234,7 @@ class TestNativePathInjection:
                 max_tokens=100,
             )
 
-        assert "extra_body" not in fake_client.created_kwargs
+        assert fake_client.created_kwargs.get("extra_body") == THINKING_KWARGS
 
 
 class TestLiteLLMNonStreamInjection:
@@ -251,7 +254,7 @@ class TestLiteLLMNonStreamInjection:
             response = await adapter._send_request(_make_request())
 
         assert response.content == "ok"
-        assert captured["extra_body"] == {"repetition_penalty": 1.2}
+        assert captured["extra_body"] == {"repetition_penalty": 1.2, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_send_request_merges_request_extra_params(self):
@@ -269,7 +272,7 @@ class TestLiteLLMNonStreamInjection:
                 _make_request(extra_params={"top_k": 20})
             )
 
-        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2}
+        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_send_request_explicit_extra_params_rp_takes_precedence(self):
@@ -287,7 +290,7 @@ class TestLiteLLMNonStreamInjection:
                 _make_request(extra_params={"repetition_penalty": 1.05})
             )
 
-        assert captured["extra_body"] == {"repetition_penalty": 1.05}
+        assert captured["extra_body"] == {"repetition_penalty": 1.05, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_send_request_config_rp_none_zero_breakage(self):
@@ -308,7 +311,7 @@ class TestLiteLLMNonStreamInjection:
         with patch("litellm.acompletion", _fake_acompletion):
             await adapter._send_request(_make_request())
 
-        assert "extra_body" not in captured
+        assert captured.get("extra_body") == THINKING_KWARGS
 
 
 class TestLiteLLMStreamInjection:
@@ -328,7 +331,7 @@ class TestLiteLLMStreamInjection:
             chunks = [c async for c in adapter.stream_complete(_make_request(stream=True))]
 
         assert chunks[-1]["type"] == "done"
-        assert captured["extra_body"] == {"repetition_penalty": 1.2}
+        assert captured["extra_body"] == {"repetition_penalty": 1.2, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_stream_merges_request_extra_params(self):
@@ -349,7 +352,7 @@ class TestLiteLLMStreamInjection:
             ]
 
         assert chunks[-1]["type"] == "done"
-        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2}
+        assert captured["extra_body"] == {"top_k": 20, "repetition_penalty": 1.2, **THINKING_KWARGS}
 
 
 # ---------------------------------------------------------------------------

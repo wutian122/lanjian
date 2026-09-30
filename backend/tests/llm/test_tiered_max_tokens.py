@@ -3,18 +3,18 @@ W1: 分阶段 max_tokens——按 Agent 类型差异化输出预算
 
 老板生产观察（fp8 内网推理）：
 - 2048：ReAct 中间轮短决策稳定，胡乱输出大减；
-- 4096：reasoning 思考流吃光预算，正文空响应；
+- 8192：reasoning 思考流吃光预算，正文空响应；
 - 32768：长输出漂移 + fp8 KV 累积误差，胡乱输出增多。
 
 单一全局值无法同时满足「中间轮要短稳」与「报告轮要空间」，落地映射：
 - orchestrator / recon = 2048（调度决策/侦察短输出，防长输出漂移）；
-- analysis / verification = 4096（P1 折中：8192 长生成漂移实证；大报告走强制总结 32768 兜底）；
+- analysis / verification = 8192（P1 折中：8192 长生成漂移实证；大报告走强制总结 32768 兜底）；
 - analysis 强制总结轮（guided_json 一次性全量 findings JSON）= 32768
   （schema 约束漂移面小，预算留大防截断）；
 - 显式传参优先于映射；未知类型无映射 → None 回退用户全局 llmMaxTokens。
 
 submit_findings 轮与中间 ReAct 轮在请求时同构（都是 tools 形态工具调用），
-无法请求时区分，故 analysis 中间轮统一 4096（P1）；极端大报告由强制总结轮 32768 兜底。
+无法请求时区分，故 analysis 中间轮统一 8192（P1）；极端大报告由强制总结轮 32768 兜底。
 """
 from types import SimpleNamespace
 from typing import Any
@@ -96,7 +96,7 @@ def _agent(cls, calls):
 @pytest.mark.parametrize(
     "agent_type,expected",
     [
-        ("orchestrator", 4096),
+        ("orchestrator", 8192),
         # 选项 a（2026-09-27）：recon/analysis/verification 恢复思考，预算同步 8192
         ("recon", 8192),
         ("analysis", 8192),
@@ -115,11 +115,11 @@ def test_unknown_agent_type_has_no_mapping():
 # ---------- stream_llm_call 端到端 ----------
 
 @pytest.mark.asyncio
-async def test_orchestrator_stream_uses_4096():
+async def test_orchestrator_stream_uses_8192():
     calls: list[dict[str, Any]] = []
     agent = _agent(OrchestratorAgent, calls)
     await agent.stream_llm_call([{"role": "user", "content": "dispatch decision"}])
-    assert calls[-1]["max_tokens"] == 4096
+    assert calls[-1]["max_tokens"] == 8192
 
 
 @pytest.mark.asyncio

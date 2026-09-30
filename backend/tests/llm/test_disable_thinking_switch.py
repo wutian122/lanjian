@@ -121,6 +121,8 @@ class TestSwitchDefaultOff:
 
     @pytest.mark.asyncio
     async def test_native_no_chat_template_kwargs(self):
+        """思考策略倒转（2026-09-29 层 2c）：默认（未开思考双开关）native 出站
+        必须注入 chat_template_kwargs.enable_thinking=False。"""
         client = _CapturingOpenAIClient()
         adapter = LiteLLMAdapter(_make_config())
         with patch("openai.AsyncOpenAI", return_value=client.client()):
@@ -129,7 +131,7 @@ class TestSwitchDefaultOff:
         body = client.created_kwargs
         assert body, "native 路径必须被调用"
         extra_body = body.get("extra_body") or {}
-        assert "chat_template_kwargs" not in extra_body
+        assert extra_body.get("chat_template_kwargs", {}).get("enable_thinking") is False
 
     @pytest.mark.asyncio
     async def test_litellm_path_no_injection(self):
@@ -144,7 +146,7 @@ class TestSwitchDefaultOff:
             await adapter.complete(_make_request())
 
         extra_body = captured.get("extra_body") or {}
-        assert "chat_template_kwargs" not in extra_body
+        assert extra_body.get("chat_template_kwargs", {}).get("enable_thinking") is False
 
 
 class TestSwitchOn:

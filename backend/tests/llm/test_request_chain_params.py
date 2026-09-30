@@ -23,6 +23,9 @@ import pytest
 
 from app.services.llm.service import LLMService
 from app.services.llm.adapters.litellm_adapter import LiteLLMAdapter
+
+# 思考策略倒转（2026-09-29 层 2c）：默认出站强制携带关思考参数
+THINKING_KWARGS = {"chat_template_kwargs": {"enable_thinking": False}}
 from app.services.llm.types import (
     LLMConfig,
     LLMMessage,
@@ -344,7 +347,7 @@ class TestNativeOpenAICall:
         assert body["response_format"] == RESPONSE_FORMAT
         # extra_body 原样透传：openai SDK 将其合并进 HTTP body 顶层，
         # SGLang 收到的 repetition_penalty 语义与展开相同，但不触发 SDK TypeError
-        assert body["extra_body"] == {"repetition_penalty": 1.15}
+        assert body["extra_body"] == {"repetition_penalty": 1.15, **THINKING_KWARGS}
         # provider 特有参数绝不能出现在 create() 顶层
         assert "repetition_penalty" not in body
 
@@ -369,9 +372,11 @@ class TestNativeOpenAICall:
             "messages",
             "temperature",
             "max_tokens",
+            "extra_body",  # 思考策略倒转：默认强制携带 chat_template_kwargs
         }
-        for absent in ("tools", "response_format", "extra_body", "repetition_penalty"):
+        for absent in ("tools", "response_format", "repetition_penalty"):
             assert absent not in fake_client.created_kwargs
+        assert fake_client.created_kwargs["extra_body"] == THINKING_KWARGS
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +414,7 @@ class TestLiteLLMPath:
         assert captured["tools"] == TOOLS
         assert captured["response_format"] == RESPONSE_FORMAT
         # litellm 官方透传机制：extra_body 合并进 HTTP 请求 body，drop_params 不丢弃
-        assert captured["extra_body"] == {"repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"repetition_penalty": 1.15, **THINKING_KWARGS}
 
     @pytest.mark.asyncio
     async def test_send_request_without_params_zero_breakage(self):
@@ -429,8 +434,9 @@ class TestLiteLLMPath:
         with patch("litellm.acompletion", _fake_acompletion):
             await adapter._send_request(_make_request())
 
-        for absent in ("tools", "response_format", "extra_body", "repetition_penalty"):
+        for absent in ("tools", "response_format", "repetition_penalty"):
             assert absent not in captured
+        assert captured.get("extra_body") == THINKING_KWARGS
 
     @pytest.mark.asyncio
     async def test_stream_complete_kwargs_contain_three_params(self):
@@ -459,7 +465,7 @@ class TestLiteLLMPath:
         assert chunks[-1]["type"] == "done"
         assert captured["tools"] == TOOLS
         assert captured["response_format"] == RESPONSE_FORMAT
-        assert captured["extra_body"] == {"repetition_penalty": 1.15}
+        assert captured["extra_body"] == {"repetition_penalty": 1.15, **THINKING_KWARGS}
         assert captured["stream"] is True
 
     @pytest.mark.asyncio
@@ -475,5 +481,6 @@ class TestLiteLLMPath:
         with patch("litellm.completion", _fake_completion):
             [c async for c in adapter.stream_complete(_make_request(stream=True))]
 
-        for absent in ("tools", "response_format", "extra_body", "repetition_penalty"):
+        for absent in ("tools", "response_format", "repetition_penalty"):
             assert absent not in captured
+        assert captured.get("extra_body") == THINKING_KWARGS

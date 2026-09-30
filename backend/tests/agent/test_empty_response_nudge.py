@@ -455,6 +455,7 @@ async def test_analysis_reasoning_only_retry_contains_nudge_text_mode():
     agent = _make_analysis_agent(caps=None)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏（关思考减半预算）仍空
         {"form": "ok", "text": _ANALYSIS_FINAL_TEXT},
     ])
 
@@ -476,6 +477,7 @@ async def test_analysis_reasoning_only_retry_contains_submit_findings_in_tools_m
     agent = _make_analysis_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏（关思考减半预算）仍空
         {"form": "tool_calls", "tool_calls": [_SUBMIT_FINDINGS_CALL]},
     ])
 
@@ -494,6 +496,7 @@ async def test_analysis_truncated_empty_retry_complements_truncation_hint():
     agent = _make_analysis_agent(caps=None)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "truncated"},
+        {"form": "truncated"},  # 一搏（关思考减半预算）仍截断空
         {"form": "ok", "text": _ANALYSIS_FINAL_TEXT},
     ])
 
@@ -513,7 +516,11 @@ async def test_analysis_three_consecutive_empty_fallback_unchanged():
     """Analysis 连续 3 次形态 B 空响应：收口行为与改动前一致（失败结果 + 计数 3 +
     仅前 2 次注入重试提示，第 3 次到上限不再 append）。"""
     agent = _make_analysis_agent(caps=None)
+    # 每轮空响应对应 2 次 stream 调用（第一遍空 + 一搏空）
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
         {"form": "reasoning_only"},
         {"form": "reasoning_only"},
         {"form": "reasoning_only"},
@@ -535,6 +542,7 @@ async def test_recon_reasoning_only_retry_contains_nudge_without_tools_hint(tmp_
     agent = _make_recon_agent()
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏（关思考减半预算）仍空
         {"form": "ok", "text": _RECON_FINAL_TEXT},
     ])
 
@@ -559,7 +567,9 @@ async def test_verification_reasoning_only_injects_nudge_and_other_keeps_generic
     agent = _make_verification_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏（关思考减半预算）仍空 → B 形态 nudge
         {"form": "other_empty"},
+        {"form": "other_empty"},     # 一搏仍空 → 泛化提示
         {"form": "tool_calls",
          "tool_calls": [_tool_call("submit_findings", json.dumps(_VERIFICATION_PAYLOAD,
                                                                  ensure_ascii=False))]},
@@ -591,7 +601,9 @@ async def test_orchestrator_reasoning_only_retry_contains_nudge(monkeypatch):
     agent = _make_orchestrator_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏（关思考减半预算）仍空
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 第二轮：第一遍空 + 一搏空
         {"form": "tool_calls", "tool_calls": [_tool_call("finish", "{}")]},
     ])
 
@@ -616,7 +628,13 @@ async def test_orchestrator_five_consecutive_empty_stop_unchanged(monkeypatch):
     )
     caps = BackendCapabilities(tools=True, guided_json=False)
     agent = _make_orchestrator_agent(caps=caps)
+    # 每轮空响应对应 2 次 stream 调用（第一遍空 + 一搏空）
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
+        {"form": "reasoning_only"},
         {"form": "reasoning_only"},
         {"form": "reasoning_only"},
         {"form": "reasoning_only"},

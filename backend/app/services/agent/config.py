@@ -70,8 +70,9 @@ class AgentConfig(BaseSettings):
     # analysis 强制总结轮一次性输出全量 findings JSON，预算留大 32768。
     # 未知类型无映射 → 回退用户全局 llmMaxTokens。
     llm_max_tokens_orchestrator: int = Field(
-        default=4096,
-        description="Per-call max_tokens for orchestrator（P1.1：2048 下 thinking reasoning 占用后决策被截，10 连格式错误实证）"
+        default=8192,
+        description="Per-call max_tokens for orchestrator（2026-09-29 层 2a：4096 下 "
+        "dispatch 任务描述+格式包装常态截断致乱码传播——任务 c6d6cd09 实证，提至 8192）"
     )
     llm_max_tokens_recon: int = Field(
         default=8192,

@@ -1187,20 +1187,18 @@ class BaseAgent(ABC):
 
     @staticmethod
     def _thinking_override_for(agent_type: Any) -> Optional[Dict[str, Any]]:
-        """思考矩阵（选项 a，2026-09-27）：按 agent 类型返回思考覆盖参数。
+        """思考策略（2026-09-29 根治）：任何 agent 均不静默请求开思考。
 
-        - recon/analysis/verification → {"chat_template_kwargs":
-          {"enable_thinking": True}}（27B 关思考下技术栈误判/候选产出保守/
-          验证秒停——生产三连实证，需思考深度）；
-        - orchestrator（调度短决策）→ None（维持全局关思考）；
-        - 未知类型 → None（保守默认，与全局一致）。
+        分析矩阵（选项 a，2026-09-27）已被移除——生产实证（任务 c6d6cd09 /
+        327b6430）recon/analysis/verification 强制 enable_thinking=True 后，
+        SGLang 部署的 Qwen3_5 魔改权重思考流 8192 tokens 仍不收敛、正文 0 字、
+        finish_reason=length：三轮子 Agent 全空响应回退，0 finding。
+        对照实验证实 enable_thinking=False 时正文完整、自然停。
 
-        agent_type 兼容 AgentType 枚举与 str（AgentConfig 声明为枚举，历史
-        mock/直接构造可能传 str）。
+        思考开关单一真相源 = 全局环境变量（默认关；adapter 注入层见
+        litellm_adapter._build_outbound_params，tests/llm/test_thinking_off_guard.py）。
+        本方法保留为兼容占位——任何 agent_type（含 str 形态）恒返回 None。
         """
-        t = agent_type if isinstance(agent_type, str) else getattr(agent_type, "value", "")
-        if t in ("verification", "analysis", "recon"):
-            return {"chat_template_kwargs": {"enable_thinking": True}}
         return None
 
     async def stream_llm_call(
@@ -1212,6 +1210,7 @@ class BaseAgent(ABC):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         extra_params: Optional[Dict[str, Any]] = None,
+        _last_ditch: bool = False,
     ) -> Tuple[str, int]:
         # R-C2（2026-09-26）：差异化关思考——Verification 深度验证任务保留思考。
         # 全局 LLM_DISABLE_THINKING 下 verification 会"秒停空转"（生产实证：
@@ -1545,6 +1544,62 @@ class BaseAgent(ABC):
         else:
             self._last_empty_kind = None
 
+        # 空响应最后一搏（2026-09-29 层 3c）：第一遍空正文且无工具调用时，
+        # 自动以「关思考 + 预算减半」重跑一次——生产实证空响应主因是思考流
+        # 吃光预算（任务 c6d6cd09 / 327b6430 三轮 analysis 全空响应回退），
+        # 关思考后同请求正文完整（对照实验实证）。成功即挽救本轮；失败继续
+        # 上层空响应止损。跳过条件：已经是一搏（防递归）、degenerate 崩坏
+        # 形态、tool_calls 轮（正文空属正常）、调用方已显式关闭思考
+        # （思考已关仍空，与思考无关，一搏无助）。
+        if (
+            not _last_ditch
+            and (not accumulated or not accumulated.strip())
+            and not self._last_tool_calls
+            and getattr(self, "_last_empty_kind", None) != "degenerate"
+        ):
+            caller_ctk = ((extra_params or {}).get("chat_template_kwargs") or {})
+            caller_thinking = caller_ctk.get("enable_thinking")
+            if caller_thinking is not False:
+                ditch_params: Dict[str, Any] = dict(extra_params or {})
+                merged_ctk: Dict[str, Any] = dict(caller_ctk)
+                merged_ctk["enable_thinking"] = False
+                ditch_params["chat_template_kwargs"] = merged_ctk
+                type_limit = max_tokens
+                if type_limit is None:
+                    from app.services.agent.config import get_agent_type_config
+                    type_limit = get_agent_type_config(
+                        self.config.agent_type.value
+                    ).max_tokens
+                ditch_max = max(512, (type_limit or 8192) // 2)
+                logger.warning(
+                    f"[{self.name}] 空响应最后一搏：关思考 + 预算减半"
+                    f"（{ditch_max}）重试一次"
+                )
+                await self.emit_event(
+                    "warning",
+                    f"检测到空响应，自动以关思考模式 + 预算 {ditch_max} 重试一次"
+                    "（最后一搏）",
+                )
+                try:
+                    accumulated, total_tokens = await self.stream_llm_call(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=ditch_max,
+                        auto_compress=auto_compress,
+                        tools=tools,
+                        response_format=response_format,
+                        extra_params=ditch_params,
+                        _last_ditch=True,
+                    )
+                    if accumulated and accumulated.strip():
+                        self._last_empty_kind = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # 一搏失败不致命，按原空响应收尾
+                    logger.warning(
+                        f"[{self.name}] 最后一搏重试失败（{exc!r}），按空响应收尾"
+                    )
+
         # sandbox-verification-hard-gate Task 14：每轮 LLM 调用落 trace
         # （每轮一次而非每 chunk；取消路径 re-raise 不经过此处，不记账）。
         self._trace_llm_call(
@@ -1635,6 +1690,42 @@ class BaseAgent(ABC):
     DEGENERACY_LOOP_MIN = 25
     DEGENERACY_LOOP_CHECK_INTERVAL = 1024
 
+    # F3 字符异常墙（2026-09-29 层 3b）：截断轮输出被垃圾字符（如 "ÿd½ôÿéúÇ"、
+    # "max ~ff files"）污染时源头丢弃。正常文本误伤面评估：扩展 Latin-1 连片
+    # 无空格 run ≥6 在代码/审计文本中几乎不出现（法语单词重音字符最多连 3-4）；
+    # 替换符/未映射符在业务文本中不应出现。
+    GARBLED_EXT_LATIN_RUN_LIMIT = 6
+    _GARBLED_RARE_CHARS = frozenset("\ufffd\ufffe\uffff")
+
+    @staticmethod
+    def _has_garbled_wall(text: str) -> bool:
+        """F3 字符异常墙检测（尾 200 窗口，纯函数，无状态）。"""
+        if not text:
+            return False
+        tail = text[-200:]
+        if any(ch in BaseAgent._GARBLED_RARE_CHARS for ch in tail):
+            return True
+        run = 0
+        for ch in tail:
+            if 0x80 <= ord(ch) <= 0xFF:
+                run += 1
+                if run >= BaseAgent.GARBLED_EXT_LATIN_RUN_LIMIT:
+                    return True
+            else:
+                run = 0
+        return False
+
+    def _is_garbled_truncated_output(self, step: Any, llm_output: str) -> bool:
+        """截断轮乱码守门（2026-09-29 层 3a）：仅当本轮 length 截断 且 解析出
+        step 且 输出含字符异常墙时判 True——调用方据此丢弃本轮决策（不执行、
+        不传子 Agent），追加压缩输出提示后重试。非截断轮乱码留给 degeneracy
+        检测管线，截断正常轮不误伤。"""
+        return (
+            step is not None
+            and bool(getattr(self, "_last_llm_truncated", False))
+            and self._has_garbled_wall(llm_output or "")
+        )
+
     def _detect_output_degeneracy(self, text: str) -> bool:
         """检测生成文本的崩坏萌芽特征（字符墙 / 循环），命中即丢弃本轮静默重试。
 
@@ -1665,6 +1756,9 @@ class BaseAgent(ABC):
                 frag = tail500[i:i + loop_min]
                 if frag in tail500[i + loop_min:]:
                     return True
+        # F3 字符异常墙：混入垃圾字符（截断/采样崩坏残留）同样判崩坏丢弃
+        if self._has_garbled_wall(text):
+            return True
         return False
 
     # ============ X1/X2/X3：tool_calls 通道健壮化（2026-09-27） ============
