@@ -1715,6 +1715,12 @@ Action Input: {{"参数": "值"}}
 
                 # 重置 API 重试计数器（成功获取响应后）
                 self._api_retry_count = 0
+                # 韧性修复（2026-10-02）：连接错误重试恢复后，error_message 若
+                # 仍保留 [API_ERROR:*] 分支的残留文本，run() 尾部 `if error_message:`
+                # 会把数小时后的正常 finish 收口误判为失败（生产实证任务 bba4d002：
+                # 09:38 一次连接错误污染变量，14:00 正常 finish 时任务被误标 failed）。
+                # 成功轮意味着错误已恢复，error_message 与计数器一并清零。
+                error_message = None
 
                 # 解析 LLM 的决策（Task 7 双形态）
                 if tool_calls_this_round:
