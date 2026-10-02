@@ -1792,9 +1792,26 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 # 且解析产物混入垃圾字符（生产实证乱码任务文本传给子 Agent 的
                 # 出口），丢弃本轮决策：不执行、不传子 Agent；历史中尚无本轮
                 # assistant 消息，仅追加一条压缩输出提示即重试。
+                # I3（审查 2026-09-29）：连续命中计数——模型系统性崩坏时每轮
+                # 都会截断+乱码，无上限的重试会空转到迭代/时间预算耗尽；连续
+                # 3 次即止损收口，缺口如实记入 observations。
                 if self._is_garbled_truncated_output(step, llm_output or ""):
+                    self._garbled_drop_count = getattr(self, "_garbled_drop_count", 0) + 1
+                    if self._garbled_drop_count >= 3:
+                        self._record_gate_observation(
+                            "garbled_output_streak",
+                            f"连续 {self._garbled_drop_count} 轮输出被截断且含乱码，"
+                            "已止损停止重试（模型输出系统性崩坏）",
+                        )
+                        await self.emit_event(
+                            "error",
+                            f"连续 {self._garbled_drop_count} 轮 LLM 输出被截断且含乱码，"
+                            "已止损（建议检查模型服务状态或切换模型）",
+                        )
+                        break
                     logger.warning(
                         f"[{self.name}] 截断轮输出含乱码（字符异常墙），本轮决策丢弃"
+                        f"（{self._garbled_drop_count}/3）"
                     )
                     await self.emit_event(
                         "warning",
@@ -1810,6 +1827,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                         ),
                     })
                     continue
+                # 正常产出轮重置乱码连续计数
+                self._garbled_drop_count = 0
 
                 self._steps.append(step)
 

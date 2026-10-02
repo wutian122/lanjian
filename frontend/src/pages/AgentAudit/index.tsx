@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { useLocalStorage } from "@/shared/hooks/useLocalStorage";
 import { toast } from "sonner";
+import { cn } from "@/shared/utils/utils";
 import { useResilientStream, type ConnectionState } from "./hooks/useResilientStream";
 
 import {
@@ -1494,8 +1495,11 @@ function AgentAuditPageContent() {
           </div>
         )}
 
-        {/* 层 5b：LLM 健康度横幅（审计结论可能不完整） */}
-        {llmHealthDegraded && (
+        {/* 层 5b：LLM 健康度横幅（审计结论可能不完整）。
+            I4（审查 2026-09-29）：degraded 升级后的 status 即 completed_with_gaps，
+            与 canReAudit 横幅状态重合且同位重叠——两横幅互斥，re-audit 场景
+            把健康度警示并入蓝色横幅文案。 */}
+        {llmHealthDegraded && !canReAudit && (
           <div className="absolute top-0 left-0 right-0 z-10 bg-orange-50 border-b border-orange-200 px-4 py-2 flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-orange-600 flex-shrink-0" />
             <span className="text-sm text-orange-700">
@@ -1507,9 +1511,11 @@ function AgentAuditPageContent() {
         {canReAudit && (
           <div className="absolute top-0 left-0 right-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-blue-600" />
+              <AlertCircle className={cn("w-4 h-4", llmHealthDegraded ? "text-orange-600" : "text-blue-600")} />
               <span className="text-sm text-blue-700">
-                {"任务已完成但存在未验证的漏洞，可补充审计。"}
+                {llmHealthDegraded
+                  ? "任务已完成但存在未验证的漏洞，可补充审计；且 LLM 输出质量异常（截断/空响应占比过高），本轮结论可能不完整。"
+                  : "任务已完成但存在未验证的漏洞，可补充审计。"}
               </span>
             </div>
             <Button size="sm" onClick={handleReAudit} disabled={isReAuditing || !canReAudit}>

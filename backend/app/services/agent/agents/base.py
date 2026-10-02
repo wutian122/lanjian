@@ -1274,6 +1274,8 @@ class BaseAgent(ABC):
         llm_start = time.monotonic()
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
+        # 本轮是否发生过最后一搏（I2：决定外层是否跳过 trace 记账）
+        ditch_happened = False
         # Task 20：每轮重置空响应形态（与截断标志同生命周期）
         self._last_empty_kind = None
         # Task 7：每轮重置 tool_calls 暴露槽（done chunk 聚合结果写入）
@@ -1564,24 +1566,19 @@ class BaseAgent(ABC):
                 merged_ctk: Dict[str, Any] = dict(caller_ctk)
                 merged_ctk["enable_thinking"] = False
                 ditch_params["chat_template_kwargs"] = merged_ctk
-                type_limit = max_tokens
-                if type_limit is None:
-                    from app.services.agent.config import get_agent_type_config
-                    type_limit = get_agent_type_config(
-                        self.config.agent_type.value
-                    ).max_tokens
-                ditch_max = max(512, (type_limit or 8192) // 2)
+                # max_tokens 在 stream_llm_call 入口已按 Agent 类型回填（W1），
+                # 此处恒非 None；max(512, …) 仅防御极小配置
+                ditch_max = max(512, (max_tokens or 8192) // 2)
                 logger.warning(
-                    f"[{self.name}] 空响应最后一搏：关思考 + 预算减半"
-                    f"（{ditch_max}）重试一次"
+                    f"[{self.name}] 空响应最后一搏：预算减半（{ditch_max}）重试一次"
                 )
                 await self.emit_event(
                     "warning",
-                    f"检测到空响应，自动以关思考模式 + 预算 {ditch_max} 重试一次"
-                    "（最后一搏）",
+                    f"检测到空响应，自动以预算 {ditch_max} 重试一次（最后一搏）",
                 )
+                ditch_happened = True
                 try:
-                    accumulated, total_tokens = await self.stream_llm_call(
+                    ditch_acc, ditch_tokens = await self.stream_llm_call(
                         messages,
                         temperature=temperature,
                         max_tokens=ditch_max,
@@ -1591,6 +1588,10 @@ class BaseAgent(ABC):
                         extra_params=ditch_params,
                         _last_ditch=True,
                     )
+                    # I1（审查 2026-09-29）：累加而非覆盖——第一遍消耗的
+                    # prompt/completion tokens 必须计入调用方 token 预算记账
+                    total_tokens += ditch_tokens
+                    accumulated = ditch_acc
                     if accumulated and accumulated.strip():
                         self._last_empty_kind = None
                 except asyncio.CancelledError:
@@ -1602,12 +1603,16 @@ class BaseAgent(ABC):
 
         # sandbox-verification-hard-gate Task 14：每轮 LLM 调用落 trace
         # （每轮一次而非每 chunk；取消路径 re-raise 不经过此处，不记账）。
-        self._trace_llm_call(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            duration_ms=int((time.monotonic() - llm_start) * 1000),
-            truncated=self._last_llm_truncated,
-        )
+        # I2（审查 2026-09-29）：一搏轮由内层调用自记一条 trace（真实发生的
+        # 一搏调用），外层第一遍空轮无产出、且其 tokens/truncated 字段已被
+        # 内层重置串台——外层跳过，避免 llm_calls 双记与归因错位。
+        if not ditch_happened:
+            self._trace_llm_call(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_ms=int((time.monotonic() - llm_start) * 1000),
+                truncated=self._last_llm_truncated,
+            )
 
         return accumulated, total_tokens
 

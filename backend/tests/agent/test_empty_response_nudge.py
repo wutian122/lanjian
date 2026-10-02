@@ -215,7 +215,8 @@ async def test_reasoning_only_empty_classified_and_nudge_text():
     output, tokens = await agent.stream_llm_call(history)
 
     assert output == ""
-    assert tokens == 12
+    # I1（审查修复）：一搏 tokens 与第一遍累加（12+12=24），不再覆盖
+    assert tokens == 24
     assert agent._last_empty_kind == "reasoning_only"
 
     nudge_text_mode = agent._empty_response_nudge()

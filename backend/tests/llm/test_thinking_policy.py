@@ -78,7 +78,7 @@ class TestThinkingPolicyReversed:
             assert merged["chat_template_kwargs"]["enable_thinking"] is True
 
     def test_legacy_disable_flag_same_result(self):
-        with patch.object(settings, "LLM_ENABLE_THINKING", False), \
-             patch.object(settings, "LLM_THINKING_SEPARATE_BUDGET", False):
+        """旧开关 LLM_DISABLE_THINKING=true（存量部署环境）出站结果一致。"""
+        with patch.object(settings, "LLM_DISABLE_THINKING", True):
             off_old = _make_adapter()._merge_config_sampling_params(None)
         assert off_old["chat_template_kwargs"]["enable_thinking"] is False

@@ -264,11 +264,18 @@ class AgentTaskResponse(BaseModel):
     low_count: int = 0
 
     # 评分
-    quality_score: float = 0.0
+    # 层 5a（2026-09-29）：completed_with_gaps 且 0 发现时返回 None（无法评分）。
+    # 必须可空——否则 response_model 校验对详情/列表接口直接 500（审查 C1 实证）。
+    quality_score: float | None = None
     security_score: float | None = None
 
     # 进度百分比
     progress_percentage: float = 0.0
+
+    # 层 5b（2026-09-29）：门禁/健康度观察明细（llm_health / candidates 等）。
+    # 未在响应模型声明会被 FastAPI 按 response_model 静默过滤（审查 C2 实证），
+    # 前端健康度横幅与报告段整条链路随之失效。
+    observations: list[dict] | None = None
 
     # 时间
     created_at: datetime
