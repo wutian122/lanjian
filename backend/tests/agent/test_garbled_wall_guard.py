@@ -69,3 +69,33 @@ class TestGarbledTruncatedStepRejection:
         agent = self._make(truncated=True)
         assert agent._is_garbled_truncated_output(
             step=None, llm_output="�") is False
+
+
+class TestPunctuationDriftDetection:
+    """F4 标点密度漂移（2026-10-02 部署对照实证）。
+
+    任务 bba4d002：关思考后长正文出现"无标点面条"漂移——内容逻辑正确但
+    整段无句读（repetition_penalty 惩罚高频标点 + fp8 魔改权重长输出漂移）。
+    F1 字符墙/F2 循环/F3 乱码墙均抓不到。F4：尾 500 字符窗口句读
+    （。！？；：，、.!?;:\\n）≤2 判漂移，流中掐断省 token。
+    """
+
+    DRIFT = ("semgrep预扫描唯一热点是changes.xml文档文件非代码攻击向量不构成真实风险源可排除误报干扰因素考虑后判定不存在需要verification沙箱验证的真实候选因为needs_verification等于真"
+             "的发现数量为零此时继续重复调度同一Agent期望不同结果违反重要原则第五条避免重复且浪费token预算已达四十七万接近合理上限应基于已有充分证据做出终止决策输出结构化结论说明nginx作为成熟开源Web服务器经过多轮独立第三方安全审查其核心请求处理链路针对本次指定五类目标漏洞在当前版本快照下未发现新增或遗漏的可利用缺陷符合预期") * 3
+
+    def test_punctuation_drift_long_run_detected(self):
+        assert BaseAgent._has_punctuation_drift("Thought: " + self.DRIFT) is True
+
+    def test_normal_chinese_prose_not_flagged(self):
+        normal = ("已完成recon和analysis两个阶段，均返回0个漏洞发现。按照强制审计顺序规则，"
+                  "D6 SSRF、path traversal已由Analysis Agent检查过；semgrep预扫描唯一热点是"
+                  "changes.xml，非代码攻击向量，不构成真实风险源。考虑后判定：不存在需要"
+                  "verification沙箱验证的真实候选。" * 5)
+        assert BaseAgent._has_punctuation_drift(normal) is False
+
+    def test_code_block_with_semicolons_not_flagged(self):
+        code = "if (a == b) { return c; }\n" * 60
+        assert BaseAgent._has_punctuation_drift(code) is False
+
+    def test_short_run_not_flagged(self):
+        assert BaseAgent._has_punctuation_drift("短文本无标点") is False

@@ -1702,6 +1702,25 @@ class BaseAgent(ABC):
     GARBLED_EXT_LATIN_RUN_LIMIT = 6
     _GARBLED_RARE_CHARS = frozenset("\ufffd\ufffe\uffff")
 
+    # F4 标点密度漂移（2026-10-02 部署对照实证，任务 bba4d002）：关思考后
+    # 长正文"无标点面条"——repetition_penalty 持续惩罚高频标点 + fp8 魔改
+    # 权重长输出漂移，F1/F2/F3 均抓不到。判据：尾 500 字符窗口内句读
+    # （。！？；：，、.!?;: 换行）≤2 且总长 ≥800。正常中文 500 字符句读
+    # 约 8-15 个；代码块有分号/换行不误伤。
+    PUNCT_DRIFT_MIN_LENGTH = 800
+    PUNCT_DRIFT_WINDOW = 500
+    PUNCT_DRIFT_MIN_MARKS = 3
+    _PUNCT_MARKS = frozenset("。！？；：，、.!?;:\n\r")
+
+    @staticmethod
+    def _has_punctuation_drift(text: str) -> bool:
+        """F4 标点密度漂移检测（纯函数）。"""
+        if not text or len(text) < BaseAgent.PUNCT_DRIFT_MIN_LENGTH:
+            return False
+        tail = text[-BaseAgent.PUNCT_DRIFT_WINDOW:]
+        marks = sum(1 for ch in tail if ch in BaseAgent._PUNCT_MARKS)
+        return marks < BaseAgent.PUNCT_DRIFT_MIN_MARKS
+
     @staticmethod
     def _has_garbled_wall(text: str) -> bool:
         """F3 字符异常墙检测（尾 200 窗口，纯函数，无状态）。"""
@@ -1763,6 +1782,9 @@ class BaseAgent(ABC):
                     return True
         # F3 字符异常墙：混入垃圾字符（截断/采样崩坏残留）同样判崩坏丢弃
         if self._has_garbled_wall(text):
+            return True
+        # F4 标点密度漂移：长正文无句读（关思考后输出通道的温和退化形态）
+        if self._has_punctuation_drift(text):
             return True
         return False
 
