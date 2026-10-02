@@ -1397,15 +1397,15 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                     task.observations = observations_list
                     if (
                         llm_health.get("degraded")
-                        and task.status == AgentTaskStatus.COMPLETED.value
+                        and task.status == AgentTaskStatus.COMPLETED
                     ):
-                        task.status = AgentTaskStatus.COMPLETED_WITH_GAPS.value
+                        task.status = AgentTaskStatus.COMPLETED_WITH_GAPS
                 except Exception as exc:  # 健康度统计非致命：失败不阻断收口
                     logger.warning(f"LLM 健康度统计失败（非致命）: {exc!r}")
 
                 # 计算安全评分
                 scoring_gaps = (
-                    task.status == AgentTaskStatus.COMPLETED_WITH_GAPS.value
+                    task.status == AgentTaskStatus.COMPLETED_WITH_GAPS
                 )
                 task.security_score = _calculate_security_score(
                     findings, gaps=scoring_gaps
