@@ -117,6 +117,21 @@ function AgentAuditPageContent() {
     (o) => (o as { llm_health?: { degraded?: boolean } } | null)?.llm_health?.degraded === true,
   );
 
+  // 运行中实时 LLM 异常事件计数（从日志流统计，口径=事件条数；
+  // "检测到空响应"= 最后一搏 warning 每空轮恰好 1 条，1:1 对应空响应轮）
+  const llmRuntimeWarnings = useMemo(() => {
+    let truncations = 0;
+    let empties = 0;
+    let formatFails = 0;
+    for (const log of logs) {
+      const text = log.title || "";
+      if (text.includes("max_tokens 截断")) truncations += 1;
+      if (text.includes("检测到空响应")) empties += 1;
+      if (text.includes("格式解析失败")) formatFails += 1;
+    }
+    return { truncations, empties, formatFails };
+  }, [logs]);
+
   // 🔥 当 taskId 变化时立即重置状态（新建任务时清理旧日志）
   useEffect(() => {
     // 如果 taskId 发生变化，立即重置
@@ -1774,7 +1789,7 @@ function AgentAuditPageContent() {
 
           {/* Middle section - Stats */}
           <div className="flex-shrink-0 border-t border-border bg-card p-3">
-            <StatsPanel task={task} findings={findings} compact />
+            <StatsPanel task={task} findings={findings} compact llmRuntimeWarnings={llmRuntimeWarnings} />
           </div>
         </div>
       </div>

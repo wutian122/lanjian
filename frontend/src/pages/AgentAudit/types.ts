@@ -166,6 +166,26 @@ export interface StatsPanelProps {
   task: AgentTask | null;
   findings: AgentFinding[];
   compact?: boolean;
+  // 层 5b（2026-09-29）：运行中实时 LLM 异常事件计数（从日志流统计，
+  // 口径=事件条数；任务收口后的权威口径走 task.observations.llm_health）
+  llmRuntimeWarnings?: LlmRuntimeWarnings;
+}
+
+// LLM 输出健康度（后端 _compute_llm_health 收口落 observations.llm_health）
+export interface LlmHealth {
+  llm_calls: number;
+  truncations: number;
+  empty_responses: number;
+  format_retries: number;
+  garbled_drops: number;
+  degraded: boolean;
+}
+
+// 运行中实时统计（前端从 warning/error 日志聚合）
+export interface LlmRuntimeWarnings {
+  truncations: number;
+  empties: number;
+  formatFails: number;
 }
 
 export interface AICollaborationPanelProps {

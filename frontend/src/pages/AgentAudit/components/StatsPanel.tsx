@@ -9,7 +9,20 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/shared/utils/utils";
 import { VerificationStatusBreakdown } from "@/shared/components/VerificationStatusBreakdown";
 import { describeTimeBudget, isRunningStatus } from "@/shared/utils/timeBudget";
-import type { StatsPanelProps } from "../types";
+import type { LlmHealth, LlmRuntimeWarnings, StatsPanelProps } from "../types";
+
+// 层 5b（2026-09-29）：从 observations 提取收口后的 LLM 健康度
+// （多条 observation 时取最后一条 llm_health——重跑/补充审计以最新为准）
+function extractLlmHealth(observations: Array<Record<string, unknown>> | null | undefined): LlmHealth | null {
+  let found: LlmHealth | null = null;
+  for (const o of observations ?? []) {
+    const health = (o as { llm_health?: LlmHealth } | null)?.llm_health;
+    if (health && typeof health.degraded === "boolean") {
+      found = health;
+    }
+  }
+  return found;
+}
 
 function MetricItem({ icon, label, value, suffix = "", compact = false, valueClassName }: {
   icon: React.ReactNode;
@@ -37,7 +50,7 @@ function MetricItem({ icon, label, value, suffix = "", compact = false, valueCla
   );
 }
 
-export const StatsPanel = memo(function StatsPanel({ task, findings, compact = false }: StatsPanelProps) {
+export const StatsPanel = memo(function StatsPanel({ task, findings, compact = false, llmRuntimeWarnings }: StatsPanelProps) {
   // Task 17：运行中倒计时每秒刷新；终态/暂停态不 tick（视图不依赖当前时间）
   const [now, setNow] = useState(() => Date.now());
   const taskStatus = task?.status;
@@ -52,6 +65,7 @@ export const StatsPanel = memo(function StatsPanel({ task, findings, compact = f
   const totalFindings = task.findings_count || 0;
   const progressPercent = task.progress_percentage || 0;
   const timeBudget = describeTimeBudget(task, now);
+  const llmHealth = extractLlmHealth(task.observations);
 
   return (
     <div className={cn(compact ? "space-y-2" : "space-y-3")}>
@@ -245,6 +259,64 @@ export const StatsPanel = memo(function StatsPanel({ task, findings, compact = f
           </div>
         </div>
       )}
+
+      {/* 层 5b：LLM 输出健康度（收口后权威口径；运行中显示实时事件计数） */}
+      {(llmHealth || (llmRuntimeWarnings && (llmRuntimeWarnings.truncations > 0 || llmRuntimeWarnings.empties > 0 || llmRuntimeWarnings.formatFails > 0))) && (() => {
+        const isDegraded = llmHealth?.degraded ?? false;
+        const rows: Array<{ label: string; value: number; warn: boolean }> = llmHealth
+          ? [
+              { label: "LLM 调用", value: llmHealth.llm_calls, warn: false },
+              { label: "输出截断", value: llmHealth.truncations, warn: llmHealth.truncations > 0 },
+              { label: "空响应", value: llmHealth.empty_responses, warn: llmHealth.empty_responses > 0 },
+              { label: "格式失败", value: llmHealth.format_retries, warn: llmHealth.format_retries > 0 },
+              { label: "乱码丢弃", value: llmHealth.garbled_drops, warn: llmHealth.garbled_drops > 0 },
+            ]
+          : [
+              { label: "输出截断", value: llmRuntimeWarnings?.truncations ?? 0, warn: (llmRuntimeWarnings?.truncations ?? 0) > 0 },
+              { label: "空响应", value: llmRuntimeWarnings?.empties ?? 0, warn: (llmRuntimeWarnings?.empties ?? 0) > 0 },
+              { label: "格式失败", value: llmRuntimeWarnings?.formatFails ?? 0, warn: (llmRuntimeWarnings?.formatFails ?? 0) > 0 },
+            ];
+        return (
+          <div className={cn(
+            "rounded-lg border bg-card",
+            compact ? "p-2.5" : "p-4",
+            isDegraded ? "border-orange-300 dark:border-orange-800" : "border-border"
+          )}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Activity className={cn("w-4 h-4", isDegraded ? "text-orange-600" : "text-muted-foreground")} />
+                <span className={cn("font-semibold", compact ? "text-xs" : "text-sm")}>
+                  LLM 输出健康度{!llmHealth && "（实时）"}
+                </span>
+              </div>
+              {isDegraded && (
+                <Badge variant="destructive" className={compact ? "text-[10px]" : "text-xs"}>
+                  输出质量异常
+                </Badge>
+              )}
+            </div>
+            <div className={cn("grid", compact ? "grid-cols-3 gap-1.5" : "grid-cols-5 gap-2")}>
+              {rows.map((r) => (
+                <div key={r.label} className="rounded-md border border-border bg-muted/30 px-2 py-1.5 text-center">
+                  <div className={cn(
+                    "font-semibold",
+                    compact ? "text-sm" : "text-base",
+                    r.warn ? "text-amber-600" : "text-foreground"
+                  )}>
+                    {r.value}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">{r.label}</div>
+                </div>
+              ))}
+            </div>
+            {isDegraded && (
+              <div className={cn("mt-2 text-orange-700 dark:text-orange-400", compact ? "text-[10px]" : "text-xs")}>
+                截断/空响应占比过高，本轮审计结论可能不完整，请谨慎采信。
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 });
