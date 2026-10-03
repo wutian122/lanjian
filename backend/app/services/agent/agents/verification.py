@@ -753,6 +753,28 @@ def _normalize_tool_key(action: str, action_input: dict) -> str:
 # 静态确认数 1 vs 3——LLM 参与判定的采样波动）。
 VERIFICATION_TEMPERATURE = 0.2
 
+def _should_block_repeat_call(count: int, error_streak: int) -> bool:
+    """P4（2026-10-03）：死循环防护的白名单化。
+
+    生产实证（任务 026ead34）：工具 TypeError 后的同参数重试被"超过3次"
+    防护误杀，沙箱验证断路。新语义：
+    - 同参数 + 工具错误连续 ≤3 次 → 放行重试（给模型修正参数的机会）；
+    - 错误连续 >3 次 → 拦（工具本身坏了，重试无意义）；
+    - 无错误（成功结果）同参数重复 >3 次 → 拦（真死循环，语义保留）。
+    """
+    if error_streak >= 4:
+        return True
+    if error_streak >= 1:
+        return False
+    return count > 3
+
+
+def _should_force_deterministic_rerun(sandbox_fail_streak: int, rerun_done: bool) -> bool:
+    """P4-3：LLM 沙箱类工具连续失败 ≥3 → 触发确定性 PoC 强制补跑一次。"""
+    return sandbox_fail_streak >= 3 and not rerun_done
+
+
+
 def _count_verification_outcomes(findings: list) -> dict:
     """P2a（2026-10-03）：验证收口五态计数（含 static_confirmed）。
 
@@ -1571,9 +1593,14 @@ class VerificationAgent(BaseAgent):
                         self._tool_call_counts = {}
                     
                     self._tool_call_counts[tool_call_key] = self._tool_call_counts.get(tool_call_key, 0) + 1
+                    if not hasattr(self, '_tool_call_error_streak'):
+                        self._tool_call_error_streak = {}
                     
                     # 如果同一操作重复尝试超过3次，强制干预
-                    if self._tool_call_counts[tool_call_key] > 3:
+                    if _should_block_repeat_call(
+                        self._tool_call_counts[tool_call_key],
+                        self._tool_call_error_streak.get(tool_call_key, 0),
+                    ):
                         logger.warning(f"[{self.name}] Detected repetitive tool call loop: {tool_call_key}")
                         observation = (
                             f"⚠️ **系统干预**: 你已经使用完全相同的参数调用了工具 '{step.action}' 超过3次。\n"
@@ -1604,6 +1631,27 @@ class VerificationAgent(BaseAgent):
                         step.action,
                         step.action_input or {}
                     )
+
+                    # P4（2026-10-03）：工具结果分类——维护 per-key 错误 streak
+                    # （死循环防护白名单用）与沙箱类全局失败 streak（断路兜底用）
+                    _is_tool_error = observation.startswith("⚠️ 工具执行失败")
+                    _is_sandbox_tool = step.action in (
+                        "sandbox_exec", "java_test", "python_test", "php_test",
+                        "verify_vulnerability", "command_injection_test",
+                        "sql_injection_test", "xss_test",
+                    )
+                    if _is_tool_error:
+                        self._tool_call_error_streak[tool_call_key] = (
+                            self._tool_call_error_streak.get(tool_call_key, 0) + 1
+                        )
+                        if _is_sandbox_tool:
+                            self._sandbox_tool_fail_streak = (
+                                getattr(self, "_sandbox_tool_fail_streak", 0) + 1
+                            )
+                    else:
+                        self._tool_call_error_streak[tool_call_key] = 0
+                        if _is_sandbox_tool:
+                            self._sandbox_tool_fail_streak = 0
 
                     # 🔥 追踪 sandbox_exec 调用
                     if step.action == "sandbox_exec":
@@ -1812,6 +1860,28 @@ class VerificationAgent(BaseAgent):
                 self._bind_unbound_runtime_evidence(verified_findings)
             except Exception as _e:
                 logger.warning(f"[{self.name}] Final evidence binding failed: {_e}")
+ 
+            # P4-3（2026-10-03）：沙箱工具断路兜底——LLM 沙箱类调用连续失败 ≥3
+            # （空调用/TypeError 连发，生产实证 026ead34 全会话沙箱瘫痪）时，
+            # 强制补跑确定性 PoC（幂等台账自动只跑未落账命令），验证能力不随
+            # LLM 工具调用质量瘫痪。
+            if _should_force_deterministic_rerun(
+                getattr(self, "_sandbox_tool_fail_streak", 0),
+                getattr(self, "_deterministic_rerun_done", False),
+            ):
+                self._deterministic_rerun_done = True
+                logger.warning(
+                    f"[{self.name}] 沙箱类工具连续失败 "
+                    f"{getattr(self, '_sandbox_tool_fail_streak', 0)} 次，"
+                    "强制补跑确定性 PoC（幂等，仅未落账命令）"
+                )
+                try:
+                    await self._run_deterministic_sandbox_commands(
+                        getattr(self, "_sandbox_commands", None) or [],
+                        getattr(self, "_sandbox_project_root", None),
+                    )
+                except Exception as exc:
+                    logger.warning(f"[{self.name}] 确定性 PoC 补跑失败（非致命）: {exc!r}")
 
             # sandbox-verification-hard-gate Task 14：验证收尾——每个 finding 的
             # 终态/沙箱尝试摘要落审计追踪（helper 内部逐条 try/except，非致命）

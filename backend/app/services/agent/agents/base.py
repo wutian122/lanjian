@@ -10,6 +10,8 @@ Agent 基类
 5. 完整的状态管理和Agent间通信
 """
 
+import re
+
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from dataclasses import dataclass, field
@@ -1861,6 +1863,29 @@ class BaseAgent(ABC):
         """非空轮（正常产出正文/工具调用）调用：重置连续 truncated 计数。"""
         self._truncated_empty_streak = 0
 
+    _MISSING_ARG_PATTERN = re.compile(r"missing \d+ required positional arguments?: '([\w_]+)'")
+
+    @staticmethod
+    def _enhance_missing_arg_error(error_text: str) -> str:
+        """P4（2026-10-03）：漏参错误精准引导。
+
+        Flash-Next 实证（任务 026ead34）：关思考下频繁发出空调用（参数:无），
+        通用报错文本让模型无法自愈（反复空调用直至被去重阻断）。命中
+        missing argument 模式时，点名缺失参数并给出 JSON 参数修正指引。
+        """
+        m = BaseAgent._MISSING_ARG_PATTERN.search(error_text or "")
+        if not m:
+            return error_text
+        missing = m.group(1)
+        return (
+            f"{error_text}\n\n"
+            f"🎯 **精准修正指引**：本次调用参数缺失（缺少必需参数 `{missing}`）。"
+            "工具调用参数必须是一个完整的 JSON 对象，包含全部必需字段——"
+            "禁止发送空参数或省略字段。请重新调用本工具，"
+            f'例如 {{"{missing}": "<实际值>", ...}}。'
+            "若无法确定取值，请先用 list_files/search_code 获取上下文。"
+        )
+
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """
         统一的工具执行方法 - 支持取消和超时
@@ -2021,11 +2046,12 @@ class BaseAgent(ABC):
                 return output
             else:
                 # 🔥 输出详细的错误信息，包括原始错误
+                _error_detail = self._enhance_missing_arg_error(str(result.error or ""))
                 error_msg = f"""⚠️ 工具执行失败
 
 **工具**: {tool_name}
 **参数**: {json.dumps(tool_input, ensure_ascii=False, indent=2) if tool_input else '无'}
-**错误**: {result.error}
+**错误**: {_error_detail}
 
 请根据错误信息调整参数或尝试其他方法。"""
                 return error_msg
