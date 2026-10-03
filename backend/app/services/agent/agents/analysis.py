@@ -345,6 +345,23 @@ _EXEMPT_LINE_RE = re.compile(
 # 维度标识与豁免理由的分隔符（按特异性排序，先长后短；冒号兜底）
 _EXEMPT_SEPARATORS = (" — ", " – ", "——", " - ", "－", "：", ":")
 
+def _should_nudge_submit(iteration: int, max_iterations: int, *, has_candidates: bool) -> bool:
+    """P1a（2026-10-03）：探索过半交卷提醒节拍器。
+
+    Flash-Next 类模型实证（任务 eec77e54/d865def0）：30 轮探索动作全部正常
+    但 submit_findings 0 调用、强制总结 0 候选——"只干活不交卷"。本节拍器
+    在过半（iteration > max//2）后首次及每 5 轮返回 True，由 run 循环注入
+    交卷强约束（已有候选则不打扰）。
+    """
+    if has_candidates:
+        return False
+    if iteration >= max_iterations - 2:
+        return True  # 收官前必提醒
+    if iteration <= max_iterations // 2:
+        return False
+    return iteration == max_iterations // 2 + 1 or (iteration - max_iterations // 2) % 5 == 0
+
+
 _FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
 
 即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
@@ -356,6 +373,10 @@ _FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer
    UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <豁免理由>
    维度标识使用维度键（D1_injection、D2_auth、D3_authz、D4_deserialization、D5_file、D6_ssrf、D7_crypto、D8_config、D9_business_logic、D10_supply_chain）或漏洞类型名（sql_injection、xss、command_injection、path_traversal、ssrf、deserialization、xxe、hardcoded_secret、csrf、idor 等）。
 不允许对未覆盖维度既不给候选也不给豁免——0 候选且 0 豁免的总结视为无效产出。
+即使你觉得全部维度都已排除，也**必须至少 1 条**候选——输出你分析过程中印象最深的可疑点
+（confidence 如实、needs_verification=true 交沙箱裁决）——零候选总结会被系统拒绝并重试。
+最小示例（结构必须一致，内容按实际情况填写）：
+{"findings": [{"vulnerability_type": "path_traversal", "severity": "medium", "title": "示例：XX 接口路径拼接未规范化", "description": "读取的 XX 文件第 N 行存在用户可控路径拼接", "file_path": "实际读过的文件路径", "line_start": 100, "confidence": 0.4, "needs_verification": true}], "summary": "UNCOVERED_DIMENSION_EXEMPT: D7_crypto - 未发现加密相关代码"}
 
 请按以下 JSON 格式输出：
 ```json
@@ -1157,6 +1178,24 @@ class AnalysisAgent(BaseAgent):
                     break
 
                 self._iteration = iteration + 1
+                # P1a（2026-10-03）：探索过半交卷提醒——Flash-Next 类模型实证
+                # "只干活不交卷"（30 轮 0 次 submit_findings），过半后首次及
+                # 每 5 轮注入交卷强约束，直至出现候选。
+                if _should_nudge_submit(
+                    iteration + 1, self.config.max_iterations,
+                    has_candidates=bool(all_findings),
+                ):
+                    self._conversation_history.append({
+                        "role": "user",
+                        "content": (
+                            f"[系统提醒] 你已探索 {iteration + 1}/{self.config.max_iterations} 轮且尚未提交任何候选。"
+                            "请立即调用 submit_findings 交卷——哪怕只有 1 条低置信候选"
+                            "（confidence 如实、needs_verification=true，交沙箱裁决）。"
+                            "若某维度确认无候选，必须在 summary 中用 "
+                            "UNCOVERED_DIMENSION_EXEMPT: <维度> - <理由> 单独成行豁免。"
+                            "继续只探索不交卷将被视为无效审计。"
+                        ),
+                    })
                 
                 # 🔥 再次检查取消标志（在LLM调用之前）
                 if self.is_cancelled:

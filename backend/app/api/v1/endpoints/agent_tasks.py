@@ -2476,7 +2476,7 @@ async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
             llm_calls += 1
         if "max_tokens 截断" in msg:
             truncations += 1
-        if "空响应" in msg and event_type in ("warning", "error", "info"):
+        if "空响应" in msg and event_type in ("warning", "error", "info", "llm_decision"):
             # 一条事件消息只记一次（token 流事件不进此账）
             empty_responses += 1
         if "格式解析失败" in msg:

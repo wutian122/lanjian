@@ -749,6 +749,37 @@ def _normalize_tool_key(action: str, action_input: dict) -> str:
     return f"{action}:{json.dumps(action_input or {}, sort_keys=True)}"
 
 
+# P3b（2026-10-03）：验证阶段低温压判定波动（生产实证同批候选跨机
+# 静态确认数 1 vs 3——LLM 参与判定的采样波动）。
+VERIFICATION_TEMPERATURE = 0.2
+
+def _count_verification_outcomes(findings: list) -> dict:
+    """P2a（2026-10-03）：验证收口五态计数（含 static_confirmed）。
+
+    原统计漏计 static_confirmed——静态确认的漏洞在收口文案中隐身，
+    用户看到"0 确认"误以为审计颗粒无收。"""
+    keys = ("confirmed", "static_confirmed", "false_positive",
+            "not_reproducible", "needs_context")
+    counts = {k: 0 for k in keys}
+    for f in findings or []:
+        status = str((f or {}).get("verification_status") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _elastic_budget(n_findings: int, per_finding_config: int) -> int:
+    """P3a（2026-10-03）：验证弹性预算自适应。
+
+    生产实证（任务 eec77e54）：8 个 Semgrep 兜底候选耗 34 万 token
+    （per_finding=8 × 8 + 20 = 84 轮上限，实际 13 轮继续验证）。
+    候选 >5 时 per_finding 减半——Semgrep 兜底候选是泛化规则产物，
+    逐个深验性价比低；LLM 深度候选（少量高价值）保持原预算。
+    """
+    per_finding = 4 if n_findings > 5 else per_finding_config
+    return min(per_finding * n_findings + 20, 160)
+
+
 class VerificationAgent(BaseAgent):
     """
     漏洞验证 Agent - LLM 驱动版
@@ -1286,7 +1317,7 @@ class VerificationAgent(BaseAgent):
             except Exception:
                 per_finding = 8
                 logger.warning("[Verification] 弹性预算配置读取失败，用默认值 per_finding=8", exc_info=True)
-            elastic_max = min(per_finding * n_findings + 20, 160)
+            elastic_max = _elastic_budget(n_findings, per_finding)
             if elastic_max > self.config.max_iterations:
                 self.config.max_iterations = elastic_max
                 logger.info(f"[Verification] 弹性预算: {n_findings} findings → {elastic_max} iterations")
@@ -1378,9 +1409,10 @@ class VerificationAgent(BaseAgent):
                     llm_output, tokens_this_round = await self.stream_llm_call(
                         self._conversation_history,
                         tools=verification_tools,
-                        # 🔥 不传递 temperature 和 max_tokens，使用用户配置
-                        # R-C2：verification 的思考保留由 base.stream_llm_call
-                        # 按 agent 类型集中注入（见 base.py R-C2 注释）
+                        temperature=VERIFICATION_TEMPERATURE,
+                        # P3b（2026-10-03）：验证阶段显式低温 0.2——判定一致性
+                        # 优先于探索创造性（用户配置 0.35 仍偏高）。max_tokens
+                        # 仍走用户配置。R-C2：思考保留由 base 集中注入。
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
@@ -1785,15 +1817,19 @@ class VerificationAgent(BaseAgent):
             # 终态/沙箱尝试摘要落审计追踪（helper 内部逐条 try/except，非致命）
             self._trace_verification_results(verified_findings)
 
-            # 统计
-            confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
-            not_reproducible_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NOT_REPRODUCIBLE])
-            false_positive_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.FALSE_POSITIVE])
-            needs_context_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NEEDS_CONTEXT])
+            # 统计（P2a 2026-10-03：static_confirmed 纳入收口——生产实证 B 机
+            # eec77e54 "0 确认"实为 0 动态确认 + 3 静态确认，文案漏计误导用户）
+            counts = _count_verification_outcomes(verified_findings)
+            confirmed_count = counts["confirmed"]
+            not_reproducible_count = counts["not_reproducible"]
+            false_positive_count = counts["false_positive"]
+            needs_context_count = counts["needs_context"]
 
             await self.emit_event(
                 "info",
-                f"Verification Agent 完成: {confirmed_count} 确认, {false_positive_count} 误报, {not_reproducible_count} 无法复现, {needs_context_count} 需上下文"
+                f"Verification Agent 完成: {counts['confirmed']} 确认, "
+                f"{counts['static_confirmed']} 静态确认, {counts['false_positive']} 误报, "
+                f"{counts['not_reproducible']} 无法复现, {counts['needs_context']} 需上下文"
             )
 
             # 🔥 CRITICAL: Log final findings count before returning
