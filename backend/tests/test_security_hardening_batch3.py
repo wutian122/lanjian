@@ -17,62 +17,32 @@ def _set_secret_key(monkeypatch):
 
 
 class TestValidateLlmBaseUrl:
+    """2026-10-03 老板决策：移除内网/回环/保留地址拦截（内网 LLM 服务为部署常态，
+    白名单维护成本高于收益）。保留 http/https 协议与主机名基本格式校验。"""
+
     def test_rejects_non_http_scheme(self):
         from app.api.v1.endpoints.config import _validate_llm_base_url
 
-        with pytest.raises(HTTPException) as e:
+        with pytest.raises(HTTPException) as exc:
             _validate_llm_base_url("ftp://example.com/v1")
-        assert e.value.status_code == 400
+        assert exc.value.status_code == 400
 
-    def test_rejects_loopback_ip(self):
+    def test_allows_private_ip(self):
         from app.api.v1.endpoints.config import _validate_llm_base_url
 
-        with pytest.raises(HTTPException) as e:
-            _validate_llm_base_url("http://127.0.0.1:9999/v1")
-        assert e.value.status_code == 400
+        for url in (
+            "http://10.129.2.102:8001/v1",
+            "http://192.168.238.132:8000/v1",
+            "http://127.0.0.1:9999/v1",
+            "http://localhost:8001/v1",
+        ):
+            assert _validate_llm_base_url(url) == url
 
-    def test_rejects_private_and_reserved_ips(self):
+    def test_allows_public_and_internal_hostnames(self):
         from app.api.v1.endpoints.config import _validate_llm_base_url
 
-        for url in ("http://192.168.1.10/v1", "http://10.0.0.5/v1", "http://172.16.0.1/v1"):
-            with pytest.raises(HTTPException):
-                _validate_llm_base_url(url)
-
-    def test_rejects_internal_service_names(self):
-        from app.api.v1.endpoints.config import _validate_llm_base_url
-
-        for host in ("localhost", "db", "redis", "backend", "frontend", "sandbox"):
-            with pytest.raises(HTTPException):
-                _validate_llm_base_url(f"http://{host}:8000/v1")
-
-    def test_rejects_unresolvable_hostname(self):
-        from app.api.v1.endpoints.config import _validate_llm_base_url
-
-        with pytest.raises(HTTPException):
-            _validate_llm_base_url("http://nonexistent-host.invalid.example/v1")
-
-    def test_allows_public_ip(self):
-        from app.api.v1.endpoints.config import _validate_llm_base_url
-
-        assert _validate_llm_base_url("https://1.1.1.1/v1") == "https://1.1.1.1/v1"
-
-    def test_allows_public_hostname(self):
-        from app.api.v1.endpoints.config import _validate_llm_base_url
-
-        assert _validate_llm_base_url("https://api.openai.com/v1") == "https://api.openai.com/v1"
-
-    def test_allowlist_bypasses_private_check(self, monkeypatch):
-        monkeypatch.setenv("LLM_TEST_ALLOWED_HOSTS", "internal-proxy")
-        import app.core.config as cfg_mod
-        importlib.reload(cfg_mod)
-        import app.api.v1.endpoints.config as cfg
-        importlib.reload(cfg)
-
-        assert (
-            cfg._validate_llm_base_url("http://internal-proxy:8000/v1")
-            == "http://internal-proxy:8000/v1"
-        )
-
+        assert _validate_llm_base_url("http://example.com/v1") == "http://example.com/v1"
+        assert _validate_llm_base_url("http://sglang.internal:8001/v1") == "http://sglang.internal:8001/v1"
 
 async def test_llm_test_error_response_has_no_traceback():
     """LLM 测试失败时不再把 traceback 全文回传客户端。"""
