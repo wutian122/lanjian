@@ -1403,17 +1403,18 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 except Exception as exc:  # 健康度统计非致命：失败不阻断收口
                     logger.warning(f"LLM 健康度统计失败（非致命）: {exc!r}")
 
-                # 计算安全评分
+                # 计算安全评分（P6：输入改用落库口径，与原始幻觉列表解耦）
                 scoring_gaps = (
                     task.status == AgentTaskStatus.COMPLETED_WITH_GAPS
                 )
+                saved_for_scoring = await _load_saved_findings_for_scoring(db, task_id)
                 task.security_score = _calculate_security_score(
-                    findings, gaps=scoring_gaps
+                    saved_for_scoring, gaps=scoring_gaps
                 )
                 # P4: 质量评分（agent 流程之前恒为 0）
                 _cov_info = (_meta or {}).get("coverage_info", {}) if isinstance(_meta, dict) else {}
                 task.quality_score = _calculate_quality_score(
-                    findings,
+                    saved_for_scoring,
                     verified_count=task.verified_count,
                     coverage_covered=_cov_info.get("covered_count", 0),
                     coverage_total=_cov_info.get("total_dimensions", 0) or 10,
@@ -2449,6 +2450,29 @@ async def _save_findings(
         await db.rollback()
 
     return saved_count
+
+
+async def _load_saved_findings_for_scoring(db: AsyncSession, task_id: str) -> list[dict]:
+    """P6（2026-10-06）：加载落库 findings 作为评分输入（与原始列表解耦）。
+
+    生产实证（B 机任务 5f6487a4）：orchestrator 原始列表 17 项、落库仅 4 项
+    （幻觉过滤/去重/路径反查剔除）——评分用原始列表扣分爆表（security=0，
+    应 66）。落库口径与 _recalc_task_counters_from_db 对齐。
+    """
+    stmt = select(
+        AgentFinding.severity,
+        AgentFinding.verification_status,
+        AgentFinding.ai_confidence,
+    ).where(AgentFinding.task_id == task_id)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "severity": (r.severity or "low"),
+            "verification_status": (r.verification_status or ""),
+            "ai_confidence": r.ai_confidence,
+        }
+        for r in rows
+    ]
 
 
 async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:

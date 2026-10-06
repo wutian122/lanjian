@@ -37,3 +37,38 @@ class TestScoringGapsSemantics:
         assert _calculate_quality_score(
             [], verified_count=0, coverage_covered=0, coverage_total=10,
             gaps=False) == 100.0
+
+
+class TestScoringUsesSavedFindingsP6:
+    """P6（2026-10-06）：评分输入必须用落库口径。
+
+    生产实证（B 机任务 5f6487a4）：原始列表 17 项（13 项被幻觉过滤后落库
+    4 项），评分用原始列表扣分 → 0 分（应 66 分）。quality 同被污染
+    （42 分偏低）。评分输入必须与 _recalc_task_counters_from_db 同口径
+    （落库后的 AgentFinding），而不是 orchestrator 返回的原始列表。
+    """
+
+    def test_security_score_saved口径_66分(self):
+        from app.api.v1.endpoints.agent_tasks import _calculate_security_score
+
+        saved = [{"severity": "high"}, {"severity": "medium"},
+                 {"severity": "medium"}, {"severity": "low"}]
+        assert _calculate_security_score(saved, gaps=True) == 66.0
+
+    async def test_load_saved_findings_for_scoring(self):
+        """新增 helper：从 DB 加载落库 findings（id/severity/verification_status/
+        ai_confidence），供评分与原始列表解耦。"""
+        from unittest.mock import AsyncMock, MagicMock
+        from app.api.v1.endpoints.agent_tasks import _load_saved_findings_for_scoring
+
+        row = MagicMock()
+        row.severity = "high"
+        row.verification_status = "confirmed"
+        row.ai_confidence = 0.9
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[row])))
+        out = await _load_saved_findings_for_scoring(db, "t-1")
+        assert len(out) == 1
+        assert out[0]["severity"] == "high"
+        assert out[0]["verification_status"] == "confirmed"
+        assert out[0]["ai_confidence"] == 0.9
