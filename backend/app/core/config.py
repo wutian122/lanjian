@@ -168,7 +168,10 @@ class Settings(BaseSettings):
     # 鎵弿閰嶇疆
     MAX_ANALYZE_FILES: int = 0  # 鏈€澶у垎鏋愭枃浠舵暟锛?琛ㄧず鏃犻檺鍒?
     MAX_FILE_SIZE_BYTES: int = 200 * 1024  # 鏈€澶ф枃浠跺ぇ灏?200KB
-    LLM_CONCURRENCY: int = 3  # LLM骞跺彂鏁?
+    LLM_CONCURRENCY: int = 3
+    # P5-2（2026-10-04）：跨任务全局 LLM 并发闸（四任务并发打爆单卡 SGLang
+    # 实证）。单 worker 下进程内信号量即全局；闸粒度 = 单次 HTTP 出站调用。
+    LLM_GLOBAL_CONCURRENCY: int = 6  # LLM骞跺彂鏁?
     LLM_GAP_MS: int = 2000  # LLM璇锋眰闂撮殧锛堟绉掞級
     
     # ZIP鏂囦欢瀛樺偍閰嶇疆

@@ -8,5 +8,5 @@ set -eo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 docker run --rm -v "$REPO:/repo" -w /repo/backend \
   -e LANJIAN_TEST_DUMMY_KEY=unit-test-dummy-key -e PYTHONDONTWRITEBYTECODE=1 \
-  --entrypoint "" "${LANJIAN_TEST_IMAGE:-wutian449/lanjian-backend:v6.5.2f}" sh -c \
+  --entrypoint "" "${LANJIAN_TEST_IMAGE:-wutian449/lanjian-backend:v6.6.0}" sh -c \
   '/app/.venv/bin/pip install -q --disable-pip-version-check pytest pytest-asyncio pytest-cov >/dev/null 2>&1; PYTHONPATH=/repo/backend /app/.venv/bin/python -m pytest "$@"' -- "$@"
