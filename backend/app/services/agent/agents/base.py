@@ -1571,37 +1571,59 @@ class BaseAgent(ABC):
                 # max_tokens 在 stream_llm_call 入口已按 Agent 类型回填（W1），
                 # 此处恒非 None；max(512, …) 仅防御极小配置
                 ditch_max = max(512, (max_tokens or 8192) // 2)
-                logger.warning(
-                    f"[{self.name}] 空响应最后一搏：预算减半（{ditch_max}）重试一次"
-                )
-                await self.emit_event(
-                    "warning",
-                    f"检测到空响应，自动以预算 {ditch_max} 重试一次（最后一搏）",
-                )
                 ditch_happened = True
-                try:
-                    ditch_acc, ditch_tokens = await self.stream_llm_call(
-                        messages,
-                        temperature=temperature,
-                        max_tokens=ditch_max,
-                        auto_compress=auto_compress,
-                        tools=tools,
-                        response_format=response_format,
-                        extra_params=ditch_params,
-                        _last_ditch=True,
+                # P5-1（2026-10-04）：救援序列——原样失败后依次：
+                # ①一搏（关思考+预算减半）②退避15s+纯文本（去 tools）
+                # ③退避30s+纯文本。过载窗口通常 <2 分钟，退避扛过即恢复
+                # （生产实证 1fe2d9ce：过载空响应 2-4 秒/轮，30 秒即止损夭折）。
+                rescue_plans = [
+                    {"backoff": 0, "plain_text": False, "label": "关思考+预算减半"},
+                    {"backoff": self._empty_response_backoff(1), "plain_text": True,
+                     "label": "退避15s+纯文本"},
+                    {"backoff": self._empty_response_backoff(2), "plain_text": True,
+                     "label": "退避30s+纯文本"},
+                ]
+                for _plan in rescue_plans:
+                    if _plan["backoff"]:
+                        logger.warning(
+                            f"[{self.name}] 空响应救援：退避 {_plan['backoff']}s 后"
+                            f"以{_plan['label']}重试"
+                        )
+                        await asyncio.sleep(_plan["backoff"])
+                    else:
+                        logger.warning(
+                            f"[{self.name}] 空响应救援：{_plan['label']}重试一次"
+                        )
+                    await self.emit_event(
+                        "warning",
+                        f"检测到空响应，自动以{_plan['label']}重试（救援 {rescue_plans.index(_plan) + 1}/3）",
                     )
-                    # I1（审查 2026-09-29）：累加而非覆盖——第一遍消耗的
-                    # prompt/completion tokens 必须计入调用方 token 预算记账
-                    total_tokens += ditch_tokens
-                    accumulated = ditch_acc
-                    if accumulated and accumulated.strip():
-                        self._last_empty_kind = None
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # 一搏失败不致命，按原空响应收尾
-                    logger.warning(
-                        f"[{self.name}] 最后一搏重试失败（{exc!r}），按空响应收尾"
-                    )
+                    _plan_params: Dict[str, Any] = dict(ditch_params)
+                    _plan_tools = None if _plan["plain_text"] else tools
+                    try:
+                        ditch_acc, ditch_tokens = await self.stream_llm_call(
+                            messages,
+                            temperature=temperature,
+                            max_tokens=ditch_max,
+                            auto_compress=auto_compress,
+                            tools=_plan_tools,
+                            response_format=response_format,
+                            extra_params=_plan_params,
+                            _last_ditch=True,
+                        )
+                        # I1（审查 2026-09-29）：累加而非覆盖——全部救援尝试的
+                        # tokens 都计入调用方 token 预算记账
+                        total_tokens += ditch_tokens
+                        accumulated = ditch_acc
+                        if accumulated and accumulated.strip():
+                            self._last_empty_kind = None
+                            break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # 救援失败不致命，继续下一档或按空响应收尾
+                        logger.warning(
+                            f"[{self.name}] 空响应救援失败（{_plan['label']}，{exc!r}）"
+                        )
 
         # sandbox-verification-hard-gate Task 14：每轮 LLM 调用落 trace
         # （每轮一次而非每 chunk；取消路径 re-raise 不经过此处，不记账）。
@@ -1687,7 +1709,7 @@ class BaseAgent(ABC):
     # Qwen3.8-27B 思考流吃光 max_tokens 属系统性工况——重试大概率同样截断，
     # 既有累计 5 次上限会空转 5 轮（每轮约 100 秒 / 4k-10k tokens）才兜底。
     # 连续 3 轮 truncated 即止损，非空轮重置计数（模型恢复即重新计数）。
-    TRUNCATED_EMPTY_STOP_LIMIT = 3
+    TRUNCATED_EMPTY_STOP_LIMIT = 5
 
     # L2（2026-09-26）：生成崩坏萌芽检测阈值。模型采样崩坏（字符墙/循环）
     # 概率性发生（梯度实验实证蓝鉴侧输入无法消除），萌芽即掐断本轮静默重试，
@@ -1862,6 +1884,12 @@ class BaseAgent(ABC):
     def reset_empty_streak(self) -> None:
         """非空轮（正常产出正文/工具调用）调用：重置连续 truncated 计数。"""
         self._truncated_empty_streak = 0
+
+    @staticmethod
+    def _empty_response_backoff(attempt: int) -> int:
+        """P5-1（2026-10-04）：空响应救援退避秒数。过载窗口通常 <2 分钟，
+        退避拉开空响应间隔扛过窗口（1→15s、2→30s、≥3→60s 封顶）。"""
+        return min(15 * (2 ** max(0, attempt - 1)), 60)
 
     _MISSING_ARG_PATTERN = re.compile(r"missing \d+ required positional arguments?: '([\w_]+)'")
 

@@ -21,6 +21,13 @@ from app.services.agent.agents.base import AgentConfig, AgentPattern, AgentType
 from app.services.agent.agents.recon import ReconAgent
 
 
+@pytest.fixture(autouse=True)
+def _patch_base_sleep(monkeypatch):
+    """P5-1：救援退避 sleep mock（防真睡 45s）。"""
+    import app.services.agent.agents.base as _base_mod
+    monkeypatch.setattr(f"{_base_mod.__name__}.asyncio.sleep", AsyncMock())
+
+
 def _make_agent() -> ReconAgent:
     agent = ReconAgent.__new__(ReconAgent)
     agent.config = AgentConfig(
@@ -86,13 +93,15 @@ class TestLastDitchEmptyRetry:
     def test_second_attempt_empty_still_returns_empty(self):
         agent = _make_agent()
         captured: List[Dict[str, Any]] = []
+        # P5-1 救援序列：原样 + 一搏 + 退避15s 纯文本 + 退避30s 纯文本 = 4 次
         self._agent_with_scripted_streams(
-            agent, [_stream_with(""), _stream_with("")], captured)
+            agent, [_stream_with("") for _ in range(4)], captured)
         out, _ = asyncio.run(agent.stream_llm_call(
             [{"role": "user", "content": "hi"}], max_tokens=1024))
         assert out.strip() == ""
-        assert len(captured) == 2
+        assert len(captured) == 4, "P5-1 救援序列：原样+一搏+两轮退避 = 4 次调用"
         assert captured[1]["max_tokens"] == max(512, 1024 // 2)
+        # P5-1：救援扩展为 4 段，tokens 累加（4 次空响应 × usage 记账）
 
     def test_tool_calls_round_not_treated_as_empty(self):
         agent = _make_agent()
