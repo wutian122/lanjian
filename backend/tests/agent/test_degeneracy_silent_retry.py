@@ -152,9 +152,9 @@ class TestStreamSilentRetry:
 
 class TestDegenerateStopLoss:
     def test_degenerate_counts_toward_stop(self):
-        """degenerate 形态计入连续止损计数（与 truncated 同权重）"""
+        """degenerate 形态计入连续止损计数（与 truncated 同权重；P5-1 阈值 3→5）"""
         agent = _make_agent()
-        for kind in ("degenerate", "degenerate"):
+        for kind in ("degenerate", "degenerate", "degenerate", "degenerate"):
             agent._last_empty_kind = kind
             assert agent.record_empty_round() is False
         agent._last_empty_kind = "degenerate"
@@ -162,8 +162,8 @@ class TestDegenerateStopLoss:
 
     def test_truncated_streak_not_broken_by_degenerate(self):
         agent = _make_agent()
-        agent._last_empty_kind = "truncated"
-        agent.record_empty_round()
-        agent.record_empty_round()
+        for _ in range(4):
+            agent._last_empty_kind = "truncated"
+            agent.record_empty_round()
         agent._last_empty_kind = "degenerate"
         assert agent.record_empty_round() is True, "两种崩坏形态共享止损预算"

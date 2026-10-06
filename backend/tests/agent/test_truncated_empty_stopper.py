@@ -29,14 +29,14 @@ def _make_agent() -> OrchestratorAgent:
 
 class TestTruncatedEmptyStopper:
     def test_three_consecutive_truncated_hits_limit(self):
-        """连续 3 轮 truncated 空响应 → 第 3 轮触发止损"""
+        """P5-1：连续 5 轮 truncated 空响应 → 第 5 轮触发止损（阈值 3→5）"""
         agent = _make_agent()
         results = []
-        for _ in range(3):
+        for _ in range(5):
             agent._last_empty_kind = "truncated"
             results.append(agent.record_empty_round())
 
-        assert results == [False, False, True]
+        assert results == [False, False, False, False, True]
 
     def test_reasoning_only_does_not_count(self):
         """reasoning_only 形态不计入连续 truncated（沿用既有 5 次累计上限）"""
@@ -47,9 +47,11 @@ class TestTruncatedEmptyStopper:
         assert agent.record_empty_round() is False
         agent._last_empty_kind = "other"
         assert agent.record_empty_round() is False
-        # reasoning_only / other 不打断也不累加 truncated 连续计数
-        agent._last_empty_kind = "truncated"
-        assert agent.record_empty_round() is False
+        # reasoning_only / other 不打断也不累加 truncated 连续计数：
+        # truncated 总共 5 次（1+3），第 5 次触发止损
+        for _ in range(3):
+            agent._last_empty_kind = "truncated"
+            assert agent.record_empty_round() is False
         agent._last_empty_kind = "truncated"
         assert agent.record_empty_round() is True
 
@@ -62,10 +64,9 @@ class TestTruncatedEmptyStopper:
         # 模型恢复：一轮正常产出
         agent.reset_empty_streak()
         # 再次进入 truncated 空响应：重新计数
-        agent._last_empty_kind = "truncated"
-        assert agent.record_empty_round() is False
-        agent._last_empty_kind = "truncated"
-        assert agent.record_empty_round() is False
+        for _ in range(4):
+            agent._last_empty_kind = "truncated"
+            assert agent.record_empty_round() is False
         agent._last_empty_kind = "truncated"
         assert agent.record_empty_round() is True
 
@@ -73,4 +74,4 @@ class TestTruncatedEmptyStopper:
         """止损方法挂在 BaseAgent（recon/analysis/verification 同样受保护）"""
         assert hasattr(BaseAgent, "record_empty_round")
         assert hasattr(BaseAgent, "reset_empty_streak")
-        assert BaseAgent.TRUNCATED_EMPTY_STOP_LIMIT == 3
+        assert BaseAgent.TRUNCATED_EMPTY_STOP_LIMIT == 5
