@@ -1592,15 +1592,25 @@ class OrchestratorAgent(BaseAgent):
                     # 系统性工况下重试大概率同样截断，避免每轮约 100 秒的空转烧资源
                     # （2026-09-26 生产实证：任务 c0c6182f 连续 6 轮空转后才兜底）
                     if self.record_empty_round():
-                        logger.error(
-                            f"[{self.name}] 连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 "
-                            "输出预算被思考流耗尽（truncated 空响应），止损停止重试"
+                        # P5-3（2026-10-04）：按形态如实归因——usage 全 0 =
+                        # 调用未达模型（服务过载 abort/瞬时故障），非"思考流耗尽"
+                        if self._is_overload_suspected(getattr(self, "_last_round_usage", None)):
+                            _stop_reason = (
+                                f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 LLM 返回空响应"
+                                "（疑似服务过载或网络异常，调用未达模型）"
+                            )
+                            _advice = "建议稍后点击重新审计，或检查 LLM 服务状态"
+                        else:
+                            _stop_reason = (
+                                f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮输出被截断且正文为空"
+                            )
+                            _advice = "建议调大 max_tokens 或精简任务描述"
+                        logger.error(f"[{self.name}] {_stop_reason}，止损停止重试")
+                        self._record_gate_observation(
+                            "llm_empty_response_streak",
+                            f"{_stop_reason}，编排提前收口，仅 Semgrep 兜底候选可用。{_advice}",
                         )
-                        await self.emit_event(
-                            "error",
-                            f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 LLM 输出预算被思考流耗尽，"
-                            "已止损停止重试（建议为模型关闭思考模式或调大 max_tokens）",
-                        )
+                        await self.emit_event("error", f"{_stop_reason}，已止损。{_advice}")
                         break
                     empty_retry_count = getattr(self, '_empty_retry_count', 0) + 1
                     self._empty_retry_count = empty_retry_count

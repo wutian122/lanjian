@@ -1276,6 +1276,8 @@ class BaseAgent(ABC):
         llm_start = time.monotonic()
         # 每轮调用开始时重置截断标志（仅反映"最近一轮"是否被 length 截断）
         self._last_llm_truncated = False
+        # P5-3：本轮 usage 快照（供空响应止损归因——usage 全 0 = 疑似过载）
+        self._last_round_usage = None
         # 本轮是否发生过最后一搏（I2：决定外层是否跳过 trace 记账）
         ditch_happened = False
         # Task 20：每轮重置空响应形态（与截断标志同生命周期）
@@ -1419,6 +1421,10 @@ class BaseAgent(ABC):
                                 # Task 14：token 拆分落 trace（usage 缺失时保持 0）
                                 prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
                                 completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+                                self._last_round_usage = {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                }
                             # 截断可见化：finish_reason=length 时告警 + 历史提示 + 置位标志
                             if chunk.get("finish_reason") == "length":
                                 self._last_llm_truncated = True
@@ -1437,6 +1443,10 @@ class BaseAgent(ABC):
                                 total_tokens = chunk["usage"].get("total_tokens", 0)
                                 prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
                                 completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+                                self._last_round_usage = {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                }
 
                             # 使用特殊前缀标记 API 错误，让调用方能够识别
                             # 格式：[API_ERROR:error_type] user_message
@@ -1884,6 +1894,18 @@ class BaseAgent(ABC):
     def reset_empty_streak(self) -> None:
         """非空轮（正常产出正文/工具调用）调用：重置连续 truncated 计数。"""
         self._truncated_empty_streak = 0
+
+    @staticmethod
+    def _is_overload_suspected(usage: Any) -> bool:
+        """P5-3（2026-10-04）：usage 全 0/缺失 = 调用未达模型（服务过载
+        abort/瞬时故障），区别于真实生成后截断。生产实证 1fe2d9ce：
+        过载轮 prompt=0/compl=0。"""
+        if not usage:
+            return True
+        try:
+            return not (usage.get("prompt_tokens") or usage.get("completion_tokens"))
+        except AttributeError:
+            return True
 
     @staticmethod
     def _empty_response_backoff(attempt: int) -> int:
