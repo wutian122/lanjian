@@ -362,6 +362,43 @@ def _should_nudge_submit(iteration: int, max_iterations: int, *, has_candidates:
     return iteration == max_iterations // 2 + 1 or (iteration - max_iterations // 2) % 5 == 0
 
 
+_SEMGREP_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _render_semgrep_section(semgrep_findings: list) -> str:
+    """P7-3（2026-10-07）：渲染 Semgrep 命中注入段（键名修复+severity 排序）。
+
+    生产实证（B 机 c8686a20）：旧渲染读 rule_id/check_id 而预扫实际存
+    semgrep_rule_id → 规则列恒"?"；15 条截断无排序，高价值命中可能被丢。
+    修复：解析 semgrep_rule_id 键、显示 severity、按 severity 降序取前 15。
+    """
+    ranked = sorted(
+        (sf for sf in (semgrep_findings or []) if isinstance(sf, dict)),
+        key=lambda sf: _SEMGREP_SEVERITY_RANK.get(
+            str(sf.get("severity") or "").strip().lower(), 0
+        ),
+        reverse=True,
+    )
+    section = "\n## 🔬 Semgrep 预扫描结果（精确定位，请优先验证）\n"
+    section += "以下是由 Semgrep 静态分析识别的潜在安全问题（按严重度排序），每个条目包含精确的文件、行号和规则 ID。\n"
+    section += "请使用 read_file 验证这些问题是否真实存在。\n\n"
+    for sf in ranked[:15]:
+        sf_file = sf.get("file_path", sf.get("path", "?"))
+        sf_line = sf.get("line_start", sf.get("line", "?"))
+        sf_rule = (
+            sf.get("semgrep_rule_id")
+            or sf.get("rule_id")
+            or sf.get("check_id")
+            or "?"
+        )
+        sf_sev = str(sf.get("severity") or "?").strip().lower()
+        sf_msg = str(sf.get("message", sf.get("description", sf.get("title", ""))))[:80]
+        section += f"- `{sf_file}:{sf_line}` [{sf_rule}] ({sf_sev}) {sf_msg}\n"
+    if len(ranked) > 15:
+        section += f"- ... 还有 {len(ranked) - 15} 条 Semgrep 发现\n"
+    return section
+
+
 _FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
 
 即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
@@ -1109,20 +1146,9 @@ class AnalysisAgent(BaseAgent):
         if trace_summary:
             initial_message += f"\n## 📋 此前执行轨迹摘要（避免重复劳动）\n{trace_summary}\n"
 
-        # ✅ P1-4: 注入 Semgrep 精确定位信息
+        # ✅ P1-4: 注入 Semgrep 精确定位信息（P7-3：键名修复+severity 排序）
         if semgrep_findings:
-            semgrep_section = "\n## 🔬 Semgrep 预扫描结果（精确定位，请优先验证）\n"
-            semgrep_section += "以下是由 Semgrep 静态分析识别的潜在安全问题，每个条目包含精确的文件、行号和规则 ID。\n"
-            semgrep_section += "请使用 read_file 验证这些问题是否真实存在。\n\n"
-            for sf in semgrep_findings[:15]:
-                sf_file = sf.get("file_path", sf.get("path", "?"))
-                sf_line = sf.get("line", sf.get("line_start", "?"))
-                sf_rule = sf.get("rule_id", sf.get("check_id", "?"))
-                sf_msg = sf.get("message", sf.get("title", ""))[:80]
-                semgrep_section += f"- `{sf_file}:{sf_line}` [{sf_rule}] {sf_msg}\n"
-            if len(semgrep_findings) > 15:
-                semgrep_section += f"- ... 还有 {len(semgrep_findings) - 15} 条 Semgrep 发现\n"
-            initial_message += semgrep_section
+            initial_message += _render_semgrep_section(semgrep_findings)
 
         # 🔥 记录工作开始
         self.record_work("开始安全漏洞分析")

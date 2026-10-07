@@ -252,6 +252,44 @@ _SEMGREP_FALLBACK_SEVERITY_ORDER: dict[str, int] = {
 _SEMGREP_FALLBACK_MIN_SEVERITY_RANK = 2  # medium
 
 
+def _build_semgrep_hot_lead(semgrep_findings: list) -> str:
+    """P7-3（2026-10-07）：Semgrep 热点线索注入文本（带规则号/行号/severity）。
+
+    生产实证（B 机 c8686a20）：旧注入仅前 20 个路径（无规则号/行号），
+    LLM 无法据此精准定位；且无序截断可能丢高价值命中。修复：按 severity
+    降序、带 `path:line [rule] (severity)` 格式、取前 20。
+    """
+    hits = [sf for sf in (semgrep_findings or []) if isinstance(sf, dict)]
+    ranked = sorted(
+        hits,
+        key=lambda sf: _SEMGREP_FALLBACK_SEVERITY_ORDER.get(
+            str(sf.get("severity") or "medium").strip().lower(),
+            _SEMGREP_FALLBACK_MIN_SEVERITY_RANK,
+        ),
+        reverse=True,
+    )
+    lines = []
+    for sf in ranked[:20]:
+        fp = sf.get("file_path", sf.get("path", "?"))
+        ln = sf.get("line_start", sf.get("line", "?"))
+        rule = (
+            sf.get("semgrep_rule_id")
+            or sf.get("rule_id")
+            or sf.get("check_id")
+            or "?"
+        )
+        sev = str(sf.get("severity") or "?").strip().lower()
+        lines.append(f"- `{fp}:{ln}` [{rule}] ({sev})")
+    hot_files_summary = "\n".join(lines)
+    return (
+        f"## 🔍 Semgrep 预扫描线索\n\n"
+        f"Semgrep 已完成确定性扫描，识别出 {len(hits)} 条潜在问题（按严重度排序，前 20 条）:\n"
+        f"{hot_files_summary}\n\n"
+        f"**重要**：这些是 Semgrep 的初步发现，必须由 Analysis Agent 深度验证后才能确认为漏洞。\n"
+        f"请调度 Recon Agent 收集这些热点文件的结构信息，再调度 Analysis Agent 进行深度审计。"
+    )
+
+
 def _is_verifiable_semgrep_candidate(candidate: dict[str, Any]) -> bool:
     """F1: 兜底候选是否值得送沙箱——类型有确定性 PoC 专用模板且 severity ≥ medium。
 
@@ -648,6 +686,50 @@ class OrchestratorAgent(BaseAgent):
         if extra:
             entry.update(extra)
         self._gate_observations.append(entry)
+
+    def _register_semgrep_leads_observation(self) -> None:
+        """P7-2（2026-10-07）：Semgrep 预扫命中全量留痕（幂等）。
+
+        生产实证（B 机 c8686a20）：预扫 129→去重 82 命中，Analysis 有产出时
+        兜底通道整条短路——80 条未采纳命中在正常路径零记录（审计链黑洞）。
+        本方法无论 Analysis 是否有产出，收口时把全部命中的统计+明细写入
+        gate observation "semgrep_leads"，报告段复用「未验证静态线索」渲染。
+        """
+        if getattr(self, "_semgrep_leads_registered", False):
+            return
+        self._semgrep_leads_registered = True
+        hits = [f for f in (self._semgrep_findings or []) if isinstance(f, dict)]
+        if not hits:
+            return
+        adopted_files = {
+            (f.get("file_path") or "").strip().lower()
+            for f in (self._all_findings or [])
+            if isinstance(f, dict) and f.get("file_path")
+        }
+        candidates = []
+        adopted = 0
+        for h in hits:
+            fp = (h.get("file_path") or "").strip()
+            if fp.lower() in adopted_files:
+                adopted += 1
+            candidates.append({
+                "file_path": fp,
+                "line": h.get("line_start") or 0,
+                "title": str(h.get("semgrep_rule_id") or h.get("title") or "semgrep-hit")[:120],
+                "type": str(h.get("vulnerability_type") or "other"),
+            })
+        self._record_gate_observation(
+            "semgrep_leads",
+            f"Semgrep 预扫 {len(hits)} 条命中：{adopted} 条被 AI 采纳分析，"
+            f"{len(hits) - adopted} 条未采纳（明细见下，供人工复核）",
+            extra={"candidates": candidates[:50],
+                   "counts": {"hits": len(hits), "adopted": adopted,
+                              "unadopted": len(hits) - adopted}},
+        )
+        logger.info(
+            f"[Orchestrator] Semgrep leads registered: {len(hits)} hits, "
+            f"{adopted} adopted, {len(hits) - adopted} unadopted (observations)"
+        )
 
     async def _maybe_dispatch_force_verification(self) -> None:
         """T6 (REQ-VC-2): R4 放行前的程序化收口——补发一次 verification 调度。
@@ -1449,14 +1531,8 @@ class OrchestratorAgent(BaseAgent):
                     logger.warning(f"[Orchestrator] Semgrep prescan failed (non-fatal): {e}")
 
                 if self._semgrep_hot_files:
-                    hot_files_summary = ", ".join(self._semgrep_hot_files[:20])
-                    semgrep_lead = (
-                        f"## 🔍 Semgrep 预扫描线索\n\n"
-                        f"Semgrep 已完成确定性扫描，识别出 {len(self._semgrep_hot_files)} 个热点文件（含潜在安全问题）。\n"
-                        f"**热点文件列表**（前20个）:\n{hot_files_summary}\n\n"
-                        f"**重要**：这些是 Semgrep 的初步发现，必须由 Analysis Agent 深度验证后才能确认为漏洞。\n"
-                        f"请调度 Recon Agent 收集这些热点文件的结构信息，再调度 Analysis Agent 进行深度审计。"
-                    )
+                    # P7-3：注入带规则号/行号/severity 的命中明细（原为纯路径列表）
+                    semgrep_lead = _build_semgrep_hot_lead(self._semgrep_findings)
                     self._conversation_history.append({
                         "role": "user",
                         "content": semgrep_lead,
@@ -1905,6 +1981,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                 # 执行 LLM 决定的操作
                 if step.action == "finish":
+                    # P7-2：收口前登记 Semgrep 命中全量留痕（幂等，正常路径也记）
+                    self._register_semgrep_leads_observation()
                     # Task 11 (finding-output-floor): finish 前兜底——Analysis 达调度
                     # 上限或产出下限违规时，Semgrep 预扫发现兜底落库（幂等）；仍无
                     # 可验证产出则按覆盖不足语义收口（completed_with_gaps）。
