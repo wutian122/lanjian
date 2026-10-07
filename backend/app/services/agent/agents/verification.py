@@ -108,6 +108,44 @@ _LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
 }
 
 
+_VULN_TYPE_ALIASES = {
+    "sqli": "sql_injection",
+    "sql": "sql_injection",
+    "xss": "xss",
+    "rce": "command_injection",
+    "cmd": "command_injection",
+    "command": "command_injection",
+    "r.c.e": "command_injection",
+    "pathtrav": "path_traversal",
+    "path_traversal": "path_traversal",
+    "lfi": "path_traversal",
+    "ssrf": "ssrf",
+    "deserialization": "deserialization",
+    "deser": "deserialization",
+    "xxe": "xxe",
+    "insecure_cookie": "insecure_cookie",
+    "cookie": "insecure_cookie",
+    "expression_injection": "expression_injection",
+    "el_injection": "expression_injection",
+    "ssti": "expression_injection",
+}
+
+
+def normalize_vuln_type(raw: str) -> str:
+    """P7-4（2026-10-07）：漏洞类型规范化（保存路径与 PoC 路径共用唯一入口）。
+
+    生产实证：两处各自实现且不一致（空格/别名在 PoC 路径漏规范化，
+    33% 候选落入通用模板空转）。
+    """
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in _VULN_TYPE_ALIASES.values():
+        return key
+    for alias, canonical in _VULN_TYPE_ALIASES.items():
+        if key == alias or key.startswith(alias + "_"):
+            return canonical
+    return "other"
+
+
 def _language_sink_patterns(vuln_type: str, file_path: str) -> list[str]:
     """REQ-VP-1: 按目标文件扩展名返回该语言的危险 sink 检测 pattern 列表。"""
     ext = ""
@@ -3257,7 +3295,10 @@ class VerificationAgent(BaseAgent):
         from uuid import uuid4
         commands = []
         for i, f in enumerate(findings):
-            vuln_type = (f.get('vulnerability_type') or '').lower()
+            # P7-4：PoC 路径与保存路径共用规范化（原为各自实现，别名漏匹配）
+            vuln_type = normalize_vuln_type(
+                str(f.get('vulnerability_type') or 'other')
+            )
             file_path = f.get('file_path', 'unknown')
             line = f.get('line_start', 0)
             title = f.get('title', '')
@@ -3267,6 +3308,10 @@ class VerificationAgent(BaseAgent):
             f["_sandbox_finding_id"] = finding_id
 
             cmd = self._gen_sandbox_command(vuln_type, file_path, line, title, i)
+            # P7-4：子串/默认匹配返回 {'label':..., 'input': {'command':...}} 包装，
+            # 精确命中直接返回 {'command':...}——统一 unwrap 后处理
+            if cmd and "command" not in cmd and isinstance(cmd.get("input"), dict):
+                cmd = cmd["input"]
             if cmd:
                 # Opt-1: Embed finding_id as comment in the command
                 original_command = cmd.get("command", "")
@@ -3302,6 +3347,52 @@ class VerificationAgent(BaseAgent):
         sink_regex = "|".join(sink_patterns) if sink_patterns else "noop_never_match"
 
         cmd_templates = {
+            'insecure_cookie': {
+                'command': (
+                    f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
+                    f"import os, re, sys\n"
+                    f"print('=== SANDBOX Cookie Security Verification ===')\n"
+                    f"print('Target: {file_ref}')\n"
+                    f"src_path = '/workspace/src/{safe_path}'\n"
+                    "if not os.path.exists(src_path):\n"
+                    "    print('SOURCE_NOT_FOUND'); sys.exit(2)\n"
+                    "with open(src_path) as fh: content = fh.read()\n"
+                    "issues = []\n"
+                    "# 语义匹配：检查 cookie 安全标志的显式设置\n"
+                    "for flag, pat in [\n"
+                    "    ('HttpOnly', r'setHttpOnly\\\\s*\\\\(\\\\s*(?:true|1)'),\n"
+                    "    ('Secure', r'setSecure\\\\s*\\\\(\\\\s*(?:true|1)'),\n"
+                    "]:\n"
+                    "    if not re.search(pat, content, re.I):\n"
+                    "        issues.append(flag)\n"
+                    "if issues:\n"
+                    "    print(f'STATIC_CONFIRMED: cookie missing flags: {issues}')\n"
+                    "else:\n"
+                    "    print('NO_ISSUE: HttpOnly/Secure flags explicitly set (false_positive)')\n"
+                    "print('=== Verification Complete ===')\n"
+                    "POC_EOF\npython3 /tmp/poc_%d.py" % index
+                )
+            },
+            'expression_injection': {
+                'command': (
+                    f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
+                    f"import os, re, sys\n"
+                    f"print('=== SANDBOX Expression Injection Verification ===')\n"
+                    f"print('Target: {file_ref}')\n"
+                    f"src_path = '/workspace/src/{safe_path}'\n"
+                    "if not os.path.exists(src_path):\n"
+                    "    print('SOURCE_NOT_FOUND'); sys.exit(2)\n"
+                    "with open(src_path) as fh: content = fh.read()\n"
+                    "# 语义匹配：检查动态表达式求值入口是否接收外部可控输入\n"
+                    "sinks = re.findall(r'\\.(?:eval|evaluate|getValue|invoke)\\s*\\(', content)\n"
+                    "if sinks:\n"
+                    "    print(f'STATIC_CONFIRMED: dynamic expression sinks found: {len(sinks)}')\n"
+                    "else:\n"
+                    "    print('NO_SINK: no dynamic expression evaluation found')\n"
+                    "print('=== Verification Complete ===')\n"
+                    "POC_EOF\npython3 /tmp/poc_%d.py" % index
+                )
+            },
             'sql_injection': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
@@ -3864,6 +3955,21 @@ class VerificationAgent(BaseAgent):
                     break
 
         if not matched:
+            # P7-4：非源码语言扩展名（配置/文档类）走 sink-grep 通用模板必然
+            # NO_SINK（grep 的是代码 sink，文件里永远不会有）——无验证价值，
+            # 返回 None（调用方不发命令），避免空跑浪费沙箱预算。
+            _SOURCE_CODE_EXTS = {
+                ".java", ".py", ".js", ".ts", ".jsx", ".tsx", ".php", ".rb",
+                ".go", ".rs", ".c", ".cpp", ".h", ".hpp", ".cs", ".kt",
+                ".scala", ".groovy", ".swift", ".m", ".sh", ".bash",
+            }
+            _ext = os.path.splitext(safe_path)[1].lower()
+            if _ext and _ext not in _SOURCE_CODE_EXTS:
+                logger.info(
+                    f"[Verification] 跳过 sink-grep PoC：目标 {safe_path} 非源码"
+                    "（配置/文档类，无有效静态验证模式）"
+                )
+                return None
             matched = {
                 'label': f'发现{index+1}: {vuln_type} ({file_ref})',
                 'input': {
