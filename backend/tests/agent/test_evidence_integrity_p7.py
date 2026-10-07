@@ -28,9 +28,12 @@ class TestExecutableCommandGuard:
     def test_action_description_rejected(self):
         assert _is_executable_command("check setHttpOnly flag in source") is False
 
-    def test_empty_and_short_rejected(self):
+    def test_empty_rejected_short_real_accepted(self):
+        # P8：空串拒；短真实命令（"ls"）不再因长度被误伤
         assert _is_executable_command("") is False
-        assert _is_executable_command("ls") is False
+        assert _is_executable_command("ls") is True
+        # 短描述句仍拒
+        assert _is_executable_command("check the file") is False
 
     def test_real_poc_command_accepted(self):
         real = (

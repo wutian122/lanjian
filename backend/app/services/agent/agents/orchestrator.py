@@ -722,7 +722,8 @@ class OrchestratorAgent(BaseAgent):
             "semgrep_leads",
             f"Semgrep 预扫 {len(hits)} 条命中：{adopted} 条被 AI 采纳分析，"
             f"{len(hits) - adopted} 条未采纳（明细见下，供人工复核）",
-            extra={"candidates": candidates[:50],
+            # P8：明细全量留痕（原 [:50] 截断致 32 条命中无记录）
+            extra={"candidates": candidates,
                    "counts": {"hits": len(hits), "adopted": adopted,
                               "unadopted": len(hits) - adopted}},
         )
@@ -2936,20 +2937,26 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         # 🔥 v3.0: 提取 Action Input（更宽松的匹配）
         input_match = re.search(r'Action Input:\s*(.*?)(?=\n(?:Thought:|Action:|Observation:)|$)', cleaned_response, re.DOTALL)
         if not input_match:
-            logger.warning(f"[{self.name}] 解析失败：未找到 Action Input 字段")
-            logger.debug(f"[{self.name}] Action: {action}, 响应内容（前500字符）: {cleaned_response[:500]}")
-            return None
-
-        input_text = input_match.group(1).strip()
-        # 移除 markdown 代码块
-        input_text = re.sub(r'```json\s*', '', input_text)
-        input_text = re.sub(r'```\s*', '', input_text)
-
-        # 使用增强的 JSON 解析器
-        action_input = AgentJsonParser.parse(
-            input_text,
-            default={"raw": input_text}
-        )
+            # P8（2026-10-07）：无参数动作（finish/summarize）允许省略
+            # Action Input——LLM 的合理输出不得判格式失败（生产实证裸
+            # 'Action: finish' 被误判，触发无谓静默重试）
+            if action.strip().lower() in {"finish", "summarize"}:
+                input_text = ""
+                action_input: Any = {}
+            else:
+                logger.warning(f"[{self.name}] 解析失败：未找到 Action Input 字段")
+                logger.debug(f"[{self.name}] Action: {action}, 响应内容（前500字符）: {cleaned_response[:500]}")
+                return None
+        else:
+            input_text = input_match.group(1).strip()
+            # 移除 markdown 代码块
+            input_text = re.sub(r'```json\s*', '', input_text)
+            input_text = re.sub(r'```\s*', '', input_text)
+            # 使用增强的 JSON 解析器
+            action_input = AgentJsonParser.parse(
+                input_text,
+                default={"raw": input_text}
+            )
 
         logger.debug(f"[{self.name}] 解析成功: action={action}, input_keys={list(action_input.keys()) if isinstance(action_input, dict) else 'not_dict'}")
 

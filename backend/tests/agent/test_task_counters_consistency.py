@@ -55,6 +55,7 @@ class TestRecalcCountersFromDB:
             _mock_scalar(5),  # files_with_findings distinct
             _mock_scalar(2),  # verified_count
             _mock_scalar(0),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
         assert task.critical_count == 1
@@ -72,6 +73,7 @@ class TestRecalcCountersFromDB:
             _mock_scalar(0),
             _mock_scalar(0),
             _mock_scalar(0),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
         assert task.critical_count == 0
@@ -89,6 +91,7 @@ class TestRecalcCountersFromDB:
             _mock_scalar(3),  # 3 个去重文件
             _mock_scalar(1),
             _mock_scalar(0),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
         assert task.files_with_findings == 3
@@ -107,6 +110,7 @@ class TestRecalcCountersFromDB:
             _mock_scalar(1),
             _mock_scalar(0),  # DB 层已排除 not_reproducible
             _mock_scalar(0),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
         assert task.verified_count == 0
@@ -121,6 +125,7 @@ class TestRecalcCountersFromDB:
             _mock_scalar(2),
             _mock_scalar(2),
             _mock_scalar(0),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
         assert task.verified_count == 2

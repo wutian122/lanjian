@@ -207,17 +207,27 @@ _NEGATIVE_EVIDENCE_MARKERS = (
 
 
 def _is_executable_command(command: str) -> bool:
-    """P7-1：命令可执行性守卫（拒占位符/动作描述，放行真实 PoC 命令）。"""
+    """P7-1：命令可执行性守卫（拒占位符/动作描述，放行真实 PoC 命令）。
+
+    P8 修正：旧实现 ``len < 15 直接拒`` 误伤真实短命令（"echo 1" 仅 6 字符），
+    导致其被从 finding 的 attempts 中剔除。判据改为**精确识别两类非执行文本**：
+    1. 含裸省略号（``...``/``…``）——占位符的典型形态
+       （``python3 -c "... check setHttpOnly ..."``）；
+    2. 纯自然语言祈使句（check/verify/analyze 等开头、且无任何代码/shell 结构）
+       ——动作描述（"check setHttpOnly flag in source"）。
+    """
     cmd = (command or "").strip()
-    if len(cmd) < 15:
+    if not cmd:
         return False
     if "..." in cmd or "…" in cmd:
         return False
-    # 纯动作描述（无引号/换行/重定向/管道等任何代码或 shell 结构）判不可执行
-    has_code_structure = any(tok in cmd for tok in (
-        "\n", '"', "'", ">", "|", "(", ")", "=", "{", ";", "/",
-    ))
-    return has_code_structure
+    first_word = cmd.split(None, 1)[0].lower()
+    _DESC_VERBS = {"check", "verify", "analyze", "inspect", "review", "examine"}
+    if first_word in _DESC_VERBS:
+        # 含代码结构（引号/重定向/管道/换行）则可能是真实命令片段，放行
+        if not any(tok in cmd for tok in ('"', "'", "|", ">", "\n", "(", "=")):
+            return False
+    return True
 
 
 def _marker_negated(evidence_lower: str) -> bool:
@@ -2734,21 +2744,25 @@ class VerificationAgent(BaseAgent):
                 verified_findings.append(target)
                 if fp:
                     seen_paths[fp] = target
-            if not target.get("sandbox_attempts"):
-                self._attach_runtime_sandbox_attempts(target)
-                # 证据可能改变状态（needs_context → confirmed/not_reproducible），重新归一化
-                if target.get("sandbox_attempts"):
-                    strict = self._normalize_verification_outcome(target)
-                    target.clear()
-                    target.update(strict)
-                elif not target.get("verification_status"):
-                    # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
-                    # 归一化经 compute_verification_status 分支 5 给 needs_context，
-                    # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
-                    # 不得留无状态 finding 出 Agent。
-                    strict = self._normalize_verification_outcome(target)
-                    target.clear()
-                    target.update(strict)
+            # P8（2026-10-07）：原守卫 `if not target.get("sandbox_attempts")`
+            # 导致 LLM 漏报且已携带（劣质）attempts 的 finding 既不补真实运行时
+            # 证据、也不重算状态——生产实证 autoindex finding 状态漂移
+            # （needs_context，按真实确定性证据应为 not_reproducible）。
+            # 运行时确定性证据是权威来源：始终合并（内部按 finding_id 幂等去重，
+            # 含真证据的 LLM attempt 不覆盖），随后始终按合并证据归一化状态。
+            self._attach_runtime_sandbox_attempts(target)
+            if target.get("sandbox_attempts"):
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
+            elif not target.get("verification_status"):
+                # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
+                # 归一化经 compute_verification_status 分支 5 给 needs_context，
+                # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
+                # 不得留无状态 finding 出 Agent。
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
             # 证据同步回待验本体：orig 是 findings_to_verify 元素，与 orchestrator
             # _all_findings 同引用（previous_results["findings"] 直传），绑定落本体后
             # 调度超时/取消走不到 merge 沙箱证据也不丢（生产 9344d5dd 断点 A）。

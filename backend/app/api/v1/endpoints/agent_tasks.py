@@ -1350,8 +1350,18 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                         logger.debug(f"[AgentTask] Finding {i+1}: {f.get('title', 'N/A')[:50]} - {f.get('severity', 'N/A')}")
 
                 # 🔥 v2.1: 传递 project_root 用于文件路径验证
-                saved_count = await _save_findings(db, task_id, findings, project_root=project_root)
-                logger.info(f"[AgentTask] Saved {saved_count}/{len(findings)} findings (filtered {len(findings) - saved_count} hallucinations)")
+                # P8：传入 filtered_observations 列表，被过滤的确认态 finding 留痕于此
+                filtered_observations: list = []
+                saved_count = await _save_findings(
+                    db, task_id, findings,
+                    project_root=project_root,
+                    filtered_observations=filtered_observations,
+                )
+                if filtered_observations:
+                    existing_obs = list(task.observations or [])
+                    existing_obs.extend(filtered_observations)
+                    task.observations = existing_obs
+                logger.info(f"[AgentTask] Saved {saved_count}/{len(findings)} findings (filtered {len(findings) - saved_count}, logged {len(filtered_observations)} confirmed-but-filtered)")
 
                 # 更新任务统计
                 # 🔥 CRITICAL FIX: 在设置完成前再次检查取消状态
@@ -2128,12 +2138,15 @@ async def _save_findings(
     task_id: str,
     findings: list[dict],
     project_root: str | None = None,
+    filtered_observations: list[dict] | None = None,
 ) -> int:
     """
     保存发现到数据库
 
     🔥 增强版：支持多种 Agent 输出格式，健壮的字段映射
     🔥 v2.1: 添加文件路径验证，过滤幻觉发现
+    🔥 P8（2026-10-07）：被过滤的确认态 finding 写入本函数局部
+       filtered_observations 列表，随结果返回供调用方合并进 task.observations。
 
     Args:
         db: 数据库会话
@@ -2144,6 +2157,8 @@ async def _save_findings(
     Returns:
         int: 实际保存的发现数量
     """
+    if filtered_observations is None:
+        filtered_observations = []
     from app.models.agent_task import VulnerabilityType
 
     logger.info(f"[SaveFindings] Starting to save {len(findings)} findings for task {task_id}")
@@ -2212,18 +2227,18 @@ async def _save_findings(
                 finding, reason="context-only recon lead 不进持久化"
             )
             if _fobs:
-                observations_list.append(_fobs)
+                filtered_observations.append(_fobs)
             continue
 
         # B1-fix: strict finding validation - reject findings without file_path, line, or low confidence
         if not is_strict_finding(finding):
             _f_title = str(finding.get("title", "N/A"))[:60]
             logger.info(f"[SaveFindings] Filtered by is_strict_finding: {_f_title}")
-            _fobs = _build_filtered_finding(
+            _fobs = _build_filtered_finding_observation(
                 finding, reason=f"is_strict_finding 校验未通过: {_f_title}"
             )
             if _fobs:
-                observations_list.append(_fobs)
+                filtered_observations.append(_fobs)
             continue
 
 
@@ -2642,6 +2657,13 @@ async def _recalc_task_counters_from_db(db: AsyncSession, task: AgentTask, task_
         AgentFinding.verification_status == VerificationStatus.STATIC_CONFIRMED,
     )
     task.static_confirmed_count = (await db.execute(static_stmt)).scalar() or 0
+
+    # P8：false_positive_count 原为死字段（定义后无写入点）——按落库口径补齐
+    fp_stmt = select(func.count()).where(
+        AgentFinding.task_id == task_id,
+        AgentFinding.verification_status == VerificationStatus.FALSE_POSITIVE,
+    )
+    task.false_positive_count = (await db.execute(fp_stmt)).scalar() or 0
 
 
 async def _get_verification_status_breakdown(db: AsyncSession, task_id: str) -> dict:

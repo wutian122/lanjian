@@ -163,9 +163,10 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker 不可用")
 
-        timeout = timeout or self.config.timeout
+        # P8：LLM 会把 timeout 发成 "30" 字符串，参与算术必 TypeError
+        from ..tools.file_tool import _coerce_int
 
-        # 禁用代理环境变量：从宿主机环境显式剔除代理变量，避免空字符串干扰 pip/curl
+        timeout = _coerce_int(timeout) or self.config.timeout
         _proxy_keys = {
             "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
             "ALL_PROXY", "all_proxy",
@@ -279,7 +280,10 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker 不可用")
 
-        timeout = timeout or self.config.timeout
+        # P8：timeout 字符串强转
+        from ..tools.file_tool import _coerce_int
+
+        timeout = _coerce_int(timeout) or self.config.timeout
 
         # read network mode from config if not specified
         if network_mode is None:
@@ -401,7 +405,9 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker not available")
 
-        timeout = timeout or self.config.timeout
+        from ..tools.file_tool import _coerce_int
+
+        timeout = _coerce_int(timeout) or self.config.timeout
         # 禁用代理环境变量：从宿主机环境剔除代理变量
         _proxy_keys = {
             "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
