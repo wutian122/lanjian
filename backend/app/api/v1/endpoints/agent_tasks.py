@@ -2208,12 +2208,22 @@ async def _save_findings(
                 f"[SaveFindings] Skipping context-only recon lead: "
                 f"{str(finding.get('title', 'N/A'))[:60]}"
             )
+            _fobs = _build_filtered_finding_observation(
+                finding, reason="context-only recon lead 不进持久化"
+            )
+            if _fobs:
+                observations_list.append(_fobs)
             continue
 
         # B1-fix: strict finding validation - reject findings without file_path, line, or low confidence
         if not is_strict_finding(finding):
             _f_title = str(finding.get("title", "N/A"))[:60]
             logger.info(f"[SaveFindings] Filtered by is_strict_finding: {_f_title}")
+            _fobs = _build_filtered_finding(
+                finding, reason=f"is_strict_finding 校验未通过: {_f_title}"
+            )
+            if _fobs:
+                observations_list.append(_fobs)
             continue
 
 
@@ -2450,6 +2460,26 @@ async def _save_findings(
         await db.rollback()
 
     return saved_count
+
+
+def _build_filtered_finding_observation(finding: dict, *, reason: str) -> dict | None:
+    """P7-5（2026-10-07）：验证判确认但落库被过滤的项必须留痕。
+
+    生产实证 L6：verification 判 confirmed/static_confirmed 的项落库被
+    is_strict_finding 过滤后零记录，用户无法解释"验证说 1 确认、落库 0"。
+    非确认态（needs_context 等）被过滤属正常质量门，不专门留痕。
+    """
+    status = str(finding.get("verification_status") or "")
+    if status not in ("confirmed", "static_confirmed"):
+        return None
+    return {
+        "gate": "filtered_confirmed_finding",
+        "time": datetime.now(UTC).isoformat(),
+        "title": str(finding.get("title", ""))[:120],
+        "file_path": str(finding.get("file_path", ""))[:300],
+        "verification_status": status,
+        "reason": reason,
+    }
 
 
 async def _load_saved_findings_for_scoring(db: AsyncSession, task_id: str) -> list[dict]:
@@ -5206,6 +5236,7 @@ def _build_unverified_static_leads_section(observations: list) -> list[str]:
         if obs.get("gate") not in (
             "semgrep_fallback_filtered",
             "semgrep_fallback_unverifiable",
+            "semgrep_leads",  # P7-2：正常路径的预扫命中全量留痕
         ):
             continue
         for cand in obs.get("candidates") or []:

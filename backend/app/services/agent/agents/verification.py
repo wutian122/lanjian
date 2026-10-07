@@ -108,6 +108,14 @@ _LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
 }
 
 
+# P7-4：全部合法 canonical 类型（normalize 必须原样保留；别名表只做映射）
+_CANONICAL_VULN_TYPES = {
+    "sql_injection", "xss", "command_injection", "path_traversal", "ssrf",
+    "deserialization", "xxe", "hardcoded_secret", "insecure_cookie",
+    "expression_injection", "insecure_deserialization", "weak_crypto",
+    "open_redirect", "insecure_configuration", "other",
+}
+
 _VULN_TYPE_ALIASES = {
     "sqli": "sql_injection",
     "sql": "sql_injection",
@@ -131,6 +139,22 @@ _VULN_TYPE_ALIASES = {
 }
 
 
+def _sandbox_command_action_input(sc: dict) -> dict:
+    """P7-4：强制引导所需的 sandbox_exec 参数（兼容扁平/旧包装两结构）。
+
+    扁平化后命令在顶层；旧结构在 sc["input"]。返回含 command/timeout 的
+    参数 dict（sandbox_exec 工具入参）。
+    """
+    if isinstance(sc.get("input"), dict):
+        return sc["input"]
+    action = {}
+    if sc.get("command"):
+        action["command"] = sc["command"]
+    if sc.get("timeout") is not None:
+        action["timeout"] = sc["timeout"]
+    return action
+
+
 def normalize_vuln_type(raw: str) -> str:
     """P7-4（2026-10-07）：漏洞类型规范化（保存路径与 PoC 路径共用唯一入口）。
 
@@ -138,7 +162,7 @@ def normalize_vuln_type(raw: str) -> str:
     33% 候选落入通用模板空转）。
     """
     key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
-    if key in _VULN_TYPE_ALIASES.values():
+    if key in _CANONICAL_VULN_TYPES:
         return key
     for alias, canonical in _VULN_TYPE_ALIASES.items():
         if key == alias or key.startswith(alias + "_"):
@@ -1454,7 +1478,7 @@ class VerificationAgent(BaseAgent):
                     # 构建前3个发现的具体命令
                     cmd_lines = []
                     for sc in sandbox_commands[:3]:
-                        input_json = json.dumps(sc['input'], ensure_ascii=False)
+                        input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                         cmd_lines.append(f"- **{sc['label']}**:\n  Action: sandbox_exec\n  Action Input: {input_json}")
 
                     cmds_text = "\n".join(cmd_lines)
@@ -1471,7 +1495,7 @@ class VerificationAgent(BaseAgent):
                     # 更严厉的警告
                     remaining_cmds = []
                     for sc in sandbox_commands[:5]:
-                        input_json = json.dumps(sc['input'], ensure_ascii=False)
+                        input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                         remaining_cmds.append(f"- Action: sandbox_exec, Action Input: {input_json}")
                     force_msg = (
                         f"🚨 **最终警告 (第{self._iteration}轮)**: 你仍拒绝调用 sandbox_exec！\n\n"
@@ -1620,7 +1644,7 @@ class VerificationAgent(BaseAgent):
                             remaining = sandbox_commands[:3]
                         cmd_lines = []
                         for sc in remaining:
-                            input_json = json.dumps(sc['input'], ensure_ascii=False)
+                            input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                             cmd_lines.append(f"- **{sc['label']}**: Action: sandbox_exec, Action Input: {input_json}")
                         self._conversation_history.append({
                             "role": "user",
@@ -1965,6 +1989,8 @@ class VerificationAgent(BaseAgent):
             # eec77e54 "0 确认"实为 0 动态确认 + 3 静态确认，文案漏计误导用户）
             counts = _count_verification_outcomes(verified_findings)
             confirmed_count = counts["confirmed"]
+            # P7-5：静态确认计数提取（handoff/返回数据统一五态口径）
+            static_confirmed_count = counts["static_confirmed"]
             not_reproducible_count = counts["not_reproducible"]
             false_positive_count = counts["false_positive"]
             needs_context_count = counts["needs_context"]
@@ -3184,7 +3210,9 @@ class VerificationAgent(BaseAgent):
         for sc in sandbox_commands:
             if self.is_cancelled:
                 break
-            cmd_input = sc.get("input") or {}
+            # P7-4：sandbox_commands 已扁平化（命令在顶层）；兼容旧包装结构
+            # {"input": {"command": ...}}（存量测试/历史调用方）
+            cmd_input = sc if sc.get("command") else (sc.get("input") or {})
             command = cmd_input.get("command", "")
             if not command:
                 continue

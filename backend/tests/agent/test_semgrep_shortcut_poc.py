@@ -71,8 +71,9 @@ def _run_deterministic_poc(agent: VerificationAgent, finding: dict, tmp_path, so
     commands = agent._build_sandbox_commands([finding])
     assert commands, f"类型 {finding.get('vulnerability_type')} 应有确定性模板命令"
     sc = commands[0]
-    cmd_input = sc["input"]
-    script = _extract_poc_source(cmd_input["command"])
+    # P7-4：_build_sandbox_commands 输出扁平化（不再有 input 包装层）
+    cmd_input = sc
+    script = _extract_poc_source(sc["command"])
     compile(script, f"<poc-{finding['vulnerability_type']}>", "exec")
 
     src_dir = tmp_path / "src"
@@ -242,7 +243,7 @@ def test_hardcoded_secret_semgrep_infra_failure_returns_needs_context():
     commands = agent._build_sandbox_commands([finding])
     sc = commands[0]
     agent._record_sandbox_attempt(
-        sc["input"],
+        sc,
         "工具执行失败: Docker not available: Error while creating mount source path",
         finding_id=sc.get("finding_id"),
     )
