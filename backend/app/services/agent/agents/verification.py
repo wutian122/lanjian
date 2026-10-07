@@ -135,6 +135,40 @@ FABRICATION_MARKERS = (
 # B3 严标准：真正的漏洞触发证据标记（confirmed 档要求含其中之一）
 # 仅 "退出码:0"/"Verification Complete" 等"PoC 跑完"标记不算真证据
 # 已去掉 "static_confirmed"（状态名，不应作为 sandbox 证据）和 "vulnerable"（太宽，"not vulnerable" 也匹配）
+# P7-1（2026-10-07）：LLM 自述 attempt 的可执行性守卫——生产实证占位符命令
+# `python3 -c "... check setHttpOnly ..."`（SyntaxError）与动作描述文本被短路
+# 绑定落库。裸省略号（"..."）与过短/纯描述文本一律判不可执行。
+_NEGATIVE_EVIDENCE_MARKERS = (
+    "false_positive", "false positive", "not vulnerable", "no vulnerability",
+    "非漏洞", "误报", "未发现漏洞",
+)
+
+
+def _is_executable_command(command: str) -> bool:
+    """P7-1：命令可执行性守卫（拒占位符/动作描述，放行真实 PoC 命令）。"""
+    cmd = (command or "").strip()
+    if len(cmd) < 15:
+        return False
+    if "..." in cmd or "…" in cmd:
+        return False
+    # 纯动作描述（无引号/换行/重定向/管道等任何代码或 shell 结构）判不可执行
+    has_code_structure = any(tok in cmd for tok in (
+        "\n", '"', "'", ">", "|", "(", ")", "=", "{", ";", "/",
+    ))
+    return has_code_structure
+
+
+def _marker_negated(evidence_lower: str) -> bool:
+    """P7-1：标记+语义双条件——VULNERABILITY_CONFIRMED 后随否定语义
+    （false_positive 等）时该标记不作数（生产实证 L6 口径分裂）。"""
+    key = "vulnerability_confirmed"
+    idx = evidence_lower.find(key)
+    if idx < 0:
+        return False
+    tail = evidence_lower[idx + len(key): idx + len(key) + 80]
+    return any(neg in tail for neg in _NEGATIVE_EVIDENCE_MARKERS)
+
+
 VULN_EVIDENCE_MARKERS = (
     "VULNERABILITY_CONFIRMED", "vulnerability confirmed",
     "exploit successful", "injection successful",
@@ -304,6 +338,8 @@ def _attempt_has_vuln_evidence_default(attempt: dict[str, Any]) -> bool:
     if "vulnerability_confirmed(static)" in ev_lower:
         return False
     if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+        return False
+    if _marker_negated(ev_lower):
         return False
     return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
@@ -2411,8 +2447,23 @@ class VerificationAgent(BaseAgent):
            → 补入（判 static_confirmed，避免真漏洞被误判 not_reproducible）
         """
         existing_attempts = finding.get("sandbox_attempts") or []
-        # 若 LLM 已填了含真证据的成功 attempt，不覆盖
-        if any(isinstance(a, dict) and a.get("success") and self._attempt_has_vuln_evidence(a) for a in existing_attempts):
+        # P7-1：先剔除占位符/动作描述型自述 attempt（命令不可执行者不得落库）
+        cleaned_attempts = [
+            a for a in existing_attempts
+            if not (isinstance(a, dict)
+                    and a.get("command")
+                    and not _is_executable_command(str(a.get("command"))))
+        ]
+        if len(cleaned_attempts) != len(existing_attempts):
+            finding["sandbox_attempts"] = cleaned_attempts
+            existing_attempts = cleaned_attempts
+        # 若 LLM 已填了含真证据的成功 attempt（且命令可执行），不覆盖
+        if any(
+            isinstance(a, dict) and a.get("success")
+            and self._attempt_has_vuln_evidence(a)
+            and _is_executable_command(str(a.get("command") or ""))
+            for a in existing_attempts
+        ):
             return
         attempts = getattr(self, "_sandbox_attempts", [])
 
@@ -2654,6 +2705,10 @@ class VerificationAgent(BaseAgent):
             return False
         # R3 反伪造：模拟/源码缺失输出不得作为漏洞触发证据
         if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+            return False
+        # P7-1：标记+语义双条件——"VULNERABILITY_CONFIRMED: false_positive" 类
+        # 冲突文本不得作为证据（生产实证 L6）
+        if _marker_negated(ev_lower):
             return False
         return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
