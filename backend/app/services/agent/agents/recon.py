@@ -297,8 +297,14 @@ class ReconAgent(BaseAgent):
         step.action_input = parsed
         return step
 
-    def _parse_llm_response(self, response: str) -> ReconStep:
-        """解析 LLM 响应 - 增强版，更健壮地提取思考内容"""
+    def _parse_llm_response(
+        self, response: str
+    ) -> Optional[ReconStep]:
+        """解析 LLM 响应 - 增强版，更健壮地提取思考内容。
+
+        P9：Action 存在但参数（标签/无标签）均无法提取时返回 None，
+        由主循环走格式 nudge（P9-1b）。
+        """
         step = ReconStep(thought="")
 
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
@@ -369,6 +375,22 @@ class ReconAgent(BaseAgent):
                 input_text,
                 default={"raw_input": input_text}
             )
+        elif step.action:
+            # P9-1a：无 "Action Input:" 标签——尝试无标签 JSON 提取
+            extracted = self._extract_unlabeled_input(step.action, cleaned_response)
+            if extracted is not None:
+                logger.info(
+                    f"[Recon] Unlabeled action input extracted for "
+                    f"'{step.action}' (keys={list(extracted.keys())})"
+                )
+                step.action_input = extracted
+            else:
+                # P9-1b：提取失败 = 输出格式错误，返回 None 由主循环 nudge
+                logger.warning(
+                    f"[Recon] Action '{step.action}' but no labeled/unlabeled "
+                    f"input could be extracted -> format failure"
+                )
+                return None
 
         # 🔥 最后的 fallback：如果整个响应没有任何标记，整体作为思考
         if not step.thought and not step.action and not step.is_final:
@@ -535,6 +557,16 @@ Final Answer: [JSON格式的结果]"""
                     step = self._step_from_tool_calls_recon(tool_calls_this_round)
                 if step is None:
                     step = self._parse_llm_response(llm_output)
+                # P9-1b：解析失败 → 格式 nudge（拦截点在 _steps.append /
+                # emit_llm_thought / assistant 历史写入之前）
+                if step is None:
+                    _fmt = await self._handle_subagent_format_failure()
+                    if _fmt == "stalled":
+                        # 连续格式错误达上限：跳出循环，由既有 forced-summary 收口
+                        break
+                    continue
+                # 成功解析轮：格式计数归零
+                self._sub_format_retry = 0
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示 LLM 在想什么

@@ -29,6 +29,11 @@ from ..agent_contract import inject_agent_contract
 from ..core.circuit_breaker import get_llm_circuit
 from ..core.rate_limiter import get_task_llm_rate_limiter
 from ..core.errors import CircuitOpenError
+# P9 稳定性簇：端点软熔断单例（throttle/record/backoff/有序收口）
+from app.core.llm_endpoint_health import get_endpoint_health
+# P9-1a：模块级导入（消除函数内重复导入；json_parser 仅依赖 stdlib + json_repair，
+# 无循环导入风险）
+from ..json_parser import AgentJsonParser
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +396,14 @@ class BaseAgent(ABC):
         # 正文空（reasoning 吃光输出预算）；"other"=旧协议无 kind/API 恢复等其他空响应。
         # 每轮调用开始时重置；上层空响应重试据此选 nudge 文案（见 _empty_response_nudge）
         self._last_empty_kind: Optional[str] = None
+        # P9-1b：连续格式错误计数（无 "Action Input:" 标签且无标签 JSON
+        # 提取失败时递增；成功解析轮归零）
+        self._sub_format_retry = 0
+        # P9-1b：子 Agent 收口留痕（格式卡死等 gate 观察）
+        self._gate_observations: List[Dict[str, Any]] = []
+        # P9 稳定性簇：degenerate 掐断/端点熔断导致的有序收口标志（仅
+        # orchestrator 轮置位），收口段据此跳过 force verification 补发
+        self._orderly_stopped = False
 
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
@@ -936,11 +949,15 @@ class BaseAgent(ABC):
         与 thinking_end 对称：携带正文全文 accumulated，落库供 SSE 重连/历史
         回放校准（content_token 高频不落库、队列满可丢弃，前端实时流以
         metadata.accumulated 全文更新，此事件为最终兜底）。
+
+        P9 观测性：tokens_used 写当轮 usage（事件级口径，非任务累计；
+        degenerate 轮写 0），经 emit_event 已知字段透传到 AgentEventData。
         """
         await self.emit_event(
             "content_end",
             "正文输出完成",
-            metadata={"accumulated": full_content}
+            metadata={"accumulated": full_content},
+            tokens_used=self._round_tokens_for_event(),
         )
 
     async def emit_thinking_end(self, full_response: str):
@@ -963,13 +980,19 @@ class BaseAgent(ABC):
         )
     
     async def emit_llm_complete(self, result_summary: str, tokens_used: int):
-        """发射 LLM 完成事件"""
+        """发射 LLM 完成事件。
+
+        P9 观测性：消息/metadata 的 tokens_used 保留任务累计口径；
+        事件级 tokens_used 列写当轮 usage（_last_round_usage 快照，
+        degenerate 轮 0）——部署日事件数据口径阶跃见方案第七章。
+        """
         await self.emit_event(
             "llm_complete",
             f"[{self.name}] 完成: {result_summary} (消耗 {tokens_used} tokens)",
             metadata={
                 "tokens_used": tokens_used,
-            }
+            },
+            tokens_used=self._round_tokens_for_event(),
         )
     
     async def emit_llm_action(self, action: str, action_input: Dict):
@@ -1395,9 +1418,23 @@ class BaseAgent(ABC):
                             if self._detect_output_degeneracy(accumulated):
                                 logger.warning(
                                     f"[{self.name}] Degenerate output detected "
-                                    "(charwall/loop), discarding round for silent retry"
+                                    "(charwall/loop), discarding round for retry"
                                 )
                                 self._last_empty_kind = "degenerate"
+                                # P9 D6：degenerate 丢弃可见化——补前端 warning
+                                # （文案含「崩坏」，不含「空响应」/「静默」）
+                                try:
+                                    await self.emit_event(
+                                        "warning",
+                                        "LLM 输出崩坏（charwall/loop），本轮内容丢弃并重试",
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        f"[{self.name}] degenerate warning emit failed",
+                                        exc_info=True,
+                                    )
+                                # P9：有序收口标志（仅 orchestrator 轮）
+                                self._note_orderly_stop()
                                 accumulated = ""
                                 accumulated_content = ""
                                 accumulated_reasoning = ""
@@ -1502,18 +1539,33 @@ class BaseAgent(ABC):
 
             return accumulated, total_tokens
 
+        endpoint = self._llm_endpoint_key()
         try:
+            # P9 稳定性簇：端点 degraded → 限流/熔断之前先降速（救援帧免收，
+            # 由 rescue_frame contextvar 内部判定）
+            try:
+                await get_endpoint_health().maybe_throttle(endpoint)
+            except Exception as _throttle_err:
+                logger.debug(
+                    f"[{self.name}] endpoint throttle failed (non-fatal): "
+                    f"{_throttle_err}",
+                    exc_info=True,
+                )
             # 🔥 限流：令牌桶节流，防止压垮 LLM 服务（task-scoped，按 task_id 隔离）
             await self._get_llm_rate_limiter().acquire()
             # 🔥 熔断：LLM 服务降级时快速失败，避免级联故障
             accumulated, total_tokens = await get_llm_circuit().call(_consume)
         except CircuitOpenError:
             logger.warning(f"[{self.name}] LLM circuit open, rejecting call")
+            # P9 记账修正：熔断 OPEN 帧无物理调用，不入端点窗口
+            self._last_empty_kind = "no_physical_call"
             accumulated = f"[API_ERROR:circuit_open] LLM 服务熔断中，请稍后重试。"
             await self.emit_event("error", "LLM 服务熔断中，请稍后重试")
         except _LLMCriticalStreamError as e:
             # 关键 API 错误已由熔断器记录；accumulated 在 raise 前已经 nonlocal 设置
             logger.warning(f"[{self.name}] Critical LLM error recorded by circuit: type={e.error_type}, msg={e.user_message}")
+            # P9 记账修正：critical stream error 帧不发生有效物理调用，不入窗口
+            self._last_empty_kind = "no_physical_call"
         except asyncio.CancelledError:
             logger.info(f"[{self.name}] LLM call cancelled")
             raise
@@ -1524,7 +1576,8 @@ class BaseAgent(ABC):
             accumulated = f"[LLM调用错误: {str(e)}] 请重试。"
         finally:
             # 正文流收尾（仅新协议且本轮发射过正文 token）：content_end 带正文全文，
-            # 落库供 SSE 重连/历史回放校准，先于 thinking_end 发射
+            # 落库供 SSE 重连/历史回放校准，先于 thinking_end 发射；
+            # tokens_used 写当轮 usage（degenerate 轮 0）
             if content_emitted:
                 await self.emit_content_end(accumulated_content)
             # thinking_end：新协议传仅思考累计（思考区收尾显示思考文本而非正文）；
@@ -1558,6 +1611,9 @@ class BaseAgent(ABC):
         else:
             self._last_empty_kind = None
 
+        # P9 端点软熔断：分类完成统一记账（no_physical_call 帧不入窗）
+        self._record_endpoint_outcome(endpoint)
+
         # 空响应最后一搏（2026-09-29 层 3c）：第一遍空正文且无工具调用时，
         # 自动以「关思考 + 预算减半」重跑一次——生产实证空响应主因是思考流
         # 吃光预算（任务 c6d6cd09 / 327b6430 三轮 analysis 全空响应回退），
@@ -1582,16 +1638,21 @@ class BaseAgent(ABC):
                 # 此处恒非 None；max(512, …) 仅防御极小配置
                 ditch_max = max(512, (max_tokens or 8192) // 2)
                 ditch_happened = True
+                # P9 稳定性簇：端点 degraded 时救援退避乘 backoff_factor
+                try:
+                    _breaker_factor = get_endpoint_health().backoff_factor(endpoint)
+                except Exception:
+                    _breaker_factor = 1.0
                 # P5-1（2026-10-04）：救援序列——原样失败后依次：
                 # ①一搏（关思考+预算减半）②退避15s+纯文本（去 tools）
                 # ③退避30s+纯文本。过载窗口通常 <2 分钟，退避扛过即恢复
                 # （生产实证 1fe2d9ce：过载空响应 2-4 秒/轮，30 秒即止损夭折）。
                 rescue_plans = [
                     {"backoff": 0, "plain_text": False, "label": "关思考+预算减半"},
-                    {"backoff": self._empty_response_backoff(1), "plain_text": True,
-                     "label": "退避15s+纯文本"},
-                    {"backoff": self._empty_response_backoff(2), "plain_text": True,
-                     "label": "退避30s+纯文本"},
+                    {"backoff": int(self._empty_response_backoff(1) * _breaker_factor),
+                     "plain_text": True, "label": "退避15s+纯文本"},
+                    {"backoff": int(self._empty_response_backoff(2) * _breaker_factor),
+                     "plain_text": True, "label": "退避30s+纯文本"},
                 ]
                 for _plan in rescue_plans:
                     if _plan["backoff"]:
@@ -1611,16 +1672,21 @@ class BaseAgent(ABC):
                     _plan_params: Dict[str, Any] = dict(ditch_params)
                     _plan_tools = None if _plan["plain_text"] else tools
                     try:
-                        ditch_acc, ditch_tokens = await self.stream_llm_call(
-                            messages,
-                            temperature=temperature,
-                            max_tokens=ditch_max,
-                            auto_compress=auto_compress,
-                            tools=_plan_tools,
-                            response_format=response_format,
-                            extra_params=_plan_params,
-                            _last_ditch=True,
-                        )
+                        # P9 单收费点：救援嵌套调用经 rescue_frame 标记，帧内
+                        # maybe_throttle 免收（防降速与救援退避自激励叠加）
+                        from app.core.llm_endpoint_health import rescue_frame
+
+                        with rescue_frame():
+                            ditch_acc, ditch_tokens = await self.stream_llm_call(
+                                messages,
+                                temperature=temperature,
+                                max_tokens=ditch_max,
+                                auto_compress=auto_compress,
+                                tools=_plan_tools,
+                                response_format=response_format,
+                                extra_params=_plan_params,
+                                _last_ditch=True,
+                            )
                         # I1（审查 2026-09-29）：累加而非覆盖——全部救援尝试的
                         # tokens 都计入调用方 token 预算记账
                         total_tokens += ditch_tokens
@@ -1714,6 +1780,206 @@ class BaseAgent(ABC):
                 "请大幅精简思考，尽快给出 Action。]"
             )
         return ""
+
+    # ============ P9（2026-10-08）：无标签 JSON 提取 + 格式 nudge ============
+
+    def _record_gate_observation(
+        self, gate: str, reason: str, extra: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """子 Agent 版 gate 观察记录（与 OrchestratorAgent 同名方法同构）。
+
+        收口时供上层读取；extra 可携带结构化明细。
+        """
+        from datetime import datetime, timezone
+
+        entry: Dict[str, Any] = {
+            "gate": gate,
+            "reason": reason,
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            entry.update(extra)
+        getattr(self, "_gate_observations", []).append(entry)
+
+    def _extract_unlabeled_input(
+        self, action: str, text: str
+    ) -> Optional[Dict[str, Any]]:
+        """P9-1a：无 "Action Input:" 标签时，提取 Action 行后的 JSON 参数。
+
+        生产实证（P9 根因簇 A）：约半数 LLM 文本输出省略 Action Input 标签，
+        参数完整地直接跟在 Action 行后；旧解析器在该情形静默给 ``{}``，
+        经 R1 失效校验放行后直达工具裸 TypeError，模型收不到参数却发过参数，
+        无法自愈。
+
+        提取规则（审查修正定稿）：
+
+        1. ``re.finditer(r"Action:\\s*<action>\\b[^\\n]*(?:\\n|$)")`` 遍历全部
+           匹配——Thought 中引用 "Action: x" 不致假阴性（逐点尝试，首个成功
+           者胜）；
+        2. 取匹配点之后的 remainder，以行首边界正则截断到下一段标记
+           （Thought/Final Answer/Observation/Action，允许 ``**`` 加粗）；
+        3. 剥离 ```json 围栏后 strip，首字符须为 ``{`` 或 ``[``；
+        4. ``AgentJsonParser.parse_any(block, default=None)``，仅接受 dict；
+        5. DEGRADED_EMPTY：解析为空 dict 且 block 非精确 ``"{}"`` → 视为失败
+           （坏碎片/普通文本不得被 json-repair "修复" 成空参）。
+        """
+        if not action or not text:
+            return None
+        action_line = re.compile(
+            r"Action:\s*" + re.escape(action) + r"\b[^\n]*(?:\n|$)"
+        )
+        for m in action_line.finditer(text):
+            remainder = text[m.end():]
+            boundary = re.search(
+                r"\n\s*(?:\*\*)?(?:Thought|Final Answer|Observation|Action)"
+                r"\s*(?:\*\*)?\s*:",
+                remainder,
+            )
+            block = remainder[:boundary.start()] if boundary else remainder
+            # 剥离 ```json / ``` 围栏（开/闭围栏分别处理，容忍尾随后续）
+            block = re.sub(r"^\s*```(?:json)?\s*", "", block)
+            block = re.sub(r"\s*```\s*$", "", block)
+            block = block.strip()
+            if not block or block[0] not in "{[":
+                continue
+            parsed = AgentJsonParser.parse_any(block, default=None)
+            if not isinstance(parsed, dict):
+                continue
+            # DEGRADED_EMPTY：非显式 "{}" 的空 dict 判失败
+            if not parsed and block != "{}":
+                continue
+            return parsed
+        return None
+
+    # 连续格式错误阈值：达到后停止格式重试，按收口路径处理（防子 Agent
+    # 空转耗尽全部迭代）。
+    SUBAGENT_FORMAT_STALL_LIMIT = 8
+
+    def _subagent_format_nudge(self) -> str:
+        """P9-1b：构造自包含的输出格式纠正提示（含两种合法形态示例）。"""
+        n = getattr(self, "_sub_format_retry", 0) + 1
+        self._sub_format_retry = n
+        return (
+            "[系统提示：你的上一轮输出格式不符合要求，工具未能解析出 Action 参数。"
+            f"这是第 {n} 次输出格式纠正。请严格按以下两种合法形态之一输出，"
+            "且参数必须是完整 JSON 对象。\n\n"
+            "形态一（带 Action Input 标签）：\n"
+            "Action: read_file\n"
+            'Action Input: {"file_path": "app/main.py"}\n\n'
+            "形态二（JSON 直接跟在 Action 行后，可省略 Action Input 标签）：\n"
+            "Action: read_file\n"
+            '{"file_path": "app/main.py"}\n\n'
+            "注意：file_path 等必填参数必须给出实际值，"
+            "禁止只写 Action 行却不提供 JSON 参数。]"
+        )
+
+    def _trace_format_nudge(self, n: int) -> None:
+        """audit_trace 增加 nudge marker 条目（success 语义中立：不计成功/失败）。"""
+        tm = getattr(self, "trace_manager", None)
+        if tm is None:
+            return
+        try:
+            add_marker = getattr(tm, "add_marker", None)
+            if add_marker is None:
+                return
+            add_marker(
+                f"格式 nudge 第 {n} 次",
+                {
+                    "kind": "subagent_format_nudge",
+                    "attempt": n,
+                    "detail": (
+                        f"输出格式无法解析，第 {n} 次注入纠正提示"
+                        "（语义中立，不计成功也不计失败）"
+                    ),
+                },
+                marker_type="format_nudge",
+            )
+        except Exception:
+            logger.debug(f"[{self.name}] trace format nudge failed", exc_info=True)
+
+    async def _handle_subagent_format_failure(self) -> str:
+        """P9-1b：主循环解析失败时的统一处理。
+
+        Returns:
+            - ``"nudge"``：已发前端 warning + trace marker + 追加 user nudge，
+              调用方应 continue（本轮不写 assistant 历史/不 append _steps）；
+            - ``"stalled"``：连续格式错误达 SUBAGENT_FORMAT_STALL_LIMIT，
+              已记 gate observation，调用方应跳到收口。
+        """
+        nudge = self._subagent_format_nudge()
+        n = self._sub_format_retry
+        await self.emit_event(
+            "warning",
+            f"模型输出格式无法解析（第 {n} 次），已注入输出格式纠正提示要求重试",
+        )
+        self._trace_format_nudge(n)
+        self._conversation_history.append({"role": "user", "content": nudge})
+        if n >= self.SUBAGENT_FORMAT_STALL_LIMIT:
+            self._record_gate_observation(
+                "subagent_format_stalled",
+                f"连续 {n} 次输出格式错误无法解析，停止格式重试并收口",
+            )
+            logger.warning(
+                f"[{self.name}] subagent format stalled after {n} consecutive failures"
+            )
+            return "stalled"
+        return "nudge"
+
+    # ============ P9 稳定性簇：端点软熔断接入辅助 ============
+
+    def _llm_endpoint_key(self) -> str:
+        """当前 LLM 调用的端点键（llm_service.config.base_url）。
+
+        base_url 缺失时用稳定兜底键——单端点部署下所有帧同桶，
+        不因为 None 散落到每帧独立桶。
+        """
+        cfg = getattr(self.llm_service, "config", None)
+        base = getattr(cfg, "base_url", None) if cfg is not None else None
+        return base or "__default_endpoint__"
+
+    def _round_tokens_for_event(self) -> int:
+        """事件级 tokens_used：当轮 usage（prompt+completion）；degenerate 轮 0。"""
+        if getattr(self, "_last_empty_kind", None) == "degenerate":
+            return 0
+        usage = getattr(self, "_last_round_usage", None)
+        if not usage:
+            return 0
+        try:
+            return int(usage.get("prompt_tokens", 0) or 0) + int(
+                usage.get("completion_tokens", 0) or 0
+            )
+        except AttributeError:
+            return 0
+
+    def _record_endpoint_outcome(self, endpoint: str) -> None:
+        """分类完成后统一记账：empty=bool(_last_empty_kind)。
+
+        记账修正：``no_physical_call`` 帧（熔断 OPEN / critical stream
+        error，无物理调用）跳过，不入窗口；其余帧（含 degenerate）
+        如实记录。
+        """
+        kind = self._last_empty_kind
+        if kind == "no_physical_call":
+            return
+        try:
+            get_endpoint_health().record(endpoint, empty=bool(kind))
+        except Exception:
+            logger.debug(
+                f"[{self.name}] endpoint record failed", exc_info=True
+            )
+
+    def _note_orderly_stop(self) -> None:
+        """degenerate 掐断点：orchestrator 轮置有序收口标志。
+
+        子 Agent 轮不置位（该标志仅控制 orchestrator 收口段补发）。
+        """
+        try:
+            if self.config.agent_type == AgentType.ORCHESTRATOR:
+                self._orderly_stopped = True
+        except Exception:
+            logger.debug(
+                f"[{self.name}] note orderly stop failed", exc_info=True
+            )
 
     # R-C1（2026-09-26）：truncated 空响应连续止损。生产实证（任务 c0c6182f）
     # Qwen3.8-27B 思考流吃光 max_tokens 属系统性工况——重试大概率同样截断，
@@ -1913,28 +2179,63 @@ class BaseAgent(ABC):
         退避拉开空响应间隔扛过窗口（1→15s、2→30s、≥3→60s 封顶）。"""
         return min(15 * (2 ** max(0, attempt - 1)), 60)
 
-    _MISSING_ARG_PATTERN = re.compile(r"missing \d+ required positional arguments?: '([\w_]+)'")
+    # P9-1c：漏参/参数形状错误模式组（替换原单正则）。
+    # ① positional / keyword-only 子句（单/复数，复数全参数捕获）
+    _MISSING_ARG_CLAUSE = re.compile(
+        r"missing \d+ required (?:positional|keyword-only) arguments?:\s*"
+        r"((?:'[^']+'(?:\s*(?:and|,)\s*)?)+)"
+    )
+    # ② 参数发成字符串：'str' object has no attribute '...'（P9-3 引导）
+    _STR_NO_ATTR_PATTERN = re.compile(r"'str' object has no attribute '(\w+)'")
+    # ③ R1 中文「必填参数缺失: X」
+    _R1_CN_MISSING_PATTERN = re.compile(r"必填参数缺失[:：]\s*([A-Za-z_]\w*)")
 
     @staticmethod
     def _enhance_missing_arg_error(error_text: str) -> str:
-        """P4（2026-10-03）：漏参错误精准引导。
+        """P4/P9-1c：漏参错误精准引导（模式组：positional/keyword-only/
+        str 形状/R1 中文）。
 
-        Flash-Next 实证（任务 026ead34）：关思考下频繁发出空调用（参数:无），
-        通用报错文本让模型无法自愈（反复空调用直至被去重阻断）。命中
-        missing argument 模式时，点名缺失参数并给出 JSON 参数修正指引。
+        命中任一模式时点名缺失参数（复数全部列出）并给出完整 JSON 对象
+        修正示例。开头短路：文本已含 R1/本函数自产特征（「参数示例」或
+        「参数必须是完整 JSON 对象」）时原样返回，杜绝双份指引。
         """
-        m = BaseAgent._MISSING_ARG_PATTERN.search(error_text or "")
-        if not m:
-            return error_text
-        missing = m.group(1)
-        return (
-            f"{error_text}\n\n"
-            f"🎯 **精准修正指引**：本次调用参数缺失（缺少必需参数 `{missing}`）。"
-            "工具调用参数必须是一个完整的 JSON 对象，包含全部必需字段——"
-            "禁止发送空参数或省略字段。请重新调用本工具，"
-            f'例如 {{"{missing}": "<实际值>", ...}}。'
-            "若无法确定取值，请先用 list_files/search_code 获取上下文。"
-        )
+        text = error_text or ""
+        if "参数示例" in text or "参数必须是完整 JSON 对象" in text:
+            return text
+
+        missing: List[str] = []
+        m = BaseAgent._MISSING_ARG_CLAUSE.search(text)
+        if m:
+            missing = re.findall(r"'([^']+)'", m.group(1))
+        if not missing:
+            m = BaseAgent._R1_CN_MISSING_PATTERN.search(text)
+            if m:
+                missing = [m.group(1)]
+
+        is_str_shape = bool(BaseAgent._STR_NO_ATTR_PATTERN.search(text))
+
+        if not missing and not is_str_shape:
+            return text
+
+        if missing:
+            fields = ", ".join(f"`{name}`" for name in missing)
+            example = "{" + ", ".join(
+                f'"{name}": "<实际值>"' for name in missing
+            ) + "}"
+            detail = (
+                f"本次调用参数缺失（缺少必需参数 {fields}）。"
+                "参数必须是完整 JSON 对象，包含全部必需字段，"
+                "禁止空参数或省略字段。"
+                f"参数示例：{example}。"
+                "若无法确定取值，请先用 list_files/search_code 获取上下文。"
+            )
+        else:
+            detail = (
+                "本次调用的参数应是 JSON 对象，却被发成了字符串（或错误类型），"
+                "工具无法从中读取字段。参数必须是完整 JSON 对象，"
+                '参数示例：{"参数名": "参数值", ...}。请重新调用本工具。'
+            )
+        return f"{text}\n\n🎯 **精准修正指引**：{detail}"
 
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
         """
@@ -2126,7 +2427,7 @@ class BaseAgent(ABC):
 **工具**: {tool_name}
 **参数**: {json.dumps(tool_input, ensure_ascii=False, indent=2) if tool_input else '无'}
 **错误类型**: {type(e).__name__}
-**错误信息**: {str(e)}
+**错误信息**: {self._enhance_missing_arg_error(str(e))}
 **堆栈跟踪**:
 ```
 {traceback.format_exc()}

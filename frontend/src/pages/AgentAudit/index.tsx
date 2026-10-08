@@ -496,7 +496,12 @@ function AgentAuditPageContent() {
               dispatch({
                 type: 'ADD_LOG',
                 payload: {
-                  type: event.event_type === 'error' ? 'error' : 'info',
+                  // P9 D6：warning 事件独立 amber 类型（degenerate/端点熔断）
+                  type: event.event_type === 'error'
+                    ? 'error'
+                    : event.event_type === 'warning'
+                      ? 'warning'
+                      : 'info',
                   title: message,
                   agentName,
                 }

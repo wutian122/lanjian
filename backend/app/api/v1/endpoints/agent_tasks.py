@@ -47,9 +47,11 @@ from app.services.agent.agents.base import AgentResult
 from app.services.agent.event_manager import EventManager
 from app.services.agent.strict_finding import (
     is_context_only_finding,
+    is_order_aligned_finding,
     is_strict_finding,
     _to_int,
 )
+from app.services.agent.utils.finding_fingerprint import assign_fingerprints
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.git_ssh_service import GitSSHOperations
 from app.services.llm.service import LLMService
@@ -2167,6 +2169,22 @@ async def _save_findings(
         logger.warning(f"[SaveFindings] No findings to save for task {task_id}")
         return 0
 
+    # P9-9：落库前统一计算 fingerprint（此时全部对齐/绑定已完成；
+    # 空身份不参与；仅本次新增 finding，历史不回填 D13）。
+    # 同 fp 后到条目标注 duplicate_of，不静默删除。
+    try:
+        fp_stats = assign_fingerprints(findings)
+        if fp_stats["duplicates"]:
+            logger.info(
+                f"[SaveFindings] {fp_stats['duplicates']} same-root entries "
+                f"annotated with duplicate_of (kept, not deleted)"
+            )
+    except Exception:
+        logger.warning(
+            "[SaveFindings] fingerprint assignment failed (non-fatal)",
+            exc_info=True,
+        )
+
     # 🔥 Case-insensitive mapping preparation
     severity_map = {
         "critical": VulnerabilitySeverity.CRITICAL,
@@ -2421,6 +2439,14 @@ async def _save_findings(
                 except ValueError:
                     cvss_score = None
 
+            # D12：aligned 分桶标记持久化进 finding_metadata（供后续查询/
+            # 报告按桶呈现），不改动 verification_status 降级外的其他口径
+            if is_order_aligned_finding(finding):
+                aligned_meta = dict(finding.get("finding_metadata") or {})
+                if not aligned_meta.get("aligned"):
+                    aligned_meta["aligned"] = True
+                    finding["finding_metadata"] = aligned_meta
+
             db_finding = AgentFinding(
                 id=str(uuid4()),
                 task_id=task_id,
@@ -2451,6 +2477,8 @@ async def _save_findings(
                 # 🔥 P3: 发现来源追踪 — Semgrep vs LLM
                 matched_rule_code=finding.get("matched_rule_code"),
                 matched_pattern=finding.get("matched_pattern"),
+                # P9-9：指纹落库（空身份为 None，历史不回填）
+                fingerprint=finding.get("fingerprint"),
                 finding_metadata=(
                     finding.get("finding_metadata")
                     or ({"discovery_source": "semgrep"} if finding.get("matched_rule_code") else {"discovery_source": "llm"})
@@ -2550,7 +2578,8 @@ async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
             empty_responses += 1
         if "格式解析失败" in msg:
             format_retries += 1
-        if "乱码" in msg:
+        if "乱码" in msg or "崩坏" in msg:
+            # P9 D6：degenerate 掐断 warning（「崩坏」）同归 garbled_drops
             garbled_drops += 1
     degraded = llm_calls > 0 and (truncations + empty_responses) / llm_calls >= 0.5
     return {
@@ -5572,6 +5601,18 @@ async def generate_audit_report(
                     md_lines.append("**漏洞描述:**")
                     md_lines.append("")
                     md_lines.append(f.description)
+                    md_lines.append("")
+
+                # P9 Fix-2: verification_note 三格式可见（第七章）——JSON/前端已
+                # 支持，MD 在漏洞描述之后条件追加「验证说明」；note 无独立列，
+                # 仅存于 verification_result JSON；空/缺失 note 不输出（无空标题）
+                _vresult = f.verification_result
+                _vnote = (
+                    _vresult.get("verification_note")
+                    if isinstance(_vresult, dict) else None
+                )
+                if _vnote and str(_vnote).strip():
+                    md_lines.append(f"**验证说明:** {str(_vnote).strip()}")
                     md_lines.append("")
 
                 if f.code_snippet:

@@ -177,6 +177,29 @@ class AuditTraceManager:
 
 """)
 
+    def add_marker(
+        self,
+        title: str,
+        content: Dict[str, Any],
+        marker_type: str = "marker",
+    ) -> None:
+        """记录语义中立的标记条目（P9-1b nudge marker 等）。
+
+        与工具/finding 记录不同：不递增任何业务统计（tools_called/
+        findings_discovered 等），仅留时间线条目供审查。
+        """
+        entry = TraceEntry(
+            timestamp=self._now(),
+            type=marker_type,
+            title=title,
+            content=content,
+        )
+        self.entries.append(entry)
+        detail = str(content.get("detail", ""))
+        self._append_to_markdown(
+            f"\n### 🏷️ [{self._now()}] {title}\n\n{detail}\n\n"
+        )
+
     def add_finding(
         self,
         finding_type: str,

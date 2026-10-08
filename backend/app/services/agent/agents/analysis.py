@@ -621,8 +621,14 @@ class AnalysisAgent(BaseAgent):
     
 
     
-    def _parse_llm_response(self, response: str) -> AnalysisStep:
-        """解析 LLM 响应 - 增强版，更健壮地提取思考内容"""
+    def _parse_llm_response(
+        self, response: str
+    ) -> Optional[AnalysisStep]:
+        """解析 LLM 响应 - 增强版，更健壮地提取思考内容。
+
+        P9：Action 存在但参数（标签/无标签）均无法提取时返回 None，
+        由主循环走格式 nudge（P9-1b）。
+        """
         step = AnalysisStep(thought="")
 
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
@@ -691,6 +697,22 @@ class AnalysisAgent(BaseAgent):
                 input_text,
                 default={"raw_input": input_text}
             )
+        elif step.action:
+            # P9-1a：无 "Action Input:" 标签——尝试无标签 JSON 提取
+            extracted = self._extract_unlabeled_input(step.action, cleaned_response)
+            if extracted is not None:
+                logger.info(
+                    f"[Analysis] Unlabeled action input extracted for "
+                    f"'{step.action}' (keys={list(extracted.keys())})"
+                )
+                step.action_input = extracted
+            else:
+                # P9-1b：提取失败 = 输出格式错误，返回 None 由主循环 nudge
+                logger.warning(
+                    f"[Analysis] Action '{step.action}' but no labeled/unlabeled "
+                    f"input could be extracted -> format failure"
+                )
+                return None
 
         # 🔥 最后的 fallback：如果整个响应没有任何标记，整体作为思考
         if not step.thought and not step.action and not step.is_final:
@@ -1326,6 +1348,16 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     step = self._final_step_from_tool_calls(tool_calls_this_round)
                 if step is None:
                     step = self._parse_llm_response(llm_output)
+                # P9-1b：解析失败 → 格式 nudge（拦截点在 _steps.append /
+                # emit_llm_thought / assistant 历史写入之前）
+                if step is None:
+                    _fmt = await self._handle_subagent_format_failure()
+                    if _fmt == "stalled":
+                        # 连续格式错误达上限：跳出循环，由既有收口/兜底产出结果
+                        break
+                    continue
+                # 成功解析轮：格式计数归零
+                self._sub_format_retry = 0
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示安全分析的思考过程
@@ -1605,6 +1637,33 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
         """获取执行步骤"""
         return self._steps
 
+    @staticmethod
+    def _observation_succeeded(observation: Optional[str]) -> bool:
+        """判定工具 observation 是否表明调用成功（files_read 饿死防护，第七章）。
+
+        只排除"确证失败"：
+        - 「⚠️ 工具执行失败」（base.execute_tool 失败帧，内含必填缺失/
+          映射引导等错误明细）；
+        - 「⚠️ 工具 '...' 执行超时」/「⚠️ 任务已取消」；
+        - observation 以「必填参数缺失」/映射引导开头（直接返回的防御口径）。
+        observation 为 None 时不判失败（合成步骤/历史兼容；生产路径
+        step.observation 在 execute_tool 后必被赋值），空串视为无内容不计数。
+        """
+        if observation is None:
+            return True
+        if not isinstance(observation, str) or not observation.strip():
+            return False
+        if observation.startswith("⚠️ 工具执行失败"):
+            return False
+        if observation.startswith("⚠️ 工具 ") or observation.startswith("⚠️ 任务已取消"):
+            return False
+        if observation.startswith("必填参数缺失"):
+            return False
+        head = observation[:200]
+        if "必须是 JSON 对象" in head:
+            return False
+        return True
+
     def _collect_execution_report(self) -> Dict[str, List[str]]:
         """聚合本轮实际执行过的文件读取与搜索模式，上报 orchestrator 推进跨轮去重。
 
@@ -1625,6 +1684,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 action = getattr(step, "action", None)
                 action_input = getattr(step, "action_input", None)
                 if not action or not isinstance(action_input, dict):
+                    continue
+                # 第七章防护（files_read 饿死）：只统计执行成功的调用。
+                # 提取成功但执行失败（必填缺失/引导/超时/取消）时文件内容
+                # 实际未取得，计入"已读"会让跨轮禁读约束拒绝重读。
+                if not self._observation_succeeded(getattr(step, "observation", None)):
                     continue
                 if action == "read_file":
                     path = action_input.get("file_path")

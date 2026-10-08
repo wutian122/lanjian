@@ -7,16 +7,63 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from pydantic import BaseModel, Field
 from dataclasses import dataclass
 
-from .base import AgentTool, ToolResult
+from .base import (
+    AgentTool,
+    ToolResult,
+    build_mapping_arg_error,
+    coerce_mapping_arg,
+    normalize_string_mapping,
+)
 from .sandbox_tool import SandboxManager
 from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
+
+
+# ============ wrapper 字面量安全辅助（第七章 P9-3 安全面） ============
+
+def _php_literal(value: str) -> str:
+    """PHP var_export 单引号字符串语义：先转义反斜杠、再转义单引号。
+
+    杜绝 key/value 中的引号逃逸与 value 尾反斜杠吞掉闭引号。
+    """
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _shell_quote(value: str) -> str:
+    """POSIX shell 单引号安全包裹（' → '\\''）。"""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _ruby_json_literal(value: str) -> str:
+    """生成 Ruby 双引号安全字面量：JSON 转义 + 中和 # 插值。
+
+    JSON 不转义 ``#``，而 Ruby 双引号字符串对 ``#{}`` / ``#$`` / ``#@``
+    做插值（可致命令执行），故把 # 统一写成 \\u0023。
+    """
+    return json.dumps(value).replace("#", "\\u0023")
+
+
+def _coerce_mapping_field(
+    value: Any, field_name: str
+) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """规整单个映射入参：返回 (规整值, 引导错误)。
+
+    None 透传（未提供）；形状非法时错误由调用方原样返回。
+    """
+    if value is None:
+        return None, None
+    mapping = coerce_mapping_arg(value, field_name)
+    if mapping is None:
+        return None, build_mapping_arg_error(field_name, value)
+    return normalize_string_mapping(mapping), None
+
 
 
 # ============ 通用语言测试基类 ============
@@ -100,9 +147,15 @@ class BaseLanguageTestTool(AgentTool):
                     break
 
             # 检查参数是否被执行
+            # defense-in-depth：非 str 值（LLM 发数字等）先 str() 化，
+            # 杜绝 value.lower() 抛 AttributeError。
+            # 保守处理：仅凭"值出现在输出中"不必然构成漏洞——回显须与 sink
+            # 数据流连贯（该参数经污点流入危险函数才有意义）；此处为弱证据，
+            # 判定仍需静态污点或其他指标共同佐证。
             if params and not is_vulnerable:
                 for key, value in params.items():
-                    if value.lower() in stdout:
+                    check_value = value if isinstance(value, str) else str(value)
+                    if check_value.lower() in stdout:
                         is_vulnerable = True
                         evidence = f"参数 '{key}' 的值出现在输出中"
                         break
@@ -122,6 +175,14 @@ class BaseLanguageTestTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行语言测试"""
+        # P9-3：映射参数形状防御（在 initialize 之前，坏参数不触发沙箱初始化）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -243,13 +304,14 @@ class PhpTestTool(BaseLanguageTestTool):
         """
         wrapper_parts = []
 
-        # 模拟超全局变量
+        # 模拟超全局变量（P9-3：key/value 用 var_export 语义字面量，防注入）
         if params:
             for key, value in params.items():
-                escaped_value = value.replace("'", "\\'")
-                wrapper_parts.append(f"$_GET['{key}'] = '{escaped_value}';")
-                wrapper_parts.append(f"$_POST['{key}'] = '{escaped_value}';")
-                wrapper_parts.append(f"$_REQUEST['{key}'] = '{escaped_value}';")
+                key_lit = _php_literal(str(key))
+                value_lit = _php_literal(str(value))
+                wrapper_parts.append(f"$_GET[{key_lit}] = {value_lit};")
+                wrapper_parts.append(f"$_POST[{key_lit}] = {value_lit};")
+                wrapper_parts.append(f"$_REQUEST[{key_lit}] = {value_lit};")
 
         # 清理原代码的 PHP 标签（因为 php -r 不需要它们）
         clean_code = code.strip()
@@ -374,11 +436,17 @@ class MockRequest:
                 wrapper_parts.append(f"request = MockRequest({params_str})")
             else:
                 # 普通模式：设置命令行参数和环境变量
+                # P9-3：key/value 用 json.dumps 字面量插值（旧实现原样插入
+                # 单引号，值含引号可逃逸执行任意 Python）
                 wrapper_parts.append("import sys, os")
                 args = ["script.py"] + list(params.values())
-                wrapper_parts.append(f"sys.argv = {args}")
+                wrapper_parts.append(
+                    f"sys.argv = {json.dumps(args, ensure_ascii=False)}"
+                )
                 for key, value in params.items():
-                    wrapper_parts.append(f"os.environ['{key.upper()}'] = '{value}'")
+                    env_key = json.dumps(str(key).upper(), ensure_ascii=False)
+                    env_val = json.dumps(str(value), ensure_ascii=False)
+                    wrapper_parts.append(f"os.environ[{env_key}] = {env_val}")
 
         wrapper_parts.append(code)
         return "\n".join(wrapper_parts)
@@ -400,6 +468,14 @@ class MockRequest:
         **kwargs
     ) -> ToolResult:
         """执行 Python 测试"""
+        # P9-3：映射参数形状防御（initialize 之前）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -556,6 +632,14 @@ const res = {{
         **kwargs
     ) -> ToolResult:
         """执行 JavaScript 测试"""
+        # P9-3：映射参数形状防御（initialize 之前）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -655,14 +739,22 @@ class JavaTestTool(BaseLanguageTestTool):
             return code
 
         # 构建模拟请求参数
+        # P9-3：k/v 用 JSON 转义字面量嵌入（JSON 转义序列均为合法 Java 转义；
+        # ensure_ascii=True 避免 javac 源码编码问题）。
         param_init = ""
         if params:
-            params_entries = ", ".join([f'"{k}", "{v}"' for k, v in params.items()])
+            entries = "}, {".join(
+                f"{json.dumps(str(k))}, {json.dumps(str(v))}"
+                for k, v in params.items()
+            )
+            args_lits = ", ".join(
+                json.dumps(str(v)) for v in params.values()
+            )
             param_init = f"""
         java.util.Map<String, String> request = new java.util.HashMap<>();
-        String[][] entries = {{{params_entries.replace(', ', '}, {')}}};
+        String[][] entries = {{{entries}}};
         for (String[] e : entries) {{ request.put(e[0], e[1]); }}
-        String[] args = new String[]{{{', '.join([f'"{v}"' for v in params.values()])}}};
+        String[] args = new String[]{{{args_lits}}};
 """
 
         wrapper = f"""
@@ -694,6 +786,14 @@ public class Test {{
         **kwargs
     ) -> ToolResult:
         """执行 Java 测试"""
+        # P9-3：映射参数形状防御（initialize 之前）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -799,14 +899,17 @@ class GoTestTool(BaseLanguageTestTool):
         imports_str = "\n".join([f'    "{imp}"' for imp in imports])
 
         # 模拟参数
+        # P9-3：值用 JSON 转义字面量嵌入（JSON 转义序列均为合法 Go 双引号
+        # 字符串转义），杜绝引号/反斜杠逃逸伪造执行。
         param_code = ""
         if params:
             args = ["program"] + list(params.values())
-            args_str = ', '.join([f'"{a}"' for a in args])
+            args_str = ', '.join(json.dumps(str(a)) for a in args)
             param_code = "    os.Args = []string{{{}}}\n".format(args_str)
-            # param_code = f"    os.Args = []string{{{', '.join([f'\"{a}\"' for a in args])}}}\n"
             for key, value in params.items():
-                param_code += f'    os.Setenv("{key.upper()}", "{value}")\n'
+                env_key = json.dumps(str(key).upper())
+                env_val = json.dumps(str(value))
+                param_code += f"    os.Setenv({env_key}, {env_val})\n"
 
         wrapper = f"""package main
 
@@ -836,6 +939,14 @@ func main() {{
         **kwargs
     ) -> ToolResult:
         """执行 Go 测试"""
+        # P9-3：映射参数形状防御（initialize 之前）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -944,7 +1055,11 @@ class RubyTestTool(BaseLanguageTestTool):
         if params:
             if rails_mode:
                 # 模拟 Rails params
-                params_ruby = "{ " + ", ".join([f'"{k}" => "{v}"' for k, v in params.items()]) + " }"
+                # P9-3：k/v 用 Ruby 安全字面量（JSON 转义 + # 插值中和）
+                params_ruby = "{ " + ", ".join(
+                    f"{_ruby_json_literal(str(k))} => {_ruby_json_literal(str(v))}"
+                    for k, v in params.items()
+                ) + " }"
                 wrapper_parts.append(f"""
 class HashWithIndifferentAccess < Hash
   def [](key)
@@ -968,10 +1083,13 @@ end
 request = Request.new(params)
 """)
             else:
-                # 普通模式
+                # 普通模式（P9-3：value/key 用 Ruby 安全字面量插值，
+                # 旧实现原样插入双引号，#{...} 可直接执行系统命令）
                 for i, (key, value) in enumerate(params.items()):
-                    wrapper_parts.append(f'ARGV[{i}] = "{value}"')
-                    wrapper_parts.append(f'ENV["{key.upper()}"] = "{value}"')
+                    value_lit = _ruby_json_literal(str(value))
+                    key_lit = _ruby_json_literal(str(key).upper())
+                    wrapper_parts.append(f"ARGV[{i}] = {value_lit}")
+                    wrapper_parts.append(f"ENV[{key_lit}] = {value_lit}")
 
         wrapper_parts.append(code)
         return "\n".join(wrapper_parts)
@@ -992,6 +1110,14 @@ request = Request.new(params)
         **kwargs
     ) -> ToolResult:
         """执行 Ruby 测试"""
+        # P9-3：映射参数形状防御（initialize 之前）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+        env_vars, _err = _coerce_mapping_field(env_vars, "env_vars")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -1091,10 +1217,16 @@ class ShellTestTool(BaseLanguageTestTool):
             for key, value in params.items():
                 # 设置位置参数和环境变量
                 if key.isdigit():
-                    # 位置参数需要特殊处理
+                    # 位置参数需要特殊处理（保持既有行为：当前不展开为 $N）
                     pass
                 else:
-                    wrapper_parts.append(f'export {key.upper()}="{value}"')
+                    # P9-3：环境变量名须为合法标识符，值用单引号安全包裹
+                    # （旧实现双引号原样插值，";、$()、反引号均可注入执行）
+                    env_key = str(key).upper()
+                    if re.fullmatch(r"[A-Z_][A-Z0-9_]*", env_key):
+                        wrapper_parts.append(
+                            f"export {env_key}={_shell_quote(str(value))}"
+                        )
 
         wrapper_parts.append(code)
         return "\n".join(wrapper_parts)
@@ -1179,6 +1311,11 @@ class UniversalCodeTestTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行通用代码测试"""
+        # P9-3：映射参数形状防御（转发到叶子之前，坏参数不触发叶子 initialize）
+        params, _err = _coerce_mapping_field(params, "params")
+        if _err:
+            return ToolResult(success=False, error=_err)
+
         language = language.lower().strip()
 
         tester = self._testers.get(language)

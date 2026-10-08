@@ -171,8 +171,16 @@ class Settings(BaseSettings):
     LLM_CONCURRENCY: int = 3
     # P5-2（2026-10-04）：跨任务全局 LLM 并发闸（四任务并发打爆单卡 SGLang
     # 实证）。单 worker 下进程内信号量即全局；闸粒度 = 单次 HTTP 出站调用。
-    LLM_GLOBAL_CONCURRENCY: int = 6  # LLM骞跺彂鏁?
+    LLM_GLOBAL_CONCURRENCY: int = 4  # P9 D5: 6→4 (6槽实测仍现 abort 空返回，下调让请求在进程内排队)  # LLM骞跺彂鏁?
     LLM_GAP_MS: int = 2000  # LLM璇锋眰闂撮殧锛堟绉掞級
+
+    # P9 稳定性簇（裁决 D3）：LLM 端点软熔断参数（按 base_url 滑窗）。
+    LLM_ENDPOINT_WINDOW_SIZE: int = 20       # 滑窗容量（帧数）
+    LLM_ENDPOINT_MIN_SAMPLES: int = 10       # 最小判定样本数（不足不判 degraded）
+    LLM_ENDPOINT_EMPTY_RATE: float = 0.5     # 空响应率 degraded 阈值
+    LLM_ENDPOINT_DEGRADED_SECONDS: float = 30.0   # degraded 持续超该值 → 有序收口
+    LLM_ENDPOINT_THROTTLE_SECONDS: float = 5.0    # degraded 时单帧降速等待
+    LLM_ENDPOINT_COOLDOWN_SECONDS: float = 120.0  # 有序收口冷却（不重复）
     
     # ZIP鏂囦欢瀛樺偍閰嶇疆
     ZIP_STORAGE_PATH: str = "./uploads/zip_files"  # ZIP鏂囦欢瀛樺偍鐩綍

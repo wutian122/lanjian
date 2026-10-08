@@ -18,7 +18,8 @@ export type LogType =
   | 'user'
   | 'dispatch'
   | 'progress'
-  | 'sandbox';
+  | 'sandbox'
+  | 'warning';  // P9 D6：degenerate/端点熔断告警（amber，独立于 info/error）
 
 export type ToolStatus = 'running' | 'completed' | 'failed';
 
