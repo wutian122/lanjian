@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { useLocalStorage } from "@/shared/hooks/useLocalStorage";
 import { toast } from "sonner";
+import { cn } from "@/shared/utils/utils";
 import { useResilientStream, type ConnectionState } from "./hooks/useResilientStream";
 
 import {
@@ -110,6 +111,27 @@ function AgentAuditPageContent() {
     const timer = setTimeout(() => setShowRecoverBanner(true), 5000);
     return () => clearTimeout(timer);
   }, [canRecover]);
+
+  // 层 5b（2026-09-29）：LLM 健康度横幅——observations 里的 llm_health.degraded
+  // 表示任务全程 LLM 截断/空响应占比过高，审计结论可能不完整（0 发现/缺口）。
+  const llmHealthDegraded = (task?.observations ?? []).some(
+    (o) => (o as { llm_health?: { degraded?: boolean } } | null)?.llm_health?.degraded === true,
+  );
+
+  // 运行中实时 LLM 异常事件计数（从日志流统计，口径=事件条数；
+  // "检测到空响应"= 最后一搏 warning 每空轮恰好 1 条，1:1 对应空响应轮）
+  const llmRuntimeWarnings = useMemo(() => {
+    let truncations = 0;
+    let empties = 0;
+    let formatFails = 0;
+    for (const log of logs) {
+      const text = log.title || "";
+      if (text.includes("max_tokens 截断")) truncations += 1;
+      if (text.includes("检测到空响应")) empties += 1;
+      if (text.includes("格式解析失败")) formatFails += 1;
+    }
+    return { truncations, empties, formatFails };
+  }, [logs]);
 
   // 🔥 当 taskId 变化时立即重置状态（新建任务时清理旧日志）
   useEffect(() => {
@@ -474,7 +496,12 @@ function AgentAuditPageContent() {
               dispatch({
                 type: 'ADD_LOG',
                 payload: {
-                  type: event.event_type === 'error' ? 'error' : 'info',
+                  // P9 D6：warning 事件独立 amber 类型（degenerate/端点熔断）
+                  type: event.event_type === 'error'
+                    ? 'error'
+                    : event.event_type === 'warning'
+                      ? 'warning'
+                      : 'info',
                   title: message,
                   agentName,
                 }
@@ -1473,12 +1500,27 @@ function AgentAuditPageContent() {
           </div>
         )}
 
+        {/* 层 5b：LLM 健康度横幅（审计结论可能不完整）。
+            I4（审查 2026-09-29）：degraded 升级后的 status 即 completed_with_gaps，
+            与 canReAudit 横幅状态重合且同位重叠——两横幅互斥，re-audit 场景
+            把健康度警示并入蓝色横幅文案。 */}
+        {llmHealthDegraded && !canReAudit && (
+          <div className="absolute top-0 left-0 right-0 z-10 bg-orange-50 border-b border-orange-200 px-4 py-2 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-orange-600 flex-shrink-0" />
+            <span className="text-sm text-orange-700">
+              LLM 输出质量异常（截断/空响应占比过高），本轮审计结论可能不完整，请谨慎采信。
+            </span>
+          </div>
+        )}
+
         {canReAudit && (
           <div className="absolute top-0 left-0 right-0 z-10 bg-blue-50 border-b border-blue-200 px-4 py-2 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-blue-600" />
+              <AlertCircle className={cn("w-4 h-4", llmHealthDegraded ? "text-orange-600" : "text-blue-600")} />
               <span className="text-sm text-blue-700">
-                {"任务已完成但存在未验证的漏洞，可补充审计。"}
+                {llmHealthDegraded
+                  ? "任务已完成但存在未验证的漏洞，可补充审计；且 LLM 输出质量异常（截断/空响应占比过高），本轮结论可能不完整。"
+                  : "任务已完成但存在未验证的漏洞，可补充审计。"}
               </span>
             </div>
             <Button size="sm" onClick={handleReAudit} disabled={isReAuditing || !canReAudit}>
@@ -1758,7 +1800,7 @@ function AgentAuditPageContent() {
 
           {/* Middle section - Stats */}
           <div className="flex-shrink-0 border-t border-border bg-card p-3">
-            <StatsPanel task={task} findings={findings} compact />
+            <StatsPanel task={task} findings={findings} compact llmRuntimeWarnings={llmRuntimeWarnings} />
           </div>
         </div>
       </div>

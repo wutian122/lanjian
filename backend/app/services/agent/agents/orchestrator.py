@@ -30,12 +30,40 @@ from ..strict_finding import (
     MIN_CANDIDATE_CONFIDENCE,
     MIN_CONFIDENCE_THRESHOLD,
     is_context_only_finding,
+    is_order_aligned_finding,
     is_verification_work_item,
 )
 from .base import AgentConfig, AgentPattern, AgentResult, AgentType, BaseAgent, TaskHandoff
+from .verification import _attempt_is_infra
 from app.services.agent.config import get_agent_config
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_snippet(value: Any, limit: int) -> str | None:
+    """P9-6：trace 三字段（poc/code_snippet/description）安全归一。
+
+    verification 按 prompt 模板把 poc 输出为结构化 dict（description/steps/
+    payload/harness_code），旧代码 ``value[:300]`` 对 dict 切片抛
+    ``KeyError: slice(None, 300, None)``，硬断 merge 循环（dispatch_complete
+    永不发射）。口径：
+    - str → 原样切片；
+    - dict/list → json.dumps(ensure_ascii=False) 后切片（保留中文可读）；
+    - None → None；
+    - 其他类型或不可 JSON 序列化值 → str(value) 后切片。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    return text[:limit]
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """你是蓝鉴的编排 Agent，负责**自主**协调整个安全审计流程。
@@ -250,6 +278,44 @@ _SEMGREP_FALLBACK_SEVERITY_ORDER: dict[str, int] = {
     "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
 }
 _SEMGREP_FALLBACK_MIN_SEVERITY_RANK = 2  # medium
+
+
+def _build_semgrep_hot_lead(semgrep_findings: list) -> str:
+    """P7-3（2026-10-07）：Semgrep 热点线索注入文本（带规则号/行号/severity）。
+
+    生产实证（B 机 c8686a20）：旧注入仅前 20 个路径（无规则号/行号），
+    LLM 无法据此精准定位；且无序截断可能丢高价值命中。修复：按 severity
+    降序、带 `path:line [rule] (severity)` 格式、取前 20。
+    """
+    hits = [sf for sf in (semgrep_findings or []) if isinstance(sf, dict)]
+    ranked = sorted(
+        hits,
+        key=lambda sf: _SEMGREP_FALLBACK_SEVERITY_ORDER.get(
+            str(sf.get("severity") or "medium").strip().lower(),
+            _SEMGREP_FALLBACK_MIN_SEVERITY_RANK,
+        ),
+        reverse=True,
+    )
+    lines = []
+    for sf in ranked[:20]:
+        fp = sf.get("file_path", sf.get("path", "?"))
+        ln = sf.get("line_start", sf.get("line", "?"))
+        rule = (
+            sf.get("semgrep_rule_id")
+            or sf.get("rule_id")
+            or sf.get("check_id")
+            or "?"
+        )
+        sev = str(sf.get("severity") or "?").strip().lower()
+        lines.append(f"- `{fp}:{ln}` [{rule}] ({sev})")
+    hot_files_summary = "\n".join(lines)
+    return (
+        f"## 🔍 Semgrep 预扫描线索\n\n"
+        f"Semgrep 已完成确定性扫描，识别出 {len(hits)} 条潜在问题（按严重度排序，前 20 条）:\n"
+        f"{hot_files_summary}\n\n"
+        f"**重要**：这些是 Semgrep 的初步发现，必须由 Analysis Agent 深度验证后才能确认为漏洞。\n"
+        f"请调度 Recon Agent 收集这些热点文件的结构信息，再调度 Analysis Agent 进行深度审计。"
+    )
 
 
 def _is_verifiable_semgrep_candidate(candidate: dict[str, Any]) -> bool:
@@ -610,8 +676,9 @@ class OrchestratorAgent(BaseAgent):
 
         Task 12: 遍历口径与门禁统一用 _actionable_findings（recon 上下文线索
         不参与证据判定——它们从不进验证队列，不可能携带验证状态）。
+        D12：顺序对齐条目经 _gate_evidence_findings 排除，不参与真实验证口径。
         """
-        for finding in self._actionable_findings():
+        for finding in self._gate_evidence_findings():
             if finding.get("verification_status") == "confirmed":
                 sandbox_attempts = finding.get("sandbox_attempts", [])
                 if isinstance(sandbox_attempts, list) and len(sandbox_attempts) > 0:
@@ -631,14 +698,68 @@ class OrchestratorAgent(BaseAgent):
                 continue
         return False
 
-    def _record_gate_observation(self, gate: str, reason: str) -> None:
-        """R6: 记录门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations。"""
+    def _record_gate_observation(
+        self, gate: str, reason: str, extra: dict[str, Any] | None = None
+    ) -> None:
+        """R6: 记录门禁拒绝/兜底原因，收尾时写入 agent_tasks.observations。
+
+        extra（2026-09-29 层 5c）：可携带结构化明细（如被过滤 Semgrep 候选
+        的 candidates 列表），供报告渲染"未验证静态线索"段落。
+        """
         from datetime import datetime, timezone
-        self._gate_observations.append({
+        entry: dict[str, Any] = {
             "gate": gate,
             "reason": reason,
             "time": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if extra:
+            entry.update(extra)
+        self._gate_observations.append(entry)
+
+    def _register_semgrep_leads_observation(self) -> None:
+        """P7-2（2026-10-07）：Semgrep 预扫命中全量留痕（幂等）。
+
+        生产实证（B 机 c8686a20）：预扫 129→去重 82 命中，Analysis 有产出时
+        兜底通道整条短路——80 条未采纳命中在正常路径零记录（审计链黑洞）。
+        本方法无论 Analysis 是否有产出，收口时把全部命中的统计+明细写入
+        gate observation "semgrep_leads"，报告段复用「未验证静态线索」渲染。
+        """
+        if getattr(self, "_semgrep_leads_registered", False):
+            return
+        self._semgrep_leads_registered = True
+        hits = [f for f in (self._semgrep_findings or []) if isinstance(f, dict)]
+        if not hits:
+            return
+        adopted_files = {
+            (f.get("file_path") or "").strip().lower()
+            for f in (self._all_findings or [])
+            if isinstance(f, dict) and f.get("file_path")
+        }
+        candidates = []
+        adopted = 0
+        for h in hits:
+            fp = (h.get("file_path") or "").strip()
+            if fp.lower() in adopted_files:
+                adopted += 1
+            candidates.append({
+                "file_path": fp,
+                "line": h.get("line_start") or 0,
+                "title": str(h.get("semgrep_rule_id") or h.get("title") or "semgrep-hit")[:120],
+                "type": str(h.get("vulnerability_type") or "other"),
+            })
+        self._record_gate_observation(
+            "semgrep_leads",
+            f"Semgrep 预扫 {len(hits)} 条命中：{adopted} 条被 AI 采纳分析，"
+            f"{len(hits) - adopted} 条未采纳（明细见下，供人工复核）",
+            # P8：明细全量留痕（原 [:50] 截断致 32 条命中无记录）
+            extra={"candidates": candidates,
+                   "counts": {"hits": len(hits), "adopted": adopted,
+                              "unadopted": len(hits) - adopted}},
+        )
+        logger.info(
+            f"[Orchestrator] Semgrep leads registered: {len(hits)} hits, "
+            f"{adopted} adopted, {len(hits) - adopted} unadopted (observations)"
+        )
 
     async def _maybe_dispatch_force_verification(self) -> None:
         """T6 (REQ-VC-2): R4 放行前的程序化收口——补发一次 verification 调度。
@@ -648,6 +769,10 @@ class OrchestratorAgent(BaseAgent):
         判定与全量验证门禁同款：非 confirmed/static_confirmed 等终态，或整体无有效
         沙箱证据，即视为未验证；一次性标志 _force_verification_dispatched 防重复。
         """
+        # P9：端点熔断/degenerate 导致的有序收口——不补发 verification
+        # （breaker 收口后无新 dispatch）
+        if getattr(self, "_orderly_stopped", False):
+            return
         if self._force_verification_dispatched:
             return
         unverified = [
@@ -733,6 +858,113 @@ class OrchestratorAgent(BaseAgent):
             )
         return marked
 
+    # P9 终局 sweep：状态单调只升序位（false_positive 不经 sweep 升级）
+    _SWEEP_STATUS_RANK: dict[str, int] = {
+        "confirmed": 4,
+        "static_confirmed": 3,
+        "not_reproducible": 2,
+        "needs_context": 0,
+    }
+
+    @staticmethod
+    def _lookup_archive_attempts(
+        file_path: str,
+        bound_ids: set[int],
+        archive: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """从持久归档反查命中的 attempt（同一 attempt 不重复绑定）。
+
+        优先级：完整 file_path 精确包含 → 路径末 2 段后缀兜底。
+        fabricated attempt 不参与（绑定后也过不了状态引擎，只会占位）。
+        """
+        fp_norm = str(file_path or "").strip().lower()
+        fp_suffix = "/".join([s for s in fp_norm.split("/") if s][-2:])
+        exact: list[dict[str, Any]] = []
+        suffix: list[dict[str, Any]] = []
+        for attempt in archive:
+            if not isinstance(attempt, dict) or id(attempt) in bound_ids:
+                continue
+            if attempt.get("fabricated"):
+                continue
+            hay = (
+                str(attempt.get("command") or "")
+                + " " + str(attempt.get("target_ref") or "")
+            ).lower()
+            if fp_norm and fp_norm in hay:
+                exact.append(attempt)
+            elif fp_suffix and fp_suffix in hay:
+                suffix.append(attempt)
+        return (exact or suffix)[:5]
+
+    def _final_evidence_sweep(self) -> int:
+        """P9 终局防御：落库前从 verification 持久归档反查绑定仍无 attempts
+        的 finding，经 _normalize_verification_outcome 重算。
+
+        口径：
+        - 仅处理验证工作项；空身份不参与；D12 aligned 条目不参与；
+        - 已有 attempts 的 finding 跳过（幂等）；显式 false_positive 维持（D10）；
+        - 状态单调只升不降级，verdict/is_verified/note 同步写回；
+        - 每次状态升级追加 post_gate_evidence_sweep observation（from→to）。
+        """
+        verification = (self.sub_agents or {}).get("verification")
+        if verification is None:
+            return 0
+        archive = getattr(verification, "_persistent_attempt_archive", None) or []
+        if not archive:
+            return 0
+        bound_ids = getattr(self, "_sweep_bound_attempt_ids", None)
+        if bound_ids is None:
+            bound_ids = set()
+            self._sweep_bound_attempt_ids = bound_ids
+
+        changed = 0
+        for finding in self._all_findings or []:
+            if not isinstance(finding, dict):
+                continue
+            if not is_verification_work_item(finding):
+                continue
+            if is_order_aligned_finding(finding):
+                continue
+            fp = str(finding.get("file_path") or "").strip()
+            if not fp or fp.lower() in ("unknown", "?", "n/a", "none", "null"):
+                continue
+            if finding.get("sandbox_attempts"):
+                continue
+            old_status = str(
+                finding.get("verification_status") or ""
+            ).strip().lower()
+            if old_status == "false_positive":
+                # D10：无 attempts 的 FP 只可能来自 LLM 显式标注，维持
+                continue
+            candidates = self._lookup_archive_attempts(fp, bound_ids, archive)
+            if not candidates:
+                continue
+            finding["sandbox_attempts"] = list(candidates)
+            for candidate in candidates:
+                bound_ids.add(id(candidate))
+            recalculated = verification._normalize_verification_outcome(
+                dict(finding)
+            )
+            new_status = str(
+                recalculated.get("verification_status") or ""
+            ).strip().lower()
+            if self._SWEEP_STATUS_RANK.get(new_status, 0) > \
+                    self._SWEEP_STATUS_RANK.get(old_status, 0):
+                finding["verification_status"] = new_status
+                finding["verdict"] = new_status
+                if recalculated.get("is_verified") is True:
+                    finding["is_verified"] = True
+                recalc_note = recalculated.get("verification_note")
+                if recalc_note:
+                    finding["verification_note"] = recalc_note
+                self._record_gate_observation(
+                    "post_gate_evidence_sweep",
+                    f"归档反查证据绑定并重算: "
+                    f"{old_status or 'none'} → {new_status}",
+                )
+                changed += 1
+        return changed
+
     def _evaluate_current_coverage(self) -> Any:
         """基于当前 findings 与文本证据评估软覆盖率。"""
         text_evidence: list[str] = []
@@ -743,7 +975,8 @@ class OrchestratorAgent(BaseAgent):
             for result in self._agent_results.values()
         )
         # Task 11: recon 上下文线索不计覆盖维度（避免侦察线索冒充已覆盖产出）
-        return evaluate_coverage(self._actionable_findings(), text_evidence)
+        # D12：顺序对齐条目同样排除（不参与 D1/D2/D3 真验证口径）
+        return evaluate_coverage(self._gate_evidence_findings(), text_evidence)
 
     def _convert_recon_high_risk_area_to_finding(self, area: Any) -> dict[str, Any] | None:
         """Recon 高风险区是 Analysis 的上下文线索，不作为漏洞 findings。"""
@@ -766,6 +999,17 @@ class OrchestratorAgent(BaseAgent):
         return [
             f for f in (self._all_findings or [])
             if is_verification_work_item(f)
+        ]
+
+    def _gate_evidence_findings(self) -> list[dict[str, Any]]:
+        """D12：finish 门禁「真实验证」口径——顺序对齐条目单独分桶排除。
+
+        aligned 条目的身份按报告顺序承接（可能错绑），不参与 D1/D2/D3
+        真验证口径、不计 completed 名义；门禁统计/覆盖率矩阵统一消费本方法。
+        """
+        return [
+            f for f in self._actionable_findings()
+            if not is_order_aligned_finding(f)
         ]
 
     def _build_semgrep_fallback_candidates(self) -> list[dict[str, Any]]:
@@ -859,7 +1103,19 @@ class OrchestratorAgent(BaseAgent):
                     f"{len(unverifiable)} 条 Semgrep 兜底候选为 EL 表达式/模板注入（SSTI）"
                     f"类，无确定性 PoC 专用模板（特征分布: {kind_breakdown}），"
                     "不进验证队列、不送沙箱（误走 SQL/命令模板必出 NO_SINK 白跑）；"
-                    "仅保留静态扫描结论，不进 semgrep_fallback_filtered 口径",
+                    "进报告「未验证静态线索」段（报告仅呈现，未执行验证）",
+                    extra={
+                        "candidates": [
+                            {
+                                "file_path": str(c.get("file_path") or ""),
+                                "line": c.get("line_start") or 0,
+                                "title": str(c.get("title") or "")[:120],
+                                "type": str(c.get("unverifiable_kind")
+                                            or c.get("vulnerability_type") or "unknown"),
+                            }
+                            for c in unverifiable
+                        ],
+                    },
                 )
                 logger.info(
                     f"[Orchestrator] Semgrep fallback excluded {len(unverifiable)} "
@@ -887,7 +1143,18 @@ class OrchestratorAgent(BaseAgent):
                     "semgrep_fallback_filtered",
                     f"{len(filtered)} 条 Semgrep 兜底候选无确定性 PoC 验证条件"
                     f"（类型分布: {breakdown}{sev_detail}），"
-                    "不进验证队列、不送沙箱、不入兜底候选报告段落",
+                    "不进验证队列、不送沙箱；进报告「未验证静态线索」段",
+                    extra={
+                        "candidates": [
+                            {
+                                "file_path": str(c.get("file_path") or ""),
+                                "line": c.get("line_start") or 0,
+                                "title": str(c.get("title") or "")[:120],
+                                "type": str(c.get("vulnerability_type") or "unknown"),
+                            }
+                            for c in filtered
+                        ],
+                    },
                 )
                 logger.info(
                     f"[Orchestrator] Semgrep fallback filtered {len(filtered)} non-verifiable "
@@ -1417,14 +1684,8 @@ class OrchestratorAgent(BaseAgent):
                     logger.warning(f"[Orchestrator] Semgrep prescan failed (non-fatal): {e}")
 
                 if self._semgrep_hot_files:
-                    hot_files_summary = ", ".join(self._semgrep_hot_files[:20])
-                    semgrep_lead = (
-                        f"## 🔍 Semgrep 预扫描线索\n\n"
-                        f"Semgrep 已完成确定性扫描，识别出 {len(self._semgrep_hot_files)} 个热点文件（含潜在安全问题）。\n"
-                        f"**热点文件列表**（前20个）:\n{hot_files_summary}\n\n"
-                        f"**重要**：这些是 Semgrep 的初步发现，必须由 Analysis Agent 深度验证后才能确认为漏洞。\n"
-                        f"请调度 Recon Agent 收集这些热点文件的结构信息，再调度 Analysis Agent 进行深度审计。"
-                    )
+                    # P7-3：注入带规则号/行号/severity 的命中明细（原为纯路径列表）
+                    semgrep_lead = _build_semgrep_hot_lead(self._semgrep_findings)
                     self._conversation_history.append({
                         "role": "user",
                         "content": semgrep_lead,
@@ -1458,6 +1719,37 @@ class OrchestratorAgent(BaseAgent):
                 await self._maybe_pause()
                 if self.is_cancelled:
                     break
+
+                # P9 稳定性簇（裁决 D3）：端点 degraded 持续超 30s → 有序收口
+                # （复用 break 后的正常 finish 收口流，保留已获证据；冷却内
+                # should_orderly_stop 不重复）。标志置位跳过 force verification 补发。
+                try:
+                    from app.core.llm_endpoint_health import get_endpoint_health
+
+                    _ep_key = self._llm_endpoint_key()
+                    if get_endpoint_health().should_orderly_stop(_ep_key):
+                        self._orderly_stopped = True
+                        self._record_gate_observation(
+                            "llm_endpoint_circuit",
+                            "LLM 端点空响应率持续过高（degraded 超 30s），"
+                            "有序停止新的编排轮次并收口，已获证据保留",
+                        )
+                        logger.warning(
+                            "[Orchestrator] Endpoint circuit degraded too long, "
+                            "orderly stopping with existing evidence"
+                        )
+                        await self.emit_event(
+                            "warning",
+                            "LLM 端点持续过载（空响应/degenerate），"
+                            "有序停止新的编排轮次并收口",
+                        )
+                        break
+                except Exception as _circuit_err:
+                    logger.debug(
+                        f"[Orchestrator] endpoint circuit check failed "
+                        f"(non-fatal): {_circuit_err}",
+                        exc_info=True,
+                    )
 
                 # P1: token 预算硬门禁 —— 超限优雅降级为 COMPLETED_WITH_GAPS
                 if self._check_token_budget_exceeded():
@@ -1556,10 +1848,38 @@ class OrchestratorAgent(BaseAgent):
                 # 🔥 检测空响应（tool_calls 形态正文为空属正常，不判空）
                 if (not llm_output or not llm_output.strip()) and not tool_calls_this_round:
                     logger.warning(f"[{self.name}] Empty LLM response")
+                    # R-C1：truncated 形态（思考流吃光输出预算）连续 3 轮即止损——
+                    # 系统性工况下重试大概率同样截断，避免每轮约 100 秒的空转烧资源
+                    # （2026-09-26 生产实证：任务 c0c6182f 连续 6 轮空转后才兜底）
+                    if self.record_empty_round():
+                        # P5-3（2026-10-04）：按形态如实归因——usage 全 0 =
+                        # 调用未达模型（服务过载 abort/瞬时故障），非"思考流耗尽"
+                        if self._is_overload_suspected(getattr(self, "_last_round_usage", None)):
+                            _stop_reason = (
+                                f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮 LLM 返回空响应"
+                                "（疑似服务过载或网络异常，调用未达模型）"
+                            )
+                            _advice = "建议稍后点击重新审计，或检查 LLM 服务状态"
+                        else:
+                            _stop_reason = (
+                                f"连续 {self.TRUNCATED_EMPTY_STOP_LIMIT} 轮输出被截断且正文为空"
+                            )
+                            _advice = "建议调大 max_tokens 或精简任务描述"
+                        logger.error(f"[{self.name}] {_stop_reason}，止损停止重试")
+                        # P9：止损即有序收口——跳过 force verification 补发
+                        self._orderly_stopped = True
+                        self._record_gate_observation(
+                            "llm_empty_response_streak",
+                            f"{_stop_reason}，编排提前收口，仅 Semgrep 兜底候选可用。{_advice}",
+                        )
+                        await self.emit_event("error", f"{_stop_reason}，已止损。{_advice}")
+                        break
                     empty_retry_count = getattr(self, '_empty_retry_count', 0) + 1
                     self._empty_retry_count = empty_retry_count
                     if empty_retry_count >= 5:  # 🔥 增加重试次数到5次
                         logger.error(f"[{self.name}] Too many empty responses, stopping")
+                        # P9：止损即有序收口
+                        self._orderly_stopped = True
                         error_message = "连续收到空响应，停止编排"
                         await self.emit_event("error", error_message)
                         break
@@ -1599,6 +1919,8 @@ Action Input: {{"参数": "值"}}
 
                 # 重置空响应计数器
                 self._empty_retry_count = 0
+                # R-C1：有效产出轮（正文/工具调用）重置连续 truncated 计数
+                self.reset_empty_streak()
 
                 # 🔥 检查是否是 API 错误（而非格式错误）
                 if llm_output.startswith("[API_ERROR:"):
@@ -1667,6 +1989,12 @@ Action Input: {{"参数": "值"}}
 
                 # 重置 API 重试计数器（成功获取响应后）
                 self._api_retry_count = 0
+                # 韧性修复（2026-10-02）：连接错误重试恢复后，error_message 若
+                # 仍保留 [API_ERROR:*] 分支的残留文本，run() 尾部 `if error_message:`
+                # 会把数小时后的正常 finish 收口误判为失败（生产实证任务 bba4d002：
+                # 09:38 一次连接错误污染变量，14:00 正常 finish 时任务被误标 failed）。
+                # 成功轮意味着错误已恢复，error_message 与计数器一并清零。
+                error_message = None
 
                 # 解析 LLM 的决策（Task 7 双形态）
                 if tool_calls_this_round:
@@ -1740,6 +2068,50 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 # 重置格式重试计数器
                 self._format_retry_count = 0
 
+                # 层 3a：截断轮乱码守门（2026-09-29）——本轮输出被 length 截断
+                # 且解析产物混入垃圾字符（生产实证乱码任务文本传给子 Agent 的
+                # 出口），丢弃本轮决策：不执行、不传子 Agent；历史中尚无本轮
+                # assistant 消息，仅追加一条压缩输出提示即重试。
+                # I3（审查 2026-09-29）：连续命中计数——模型系统性崩坏时每轮
+                # 都会截断+乱码，无上限的重试会空转到迭代/时间预算耗尽；连续
+                # 3 次即止损收口，缺口如实记入 observations。
+                if self._is_garbled_truncated_output(step, llm_output or ""):
+                    self._garbled_drop_count = getattr(self, "_garbled_drop_count", 0) + 1
+                    if self._garbled_drop_count >= 3:
+                        # P9：止损即有序收口
+                        self._orderly_stopped = True
+                        self._record_gate_observation(
+                            "garbled_output_streak",
+                            f"连续 {self._garbled_drop_count} 轮输出被截断且含乱码，"
+                            "已止损停止重试（模型输出系统性崩坏）",
+                        )
+                        await self.emit_event(
+                            "error",
+                            f"连续 {self._garbled_drop_count} 轮 LLM 输出被截断且含乱码，"
+                            "已止损（建议检查模型服务状态或切换模型）",
+                        )
+                        break
+                    logger.warning(
+                        f"[{self.name}] 截断轮输出含乱码（字符异常墙），本轮决策丢弃"
+                        f"（{self._garbled_drop_count}/3）"
+                    )
+                    await self.emit_event(
+                        "warning",
+                        "上一轮输出被截断且包含乱码，本轮决策已丢弃；"
+                        "要求大幅压缩输出后重试",
+                    )
+                    self._conversation_history.append({
+                        "role": "user",
+                        "content": (
+                            "[系统提示：上一轮输出被截断且包含乱码，已被丢弃。"
+                            "请大幅压缩输出——省略解释性文字，保留核心指令、"
+                            "文件路径清单与维度关键词——后重新输出。]"
+                        ),
+                    })
+                    continue
+                # 正常产出轮重置乱码连续计数
+                self._garbled_drop_count = 0
+
                 self._steps.append(step)
 
                 # 🔥 发射 LLM 思考内容事件 - 展示编排决策的思考过程
@@ -1799,6 +2171,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                 # 执行 LLM 决定的操作
                 if step.action == "finish":
+                    # P7-2：收口前登记 Semgrep 命中全量留痕（幂等，正常路径也记）
+                    self._register_semgrep_leads_observation()
                     # Task 11 (finding-output-floor): finish 前兜底——Analysis 达调度
                     # 上限或产出下限违规时，Semgrep 预扫发现兜底落库（幂等）；仍无
                     # 可验证产出则按覆盖不足语义收口（completed_with_gaps）。
@@ -2032,7 +2406,8 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
                     # 硬性覆盖率门禁 - 不可被 LLM 跳过（带逃逸路径）
                     coverage_matrix = CoverageMatrix()
-                    for finding in self._actionable_findings():
+                    # D12：硬覆盖矩阵同样排除顺序对齐条目
+                    for finding in self._gate_evidence_findings():
                         dim = CoverageMatrix.map_finding_to_dimension(finding.get("vulnerability_type", ""))
                         if dim:
                             coverage_matrix.mark_covered(dim, evidence=finding.get("title", ""))
@@ -2042,7 +2417,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                             coverage_matrix.mark_shallow(dim, evidence=f"grep: {pattern}")
                     hard_coverage = coverage_matrix.to_report()
 
-                    if len(self._actionable_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 3:
+                    if len(self._gate_evidence_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count < 3:
                         self._hard_coverage_block_count += 1
                         try:
                             await self.emit_event(
@@ -2099,7 +2474,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                             ),
                         })
                         continue
-                    elif len(self._actionable_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 3:
+                    elif len(self._gate_evidence_findings()) > 0 and not hard_coverage.is_sufficient and self._hard_coverage_block_count >= 3:
                         logger.warning(
                             f"Coverage gate bypassed after {self._hard_coverage_block_count} blocks: "
                             f"{hard_coverage.covered_count}/10 covered"
@@ -2355,6 +2730,14 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                 await self._maybe_dispatch_force_verification()
             except Exception as e:
                 logger.warning(f"[Orchestrator] Force verification on finalize failed (non-fatal): {e}")
+
+            # P9 终局防御：落库前从 verification 持久归档反查绑定仍无 attempts
+            # 的 finding（重算、单调只升、留痕）。必须位于 gate release marking
+            # 之前——已绑定证据的 finding 不得再被豁免（杜绝「已豁免但有证据」矛盾）
+            try:
+                self._final_evidence_sweep()
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Final evidence sweep failed (non-fatal): {e}")
 
             # sandbox-verification-hard-gate Task 8: 放行收口——R4 达限放行/轮次耗尽
             # 退出两条路径上，补验后仍零沙箱尝试的未验证 finding 强制写
@@ -2752,20 +3135,37 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         # 🔥 v3.0: 提取 Action Input（更宽松的匹配）
         input_match = re.search(r'Action Input:\s*(.*?)(?=\n(?:Thought:|Action:|Observation:)|$)', cleaned_response, re.DOTALL)
         if not input_match:
-            logger.warning(f"[{self.name}] 解析失败：未找到 Action Input 字段")
-            logger.debug(f"[{self.name}] Action: {action}, 响应内容（前500字符）: {cleaned_response[:500]}")
-            return None
-
-        input_text = input_match.group(1).strip()
-        # 移除 markdown 代码块
-        input_text = re.sub(r'```json\s*', '', input_text)
-        input_text = re.sub(r'```\s*', '', input_text)
-
-        # 使用增强的 JSON 解析器
-        action_input = AgentJsonParser.parse(
-            input_text,
-            default={"raw": input_text}
-        )
+            # P8（2026-10-07）：无参数动作（finish/summarize）允许省略
+            # Action Input——LLM 的合理输出不得判格式失败（生产实证裸
+            # 'Action: finish' 被误判，触发无谓静默重试）
+            if action.strip().lower() in {"finish", "summarize"}:
+                input_text = ""
+                action_input: Any = {}
+            else:
+                # D8/P9-1a：无 "Action Input:" 标签——先尝试无标签 JSON
+                # 提取（与子 Agent 统一解析口径）；成功即用
+                extracted = self._extract_unlabeled_input(action, cleaned_response)
+                if extracted is not None:
+                    logger.info(
+                        f"[{self.name}] Unlabeled action input extracted for "
+                        f"'{action}' (keys={list(extracted.keys())})"
+                    )
+                    action_input = extracted
+                else:
+                    # 失败维持 return None（10 梯度重试兜底不变）
+                    logger.warning(f"[{self.name}] 解析失败：未找到 Action Input 字段且无标签提取失败")
+                    logger.debug(f"[{self.name}] Action: {action}, 响应内容（前500字符）: {cleaned_response[:500]}")
+                    return None
+        else:
+            input_text = input_match.group(1).strip()
+            # 移除 markdown 代码块
+            input_text = re.sub(r'```json\s*', '', input_text)
+            input_text = re.sub(r'```\s*', '', input_text)
+            # 使用增强的 JSON 解析器
+            action_input = AgentJsonParser.parse(
+                input_text,
+                default={"raw": input_text}
+            )
 
         logger.debug(f"[{self.name}] 解析成功: action={action}, input_keys={list(action_input.keys()) if isinstance(action_input, dict) else 'not_dict'}")
 
@@ -2858,15 +3258,19 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
         if not tool_calls:
             return None
         call = tool_calls[0] or {}
-        action = str(call.get("name") or "").strip()
+        # X3：name 损坏修复（生产实证 "ve rification" 空格插入形态）
+        action = self._repair_tool_call_name(
+            str(call.get("name") or "").strip(),
+            ["dispatch_agent", "summarize", "finish"],
+        )
         arguments = call.get("arguments")
         if isinstance(arguments, dict):
             parsed: dict[str, Any] = arguments
         elif isinstance(arguments, str) and arguments.strip():
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
-                parsed = {}
+            # X2：坏 JSON 先 json-repair 抢救（修复半截/损坏 dispatch 参数），
+            # 抢救成功则参数可读，Task 21 不再判 bad_json
+            repaired = self._parse_tool_call_arguments(arguments)
+            parsed = repaired if repaired is not None else {}
             if not isinstance(parsed, dict):
                 parsed = {}
         else:
@@ -3021,6 +3425,67 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             ),
         })
 
+    # dispatch 任务描述字符预算（层 2b）：真实样本证据——任务描述常在 2-4K
+    # 字符并在 JSON 包装后突破 output token 预算，截断产生坏 JSON/乱码。
+    # 3500 字符（中英混合 ≈ 1.5-2.5K tokens）为 JSON 包装预留安全裕量。
+    DISPATCH_TASK_CHAR_BUDGET = 3500
+
+    @classmethod
+    def _compress_dispatch_task(cls, task: str) -> str:
+        """确定性兜底压缩：头 2/3 + 尾 1/3 + 省略统计（保留文件清单与收尾要求）。"""
+        budget = cls.DISPATCH_TASK_CHAR_BUDGET
+        if len(task) <= budget:
+            return task
+        head_len = budget * 2 // 3 - 40  # 为省略标记预留空间
+        tail_len = budget // 3 - 40
+        head = task[:head_len]
+        tail = task[-tail_len:]
+        omitted = len(task) - head_len - tail_len
+        marker = (
+            f"\n\n[…中间 {omitted} 字符已省略：保留目标文件清单与维度关键词；"
+            "完整要求见上文…]\n\n"
+        )
+        return head + marker + tail
+
+    async def _ensure_dispatch_task_budget(self, task: str) -> str:
+        """dispatch 任务文本出站前的预算守卫（层 2b，2026-09-29）。
+
+        未超限原样返回；超限时先尝试一次性 LLM 摘要（小预算、关思考），
+        摘要失败/为空/超长则回落确定性压缩。摘要目的：保留「文件路径清单 +
+        维度关键词」同时削掉解释性文字，让子 Agent 拿到完整有效指令。
+        """
+        if len(task) <= self.DISPATCH_TASK_CHAR_BUDGET:
+            return task
+        try:
+            summary = await self.llm_service.chat_completion(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "请把下面的审计子任务描述压缩到 800 字以内。"
+                            "必须保留：全部文件路径/文件名清单、漏洞维度关键词、"
+                            "验证/输出要求。删除：解释性文字、重复叙述。\n\n" + task
+                        ),
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=1024,
+                extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            content = (summary or {}).get("content") or ""
+            if content and len(content) <= self.DISPATCH_TASK_CHAR_BUDGET:
+                return content.strip()
+            logger.warning(
+                f"[{getattr(self, 'name', None) or self.__class__.__name__}] "
+                f"dispatch 任务摘要不可用（len={len(content)}），回落确定性压缩"
+            )
+        except Exception as exc:  # 摘要失败不致命：回落到确定性压缩
+            logger.warning(
+                f"[{getattr(self, 'name', None) or self.__class__.__name__}] "
+                f"dispatch 任务摘要失败（{exc!r}），回落确定性压缩"
+            )
+        return self._compress_dispatch_task(task)
+
     async def _dispatch_agent(self, params: dict[str, Any]) -> str:
         """调度子 Agent（支持单个和批量并行）"""
 
@@ -3029,7 +3494,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             return await self._dispatch_agents_parallel(params["agents"])
 
         agent_name = params.get("agent", "")
-        task = params.get("task", "")
+        task = await self._ensure_dispatch_task_budget(params.get("task", "") or "")
         context = params.get("context", "")
 
         logger.debug(f"[Orchestrator] _dispatch_agent 被调用: agent_name='{agent_name}', task='{task[:50]}...'")
@@ -3564,30 +4029,66 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                     logger.info(f"[Orchestrator] {agent_name} returned {len(valid_findings)} valid findings")
 
                     # 🔥 ENHANCED: Merge findings with better deduplication
+                    # P9-6：逐条 try/except 隔离——单条异常（如 trace 字段切片
+                    # KeyError、normalize/merge 意外）不得中断整轮 merge；异常记
+                    # gate observation "per_finding_trace_error" 后 continue，
+                    # 保证后续条目继续 merge、dispatch_complete 必达。
                     for new_f in valid_findings:
-                        # Normalize the finding first
-                        normalized_new = self._normalize_finding(new_f)
+                        try:
+                            # Normalize the finding first
+                            normalized_new = self._normalize_finding(new_f)
 
-                        # Skip if normalization rejected the finding (e.g., file not found)
-                        if normalized_new is None:
-                            continue
+                            # Skip if normalization rejected the finding (e.g., file not found)
+                            if normalized_new is None:
+                                continue
 
-                        # T7 (REQ-VC-3): merge-back 统一入口（_sandbox_finding_id 精确匹配优先）
-                        self._merge_or_append_finding(normalized_new)
+                            # T7 (REQ-VC-3): merge-back 统一入口（_sandbox_finding_id 精确匹配优先）
+                            self._merge_or_append_finding(normalized_new)
 
-                        # 🔥 v3.0: 记录漏洞发现到追踪文件
-                        if self.trace_manager:
-                            self.trace_manager.add_finding(
-                                finding_type=normalized_new.get("type", "unknown"),
-                                severity=normalized_new.get("severity", "medium"),
-                                title=normalized_new.get("title", "未知漏洞"),
-                                description=normalized_new.get("description", "")[:500],
-                                file_path=normalized_new.get("file_path", ""),
-                                line_number=normalized_new.get("line_number"),
-                                code_snippet=normalized_new.get("code_snippet", "")[:300] if normalized_new.get("code_snippet") else None,
-                                poc=normalized_new.get("poc", "")[:300] if normalized_new.get("poc") else None,
-                                agent_source=agent_name
+                            # 🔥 v3.0: 记录漏洞发现到追踪文件
+                            # P9-6：poc/code_snippet/description 三字段统一
+                            # _safe_snippet 安全归一（dict/list → JSON），
+                            # 消除 dict[:300] KeyError 硬断点。
+                            if self.trace_manager:
+                                self.trace_manager.add_finding(
+                                    finding_type=normalized_new.get("type", "unknown"),
+                                    severity=normalized_new.get("severity", "medium"),
+                                    title=normalized_new.get("title", "未知漏洞"),
+                                    description=_safe_snippet(
+                                        normalized_new.get("description"), 500
+                                    ),
+                                    file_path=normalized_new.get("file_path", ""),
+                                    line_number=normalized_new.get("line_number"),
+                                    code_snippet=_safe_snippet(
+                                        normalized_new.get("code_snippet"), 300
+                                    ),
+                                    poc=_safe_snippet(normalized_new.get("poc"), 300),
+                                    agent_source=agent_name
+                                )
+                        except Exception as exc:
+                            finding_ref = str(
+                                new_f.get("id")
+                                or new_f.get("_sandbox_finding_id")
+                                or new_f.get("finding_id")
+                                or new_f.get("title")
+                                or new_f.get("file_path")
+                                or "unknown"
+                            )[:200]
+                            logger.warning(
+                                f"[Orchestrator] per-finding 处理异常已隔离 "
+                                f"(ref={finding_ref}): {type(exc).__name__}: {exc}"
                             )
+                            self._record_gate_observation(
+                                "per_finding_trace_error",
+                                f"单条 finding 处理异常已隔离，其余条目继续 merge: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}",
+                                extra={
+                                    "finding_ref": finding_ref,
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc)[:300],
+                                },
+                            )
+                            continue
 
                     logger.info(f"[Orchestrator] Total findings now: {len(self._all_findings)}")
                 else:
@@ -3874,6 +4375,86 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
             self._all_findings.append(normalized_new)
             logger.info(f"[Orchestrator] Added new finding: {new_file}:{new_line} ({new_type})")
 
+    def _append_verification_note(
+        self, normalized: dict[str, Any], note: str
+    ) -> None:
+        """向 finding 追加 verification_note（既有 note 保留，空格连接）。"""
+        existing = str(normalized.get("verification_note") or "").strip()
+        normalized["verification_note"] = (
+            f"{existing} {note}".strip() if existing else note
+        )
+
+    def _apply_verdict_status_mapping(self, normalized: dict[str, Any]) -> None:
+        """P9-8: verdict→verification_status 补位归一（in-place）。
+
+        子 Agent（取消/异常/非规范路径）可能只带 verdict 而无权威
+        verification_status；落库端 ``verification_status or verdict`` 兜底会
+        把 verdict 原文直接入库——static_confirmed 结论被吞为 needs_context、
+        五态口径漂移。本方法仅在 verification_status 缺失时按系统口径补位：
+        - confirmed/likely → static_confirmed（动态 confirmed 仅由确定性证据
+          引擎 compute_verification_status 给出，merge 关口不做动态确认）；
+        - false_positive → false_positive（显式标注直接落，D10 维持）；
+        - not_reproducible/not_reproduced → not_reproducible；
+        - 其余 → needs_context。
+
+        证据前置（阻断级防护，防「洗白通道」）：confirmed/likely 仅在该
+        finding 已有 ≥1 个非 fabricated、非 infra_error 的真实 sandbox attempt
+        时才采信；零 attempt/全 fabricated/全 infra → 维持 needs_context 并
+        同步改写 verdict（否则落库端再读 verdict=confirmed 仍置
+        is_verified=True），verification_note 写明拦截原因。
+        """
+        if normalized.get("verification_status"):
+            return
+        verdict_raw = str(normalized.get("verdict") or "").lower().strip()
+        if not verdict_raw:
+            return
+
+        if verdict_raw in ("confirmed", "likely"):
+            attempts = normalized.get("sandbox_attempts")
+            attempts = attempts if isinstance(attempts, list) else []
+            has_real_attempt = any(
+                isinstance(a, dict)
+                and not a.get("fabricated")
+                and not _attempt_is_infra(a)
+                for a in attempts
+            )
+            if has_real_attempt:
+                normalized["verification_status"] = "static_confirmed"
+                normalized["verdict"] = "static_confirmed"
+                normalized["is_verified"] = True
+                if verdict_raw == "confirmed":
+                    self._append_verification_note(
+                        normalized,
+                        "verdict=confirmed 经 merge 关口按系统口径降级为 "
+                        "static_confirmed（动态 confirmed 仅由确定性证据引擎给出）",
+                    )
+                return
+            # 证据前置拦截：不得凭 LLM 自报洗白
+            normalized["verification_status"] = "needs_context"
+            normalized["verdict"] = "needs_context"
+            normalized["is_verified"] = False
+            if not attempts:
+                reason = f"verdict={verdict_raw} 但无任何沙箱 attempt 证据，未采信"
+            else:
+                reason = (
+                    f"verdict={verdict_raw} 未经真实沙箱 attempt 证实"
+                    "（attempt 全部为 fabricated 伪造或 infra_error 基础设施故障），未采信"
+                )
+            self._append_verification_note(normalized, reason)
+            return
+
+        if verdict_raw == "false_positive":
+            # 显式标注直接落（D10：显式 FP 遇新证据维持）
+            normalized["verification_status"] = "false_positive"
+            return
+
+        if verdict_raw in ("not_reproducible", "not_reproduced"):
+            normalized["verification_status"] = "not_reproducible"
+            normalized["verdict"] = "not_reproducible"
+            return
+
+        normalized["verification_status"] = "needs_context"
+
     def _normalize_finding(self, finding: dict[str, Any]) -> dict[str, Any] | None:
         """
         标准化发现格式
@@ -4001,6 +4582,9 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                 f"needs_verification=true，交沙箱验证 "
                 f"(title: {normalized.get('title', 'N/A')[:50]})"
             )
+
+        # P9-8: verdict→verification_status 补位归一（证据前置防洗白）
+        self._apply_verdict_status_mapping(normalized)
 
         return normalized
 

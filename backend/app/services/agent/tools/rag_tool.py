@@ -63,7 +63,9 @@ class RAGQueryTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行 RAG 检索"""
-        # R1: query 容错 —— LLM 偶尔漏传 query，返回结构化错误而非抛 TypeError
+        # defense-in-depth（第二道）：query 在 RAGQueryInput schema 中本为必填，
+        # tools/base.py 的 R1 会先拦截"字段缺失"；此处保留 None/空串内部判空，
+        # 兜底直接调用 _execute（绕过 execute 包装）与空串显式传值的场景。
         if not query or not query.strip():
             return ToolResult(
                 success=False,
@@ -157,6 +159,10 @@ class SecurityCodeSearchTool(AgentTool):
     
     async def _execute(
         self,
+        # P9 裁决口径：vulnerability_type 在 SecurityCodeSearchInput 中保持必填，
+        # R1（tools/base.py）对缺失字段返回结构化引导；此 "unknown" 默认为
+        # 废弃的 v1 兜底——经 execute 正常路径不可达（仅直接调用 _execute 时
+        # 可能命中，按设计视为预期行为，不把 schema 改为非必填）。
         vulnerability_type: str = "unknown",
         top_k: int = 20,
         **kwargs

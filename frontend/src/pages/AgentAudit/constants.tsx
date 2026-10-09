@@ -80,6 +80,13 @@ export const LOG_TYPE_CONFIG: Record<string, {
     borderColor: "border-l-red-500",
     bgColor: "bg-red-500/15"
   },
+  // P9 D6：degenerate 掐断/端点软熔断 warning——amber 黄（既不进 info 灰
+  // 也不进 error 红；需运维关注但非致命）
+  warning: {
+    icon: React.createElement(AlertTriangle, { className: "w-4 h-4 text-amber-600 dark:text-amber-400" }),
+    borderColor: "border-l-amber-500",
+    bgColor: "bg-amber-500/10"
+  },
   user: {
     icon: React.createElement(Shield, { className: "w-4 h-4 text-indigo-600 dark:text-indigo-400" }),
     borderColor: "border-l-indigo-500",

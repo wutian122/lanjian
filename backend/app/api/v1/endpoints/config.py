@@ -80,55 +80,19 @@ def strip_empty_sensitive(data: dict, sensitive_fields: list) -> dict:
 
 
 def _validate_llm_base_url(url: str) -> str:
-    """C2: 校验 LLM Base URL，防止已认证 SSRF。
+    """校验 LLM Base URL 基本格式：仅允许 http/https 且主机名非空。
 
-    仅允许 http/https；拒绝回环/内网/保留地址（含域名解析后校验，防 DNS rebinding）；
-    逗号分隔的 LLM_TEST_ALLOWED_HOSTS 放行合法内网代理。校验失败抛 400。
+    2026-10-03 老板决策：移除内网/回环/保留地址拦截（内网 LLM 服务为部署
+    常态，白名单维护成本高于收益；原 C2 SSRF 防护随安全加固批三移除，
+    LLM_TEST_ALLOWED_HOSTS 配置保留但不再被读取）。
     """
-    import ipaddress
-    import socket
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Base URL 必须是 http/https 协议")
-    host = (parsed.hostname or "").lower()
-    if not host:
+    if not (parsed.hostname or "").strip():
         raise HTTPException(status_code=400, detail="Base URL 缺少主机名")
-
-    allowed = [
-        h.strip().lower()
-        for h in getattr(settings, "LLM_TEST_ALLOWED_HOSTS", "").split(",")
-        if h.strip()
-    ]
-    if host in allowed:
-        return url
-
-    if host in ("localhost", "db", "redis", "backend", "frontend", "sandbox", "host.docker.internal"):
-        raise HTTPException(status_code=400, detail="禁止访问内部服务地址")
-
-    def _is_banned(ip: "ipaddress._BaseAddress") -> bool:
-        return (
-            ip.is_loopback or ip.is_private or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast
-        )
-
-    try:
-        ip = ipaddress.ip_address(host)
-        if _is_banned(ip):
-            raise HTTPException(status_code=400, detail="禁止访问内网/回环/保留地址")
-        return url
-    except ValueError:
-        pass  # 非 IP 字面量，走域名解析校验
-
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
-        raise HTTPException(status_code=400, detail="域名无法解析")
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if _is_banned(ip):
-            raise HTTPException(status_code=400, detail="域名解析到内网/回环地址")
     return url
 
 

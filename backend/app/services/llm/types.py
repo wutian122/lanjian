@@ -49,6 +49,18 @@ class LLMMessage:
     role: str  # 'system', 'user', 'assistant'
     content: str
 
+    def __post_init__(self):
+        # R-C3（2026-09-26）：单点清洗孤立代理项。源码树含非法 UTF-8 字节时，
+        # 上游 surrogateescape 解码会把坏字节变成孤立代理项（U+DC80-U+DCFF），
+        # openai SDK 序列化时抛 "surrogates not allowed" → 调用连环失败且重试
+        # 永远携带同样的坏数据（生产实证：A 机 nginx 任务 40 分钟 134 次）。
+        # 处理：构造时丢弃孤立代理项，合法内容原样保留。
+        if isinstance(self.content, str) and self.content:
+            try:
+                self.content.encode("utf-8")
+            except UnicodeEncodeError:
+                self.content = self.content.encode("utf-8", "ignore").decode("utf-8")
+
 
 @dataclass
 class LLMRequest:

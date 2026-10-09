@@ -29,6 +29,13 @@ from app.services.agent.agents.analysis import AnalysisAgent
 from app.services.agent.agents.orchestrator import OrchestratorAgent
 from app.services.agent.agents.recon import ReconAgent
 from app.services.agent.agents.verification import VerificationAgent
+
+
+@pytest.fixture(autouse=True)
+def _patch_base_sleep(monkeypatch):
+    """P5-1：救援退避 sleep 全部 mock，避免测试真睡 45s。"""
+    import app.services.agent.agents.base as _base_mod
+    monkeypatch.setattr(f"{_base_mod.__name__}.asyncio.sleep", AsyncMock())
 from app.services.agent.core.circuit_breaker import (
     CircuitState,
     CircuitStats,
@@ -96,7 +103,7 @@ def _tool_call(name, arguments="{}"):
 def _stream_of(*chunks):
     """单轮固定 chunk 序列。"""
     async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
-                   response_format=None):
+                   response_format=None, extra_params=None):
         for chunk in chunks:
             yield chunk
     return _gen
@@ -123,7 +130,7 @@ def _scripted_chat_stream(rounds):
     state = {"i": 0}
 
     async def _stream(messages=None, temperature=None, max_tokens=None, tools=None,
-                      response_format=None):
+                      response_format=None, extra_params=None):
         spec = rounds[state["i"]]
         state["i"] += 1
         form = spec["form"]
@@ -215,7 +222,8 @@ async def test_reasoning_only_empty_classified_and_nudge_text():
     output, tokens = await agent.stream_llm_call(history)
 
     assert output == ""
-    assert tokens == 12
+    # I1 + P5-1：救援序列 4 次调用 tokens 全部累加（12×4=48）
+    assert tokens == 48
     assert agent._last_empty_kind == "reasoning_only"
 
     nudge_text_mode = agent._empty_response_nudge()
@@ -455,6 +463,9 @@ async def test_analysis_reasoning_only_retry_contains_nudge_text_mode():
     agent = _make_analysis_agent(caps=None)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏仍空
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
         {"form": "ok", "text": _ANALYSIS_FINAL_TEXT},
     ])
 
@@ -476,6 +487,9 @@ async def test_analysis_reasoning_only_retry_contains_submit_findings_in_tools_m
     agent = _make_analysis_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏仍空
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
         {"form": "tool_calls", "tool_calls": [_SUBMIT_FINDINGS_CALL]},
     ])
 
@@ -494,6 +508,9 @@ async def test_analysis_truncated_empty_retry_complements_truncation_hint():
     agent = _make_analysis_agent(caps=None)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "truncated"},
+        {"form": "truncated"},  # 一搏仍截断空
+        {"form": "truncated"},  # 退避15s 纯文本重跑仍截断
+        {"form": "truncated"},  # 退避30s 纯文本重跑仍截断
         {"form": "ok", "text": _ANALYSIS_FINAL_TEXT},
     ])
 
@@ -513,11 +530,10 @@ async def test_analysis_three_consecutive_empty_fallback_unchanged():
     """Analysis 连续 3 次形态 B 空响应：收口行为与改动前一致（失败结果 + 计数 3 +
     仅前 2 次注入重试提示，第 3 次到上限不再 append）。"""
     agent = _make_analysis_agent(caps=None)
+    # 每轮空响应对应 4 次 stream 调用（第一遍空 + 一搏 + 退避15s + 退避30s）
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-    ])
+    ] * 12)
 
     result = await agent.run({"project_info": {}, "config": {}})
 
@@ -535,6 +551,9 @@ async def test_recon_reasoning_only_retry_contains_nudge_without_tools_hint(tmp_
     agent = _make_recon_agent()
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏仍空
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
         {"form": "ok", "text": _RECON_FINAL_TEXT},
     ])
 
@@ -559,6 +578,12 @@ async def test_verification_reasoning_only_injects_nudge_and_other_keeps_generic
     agent = _make_verification_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏仍空 → B 形态 nudge
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
+        {"form": "other_empty"},
+        {"form": "other_empty"},     # 第二轮第一遍+一搏仍空 → 泛化提示
+        {"form": "other_empty"},
         {"form": "other_empty"},
         {"form": "tool_calls",
          "tool_calls": [_tool_call("submit_findings", json.dumps(_VERIFICATION_PAYLOAD,
@@ -591,7 +616,13 @@ async def test_orchestrator_reasoning_only_retry_contains_nudge(monkeypatch):
     agent = _make_orchestrator_agent(caps=caps)
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 一搏仍空
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
         {"form": "reasoning_only"},
+        {"form": "reasoning_only"},  # 第二轮：一搏仍空
+        {"form": "reasoning_only"},  # 退避15s 纯文本重跑仍空
+        {"form": "reasoning_only"},  # 退避30s 纯文本重跑仍空
         {"form": "tool_calls", "tool_calls": [_tool_call("finish", "{}")]},
     ])
 
@@ -616,13 +647,10 @@ async def test_orchestrator_five_consecutive_empty_stop_unchanged(monkeypatch):
     )
     caps = BackendCapabilities(tools=True, guided_json=False)
     agent = _make_orchestrator_agent(caps=caps)
+    # 每轮空响应对应 4 次 stream 调用（第一遍空 + 一搏 + 退避15s + 退避30s）
     agent.llm_service.chat_completion_stream = _scripted_chat_stream([
         {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-        {"form": "reasoning_only"},
-    ])
+    ] * 20)
 
     await agent.run({"project_info": {}, "config": {}})
 

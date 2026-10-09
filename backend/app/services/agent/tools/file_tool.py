@@ -14,6 +14,25 @@ from .base import AgentTool, ToolResult
 from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 
+def _coerce_int(value, *, default=None):
+    """P8：把 LLM 发来的字符串型整数（"30"/"690"）安全转为 int。
+
+    生产实证：JSON 无强类型，LLM 工具调用常把整型字段发成带引号的字符串，
+    工具内直接做算术/比较必 TypeError（read_file/list_files/sandbox 共数十次）。
+    None/空串 → default；无法解析 → default（绝不抛异常）。
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class FileReadInput(BaseModel):
     """文件读取输入"""
     file_path: str = Field(description="文件路径（相对于项目根目录）")
@@ -127,6 +146,11 @@ class FileReadTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行文件读取"""
+        # P8（2026-10-07）：LLM 常把整型参数发成字符串（"690"），
+        # 直接参与算术必 TypeError（生产实证 read_file 多次失败）——入口强转
+        start_line = _coerce_int(start_line)
+        end_line = _coerce_int(end_line)
+        max_lines = _coerce_int(max_lines, default=500) or 500
         try:
             # 检查是否被排除
             if self._should_exclude(file_path):
@@ -530,6 +554,7 @@ class ListFilesTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行文件列表"""
+        max_files = _coerce_int(max_files, default=100) or 100
         try:
             # 🔥 兼容性处理：支持 path 参数作为 directory 的别名
             if "path" in kwargs and kwargs["path"]:

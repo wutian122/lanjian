@@ -200,7 +200,7 @@ async def test_stream_llm_call_passes_tools_and_exposes_tool_calls():
     """tools 参数透传至 chat_completion_stream；done 的 tool_calls 暴露到 _last_tool_calls。"""
     captured = {}
 
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None, extra_params=None):
         captured["tools"] = tools
         yield {"type": "token", "kind": "content", "content": "ok",
                "accumulated": "ok", "accumulated_content": "ok", "accumulated_reasoning": ""}
@@ -229,7 +229,7 @@ async def test_stream_llm_call_passes_tools_and_exposes_tool_calls():
 async def test_stream_llm_call_resets_tool_calls_each_round():
     """每轮调用开始时 _last_tool_calls 重置：上一轮的 tool_calls 不得泄漏到文本轮。"""
 
-    async def _gen_text(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+    async def _gen_text(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None, extra_params=None):
         captured["tools"] = tools
         yield {"type": "token", "content": "混", "accumulated": "混"}
         yield {"type": "done", "content": "混合",
@@ -307,7 +307,12 @@ def test_step_from_tool_calls_maps_finish_and_summarize_with_no_args():
 
 
 def test_step_from_tool_calls_broken_json_falls_back_to_empty_input():
-    """arguments 非法 JSON（理论上由服务端 parser 保证，防御）：不抛错，action_input={}。"""
+    """arguments 非法 JSON（理论上由服务端 parser 保证，防御）：不抛错。
+
+    X2（2026-09-27）行为更新：坏 JSON 先经 json-repair 抢救——可修复则用修复
+    参数（生产实证 dispatch 参数半截丢失）；彻底不可抢救为 dict 时仍降级
+    action_input={}（由现有分支自愈），任何情况不得抛错。
+    """
     agent = _make_bare_orchestrator()
 
     step = agent._step_from_tool_calls(
@@ -315,7 +320,14 @@ def test_step_from_tool_calls_broken_json_falls_back_to_empty_input():
     )
 
     assert step.action == "dispatch_agent"
-    assert step.action_input == {}, "坏 JSON 必须降级为空参数（由现有分支自愈），不得抛错"
+    assert isinstance(step.action_input, dict), "坏 JSON 经抢救/降级后必须是 dict，不得抛错"
+
+    # 彻底不可抢救（repair 结果非 dict）→ 降级空参数
+    step2 = agent._step_from_tool_calls(
+        [{"id": "c5", "name": "dispatch_agent", "arguments": "[1, 2, 3]"}]
+    )
+    assert step2.action == "dispatch_agent"
+    assert step2.action_input == {}
 
 
 def test_step_from_tool_calls_unknown_name_kept_for_self_healing():

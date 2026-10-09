@@ -306,7 +306,7 @@ async def test_stream_llm_call_passes_response_format():
     """response_format 参数透传至 chat_completion_stream（强制总结轮 guided 注入依赖）。"""
     captured = {}
 
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None, extra_params=None):
         captured["response_format"] = response_format
         yield {"type": "token", "kind": "content", "content": "{}",
                "accumulated": "{}", "accumulated_content": "{}", "accumulated_reasoning": ""}

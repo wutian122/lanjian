@@ -44,6 +44,8 @@ export interface AgentTask {
   };
   verification_coverage: number | null;
   observation_count: number | null;
+  // 层 5b（2026-09-29）：门禁/健康度观察明细（llm_health 等），详情接口下发
+  observations?: Array<Record<string, unknown>> | null;
 
   // Agent 统计
   total_iterations: number;
@@ -57,7 +59,8 @@ export interface AgentTask {
   low_count: number;
 
   // 评分
-  quality_score: number;
+  // 层 5a（2026-09-29）：completed_with_gaps 且 0 发现时后端返回 null（无法评分）
+  quality_score: number | null;
   security_score: number | null;
 
   // 时间
@@ -174,8 +177,8 @@ export interface AgentTaskSummary {
   task_id: string;
   status: string;
   progress_percentage: number;
-  security_score: number;
-  quality_score: number;
+  security_score: number | null;
+  quality_score: number | null;
   statistics: {
     total_files: number;
     indexed_files: number;

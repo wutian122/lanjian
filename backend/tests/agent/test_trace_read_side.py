@@ -102,7 +102,7 @@ def _tool_call(name, arguments="{}"):
 def _finish_stream():
     """单轮 finish tool_call（tools 协议），让主循环一轮收尾。"""
     async def _stream(messages=None, temperature=None, max_tokens=None, tools=None,
-                      response_format=None):
+                      response_format=None, extra_params=None):
         yield {
             "type": "done", "content": "", "reasoning": "",
             "tool_calls": [_tool_call("finish", "{}")],
@@ -420,7 +420,7 @@ _TRACE_SUMMARY = (
 def _final_stream(text, capture):
     """文本协议流；首次被调用时把 LLM 收到的 messages 存入 capture（首轮注入证据）。"""
     async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
-                   response_format=None):
+                   response_format=None, extra_params=None):
         if "first" not in capture:
             capture["first"] = list(messages or [])
         yield {
@@ -433,7 +433,7 @@ def _final_stream(text, capture):
 def _submit_stream(tool_calls, capture):
     """tools 协议流；首次被调用时把 LLM 收到的 messages 存入 capture。"""
     async def _gen(messages=None, temperature=None, max_tokens=None, tools=None,
-                   response_format=None):
+                   response_format=None, extra_params=None):
         if "first" not in capture:
             capture["first"] = list(messages or [])
         yield {

@@ -105,6 +105,21 @@ class Settings(BaseSettings):
     # structured-output-protocol 层次 6：repetition_penalty（SGLang/vLLM 接受，
     # 经 extra_params→extra_body/native body 透传；用户配置 llmConfig.repetitionPenalty 优先）
     LLM_REPETITION_PENALTY: float = 1.2
+    # 关思考开关（R-C1，2026-09-26）：True 时三条出站路径向 extra_body 注入
+    # chat_template_kwargs={"enable_thinking": False}（SGLang/vLLM 端点按请求体
+    # 顶层键接受），并放行护栏对 enable_thinking 键的剥除（<|think_off|> /
+    # /no_think 防注入清洗不受影响）。
+    # 解除护栏的历史依据：旧护栏（2026-09-03 实测）要求强制思考的原因是服务端
+    # reasoning-parser 未修正——关思考会让 content 恒空；2026-09-26 实测当前
+    # SGLang 镜像已修复（关思考后 content/tool_calls 正常、同一决策 96 vs 1364
+    # tokens），满足护栏注释预留的解除条件。默认 False 保持现状零变化。
+    LLM_DISABLE_THINKING: bool = False
+    # 2026-09-29 思考策略倒转：默认强制关思考（服务端实测思考流永不收敛，
+    # 见 tests/llm/test_thinking_policy.py）。两开关齐 true 才放行思考：
+    LLM_ENABLE_THINKING: bool = False
+    # 服务端支持思考/正文预算分离（如 reasoning-parser 独立 max_tokens）时置 true；
+    # 未支持时禁止开思考——单预算 + 思考组合 = 思考烧光预算自毁。
+    LLM_THINKING_SEPARATE_BUDGET: bool = False
 
     # Agent 娴佸紡瓒呮椂閰嶇疆锛堢锛?
     LLM_FIRST_TOKEN_TIMEOUT: int = 180  # 首Token超时时间（秒），推理模型需要更长时间  # 绛夊緟棣栦釜Token鐨勮秴鏃舵椂闂?
@@ -153,8 +168,19 @@ class Settings(BaseSettings):
     # 鎵弿閰嶇疆
     MAX_ANALYZE_FILES: int = 0  # 鏈€澶у垎鏋愭枃浠舵暟锛?琛ㄧず鏃犻檺鍒?
     MAX_FILE_SIZE_BYTES: int = 200 * 1024  # 鏈€澶ф枃浠跺ぇ灏?200KB
-    LLM_CONCURRENCY: int = 3  # LLM骞跺彂鏁?
+    LLM_CONCURRENCY: int = 3
+    # P5-2（2026-10-04）：跨任务全局 LLM 并发闸（四任务并发打爆单卡 SGLang
+    # 实证）。单 worker 下进程内信号量即全局；闸粒度 = 单次 HTTP 出站调用。
+    LLM_GLOBAL_CONCURRENCY: int = 4  # P9 D5: 6→4 (6槽实测仍现 abort 空返回，下调让请求在进程内排队)  # LLM骞跺彂鏁?
     LLM_GAP_MS: int = 2000  # LLM璇锋眰闂撮殧锛堟绉掞級
+
+    # P9 稳定性簇（裁决 D3）：LLM 端点软熔断参数（按 base_url 滑窗）。
+    LLM_ENDPOINT_WINDOW_SIZE: int = 20       # 滑窗容量（帧数）
+    LLM_ENDPOINT_MIN_SAMPLES: int = 10       # 最小判定样本数（不足不判 degraded）
+    LLM_ENDPOINT_EMPTY_RATE: float = 0.5     # 空响应率 degraded 阈值
+    LLM_ENDPOINT_DEGRADED_SECONDS: float = 30.0   # degraded 持续超该值 → 有序收口
+    LLM_ENDPOINT_THROTTLE_SECONDS: float = 5.0    # degraded 时单帧降速等待
+    LLM_ENDPOINT_COOLDOWN_SECONDS: float = 120.0  # 有序收口冷却（不重复）
     
     # ZIP鏂囦欢瀛樺偍閰嶇疆
     ZIP_STORAGE_PATH: str = "./uploads/zip_files"  # ZIP鏂囦欢瀛樺偍鐩綍

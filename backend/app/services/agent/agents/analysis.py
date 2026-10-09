@@ -345,6 +345,60 @@ _EXEMPT_LINE_RE = re.compile(
 # 维度标识与豁免理由的分隔符（按特异性排序，先长后短；冒号兜底）
 _EXEMPT_SEPARATORS = (" — ", " – ", "——", " - ", "－", "：", ":")
 
+def _should_nudge_submit(iteration: int, max_iterations: int, *, has_candidates: bool) -> bool:
+    """P1a（2026-10-03）：探索过半交卷提醒节拍器。
+
+    Flash-Next 类模型实证（任务 eec77e54/d865def0）：30 轮探索动作全部正常
+    但 submit_findings 0 调用、强制总结 0 候选——"只干活不交卷"。本节拍器
+    在过半（iteration > max//2）后首次及每 5 轮返回 True，由 run 循环注入
+    交卷强约束（已有候选则不打扰）。
+    """
+    if has_candidates:
+        return False
+    if iteration >= max_iterations - 2:
+        return True  # 收官前必提醒
+    if iteration <= max_iterations // 2:
+        return False
+    return iteration == max_iterations // 2 + 1 or (iteration - max_iterations // 2) % 5 == 0
+
+
+_SEMGREP_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _render_semgrep_section(semgrep_findings: list) -> str:
+    """P7-3（2026-10-07）：渲染 Semgrep 命中注入段（键名修复+severity 排序）。
+
+    生产实证（B 机 c8686a20）：旧渲染读 rule_id/check_id 而预扫实际存
+    semgrep_rule_id → 规则列恒"?"；15 条截断无排序，高价值命中可能被丢。
+    修复：解析 semgrep_rule_id 键、显示 severity、按 severity 降序取前 15。
+    """
+    ranked = sorted(
+        (sf for sf in (semgrep_findings or []) if isinstance(sf, dict)),
+        key=lambda sf: _SEMGREP_SEVERITY_RANK.get(
+            str(sf.get("severity") or "").strip().lower(), 0
+        ),
+        reverse=True,
+    )
+    section = "\n## 🔬 Semgrep 预扫描结果（精确定位，请优先验证）\n"
+    section += "以下是由 Semgrep 静态分析识别的潜在安全问题（按严重度排序），每个条目包含精确的文件、行号和规则 ID。\n"
+    section += "请使用 read_file 验证这些问题是否真实存在。\n\n"
+    for sf in ranked[:15]:
+        sf_file = sf.get("file_path", sf.get("path", "?"))
+        sf_line = sf.get("line_start", sf.get("line", "?"))
+        sf_rule = (
+            sf.get("semgrep_rule_id")
+            or sf.get("rule_id")
+            or sf.get("check_id")
+            or "?"
+        )
+        sf_sev = str(sf.get("severity") or "?").strip().lower()
+        sf_msg = str(sf.get("message", sf.get("description", sf.get("title", ""))))[:80]
+        section += f"- `{sf_file}:{sf_line}` [{sf_rule}] ({sf_sev}) {sf_msg}\n"
+    if len(ranked) > 15:
+        section += f"- ... 还有 {len(ranked) - 15} 条 Semgrep 发现\n"
+    return section
+
+
 _FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer，总结你发现的所有安全问题。
 
 即使没有发现严重漏洞，也请总结你的分析过程和观察到的潜在风险点。
@@ -356,6 +410,10 @@ _FORCED_SUMMARY_PROMPT = """分析阶段已结束。请立即输出 Final Answer
    UNCOVERED_DIMENSION_EXEMPT: <维度标识> - <豁免理由>
    维度标识使用维度键（D1_injection、D2_auth、D3_authz、D4_deserialization、D5_file、D6_ssrf、D7_crypto、D8_config、D9_business_logic、D10_supply_chain）或漏洞类型名（sql_injection、xss、command_injection、path_traversal、ssrf、deserialization、xxe、hardcoded_secret、csrf、idor 等）。
 不允许对未覆盖维度既不给候选也不给豁免——0 候选且 0 豁免的总结视为无效产出。
+即使你觉得全部维度都已排除，也**必须至少 1 条**候选——输出你分析过程中印象最深的可疑点
+（confidence 如实、needs_verification=true 交沙箱裁决）——零候选总结会被系统拒绝并重试。
+最小示例（结构必须一致，内容按实际情况填写）：
+{"findings": [{"vulnerability_type": "path_traversal", "severity": "medium", "title": "示例：XX 接口路径拼接未规范化", "description": "读取的 XX 文件第 N 行存在用户可控路径拼接", "file_path": "实际读过的文件路径", "line_start": 100, "confidence": 0.4, "needs_verification": true}], "summary": "UNCOVERED_DIMENSION_EXEMPT: D7_crypto - 未发现加密相关代码"}
 
 请按以下 JSON 格式输出：
 ```json
@@ -563,8 +621,14 @@ class AnalysisAgent(BaseAgent):
     
 
     
-    def _parse_llm_response(self, response: str) -> AnalysisStep:
-        """解析 LLM 响应 - 增强版，更健壮地提取思考内容"""
+    def _parse_llm_response(
+        self, response: str
+    ) -> Optional[AnalysisStep]:
+        """解析 LLM 响应 - 增强版，更健壮地提取思考内容。
+
+        P9：Action 存在但参数（标签/无标签）均无法提取时返回 None，
+        由主循环走格式 nudge（P9-1b）。
+        """
         step = AnalysisStep(thought="")
 
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
@@ -633,6 +697,22 @@ class AnalysisAgent(BaseAgent):
                 input_text,
                 default={"raw_input": input_text}
             )
+        elif step.action:
+            # P9-1a：无 "Action Input:" 标签——尝试无标签 JSON 提取
+            extracted = self._extract_unlabeled_input(step.action, cleaned_response)
+            if extracted is not None:
+                logger.info(
+                    f"[Analysis] Unlabeled action input extracted for "
+                    f"'{step.action}' (keys={list(extracted.keys())})"
+                )
+                step.action_input = extracted
+            else:
+                # P9-1b：提取失败 = 输出格式错误，返回 None 由主循环 nudge
+                logger.warning(
+                    f"[Analysis] Action '{step.action}' but no labeled/unlabeled "
+                    f"input could be extracted -> format failure"
+                )
+                return None
 
         # 🔥 最后的 fallback：如果整个响应没有任何标记，整体作为思考
         if not step.thought and not step.action and not step.is_final:
@@ -753,38 +833,43 @@ class AnalysisAgent(BaseAgent):
     def _final_step_from_tool_calls(
         self, tool_calls: Optional[List[Dict[str, Any]]]
     ) -> Optional[AnalysisStep]:
-        """tool_calls 响应映射为 Final Answer 步骤（与文本协议 _parse_llm_response 对等）。
+        """tool_calls 响应映射为步骤（X1/X2/X3 泛化，2026-09-27）。
 
-        仅 submit_findings 视为终态：function.arguments 由服务端 tool-call-parser
-        保证合法 JSON，直接 json.loads 作为 final_answer（不走 json-repair）。
-        其他函数名 / 坏 JSON / 非对象参数 → None，调用方降级文本解析路径
-        （同轮混合形态 tool_calls 优先，Task 7 边界）。
+        生产实证（任务 2ccc598a/059300c9）：sglang qwen3_coder parser 流式分片
+        概率性损坏 tool_calls（arguments 丢失/半截 JSON），而旧实现只认
+        submit_findings 终态——中间工具（read_file 等）全部降级为空 step 空名
+        执行（missing positional argument）、收口 findings 因半截 JSON 全丢。
+
+        泛化后三路：
+        - submit_findings（X2：坏 JSON 先 json-repair 抢救）→ 终态 final_answer；
+        - 其他已知工具（X3：name 损坏先修复）→ 非终态 step（action/action_input），
+          由主循环既有 execute_tool 链执行；
+        - 无法识别/无法抢救 → None（调用方降级文本解析）。
         """
         if not tool_calls:
             return None
         call = tool_calls[0] or {}
-        name = str(call.get("name") or "").strip()
-        if name != "submit_findings":
+        known = list(self.tools.keys()) + ["submit_findings"]
+        name = self._repair_tool_call_name(str(call.get("name") or ""), known)
+        parsed = self._parse_tool_call_arguments(call.get("arguments"))
+        if not name or parsed is None:
             return None
-        arguments = call.get("arguments")
-        if isinstance(arguments, dict):
-            parsed: Any = arguments
-        elif isinstance(arguments, str) and arguments.strip():
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
+        if name == "submit_findings":
+            # 终态：与文本路径同构（findings 过滤非字典项）
+            if not isinstance(parsed.get("findings"), list):
                 return None
-        else:
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        # 与文本路径同构：findings 过滤非字典项
-        if isinstance(parsed.get("findings"), list):
             parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
-        step = AnalysisStep(thought="")
-        step.is_final = True
-        step.final_answer = parsed
-        return step
+            step = AnalysisStep(thought="")
+            step.is_final = True
+            step.final_answer = parsed
+            return step
+        # X1：中间工具泛化——走既有 execute_tool 链
+        if name in self.tools:
+            step = AnalysisStep(thought="")
+            step.action = name
+            step.action_input = parsed
+            return step
+        return None
 
     async def _warn_truncated_final_answer(
         self, findings_count: int, context: str = "Final Answer"
@@ -1083,20 +1168,9 @@ class AnalysisAgent(BaseAgent):
         if trace_summary:
             initial_message += f"\n## 📋 此前执行轨迹摘要（避免重复劳动）\n{trace_summary}\n"
 
-        # ✅ P1-4: 注入 Semgrep 精确定位信息
+        # ✅ P1-4: 注入 Semgrep 精确定位信息（P7-3：键名修复+severity 排序）
         if semgrep_findings:
-            semgrep_section = "\n## 🔬 Semgrep 预扫描结果（精确定位，请优先验证）\n"
-            semgrep_section += "以下是由 Semgrep 静态分析识别的潜在安全问题，每个条目包含精确的文件、行号和规则 ID。\n"
-            semgrep_section += "请使用 read_file 验证这些问题是否真实存在。\n\n"
-            for sf in semgrep_findings[:15]:
-                sf_file = sf.get("file_path", sf.get("path", "?"))
-                sf_line = sf.get("line", sf.get("line_start", "?"))
-                sf_rule = sf.get("rule_id", sf.get("check_id", "?"))
-                sf_msg = sf.get("message", sf.get("title", ""))[:80]
-                semgrep_section += f"- `{sf_file}:{sf_line}` [{sf_rule}] {sf_msg}\n"
-            if len(semgrep_findings) > 15:
-                semgrep_section += f"- ... 还有 {len(semgrep_findings) - 15} 条 Semgrep 发现\n"
-            initial_message += semgrep_section
+            initial_message += _render_semgrep_section(semgrep_findings)
 
         # 🔥 记录工作开始
         self.record_work("开始安全漏洞分析")
@@ -1152,6 +1226,24 @@ class AnalysisAgent(BaseAgent):
                     break
 
                 self._iteration = iteration + 1
+                # P1a（2026-10-03）：探索过半交卷提醒——Flash-Next 类模型实证
+                # "只干活不交卷"（30 轮 0 次 submit_findings），过半后首次及
+                # 每 5 轮注入交卷强约束，直至出现候选。
+                if _should_nudge_submit(
+                    iteration + 1, self.config.max_iterations,
+                    has_candidates=bool(all_findings),
+                ):
+                    self._conversation_history.append({
+                        "role": "user",
+                        "content": (
+                            f"[系统提醒] 你已探索 {iteration + 1}/{self.config.max_iterations} 轮且尚未提交任何候选。"
+                            "请立即调用 submit_findings 交卷——哪怕只有 1 条低置信候选"
+                            "（confidence 如实、needs_verification=true，交沙箱裁决）。"
+                            "若某维度确认无候选，必须在 summary 中用 "
+                            "UNCOVERED_DIMENSION_EXEMPT: <维度> - <理由> 单独成行豁免。"
+                            "继续只探索不交卷将被视为无效审计。"
+                        ),
+                    })
                 
                 # 🔥 再次检查取消标志（在LLM调用之前）
                 if self.is_cancelled:
@@ -1256,6 +1348,16 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     step = self._final_step_from_tool_calls(tool_calls_this_round)
                 if step is None:
                     step = self._parse_llm_response(llm_output)
+                # P9-1b：解析失败 → 格式 nudge（拦截点在 _steps.append /
+                # emit_llm_thought / assistant 历史写入之前）
+                if step is None:
+                    _fmt = await self._handle_subagent_format_failure()
+                    if _fmt == "stalled":
+                        # 连续格式错误达上限：跳出循环，由既有收口/兜底产出结果
+                        break
+                    continue
+                # 成功解析轮：格式计数归零
+                self._sub_format_retry = 0
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示安全分析的思考过程
@@ -1269,6 +1371,13 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     # 造成后端对话状态混乱（同 Task 7 orchestrator 历史合成）
                     history_content = (
                         "Final Answer: " + json.dumps(step.final_answer, ensure_ascii=False)
+                    )
+                elif tool_calls_this_round and step is not None and step.action:
+                    # X1：中间工具 tool_calls 轮正文为空——合成 Action 文本入历史，
+                    # 保持多轮历史与文本协议自洽（避免 assistant 空 content）
+                    history_content = (
+                        f"Action: {step.action}\n"
+                        + json.dumps(step.action_input or {}, ensure_ascii=False)
                     )
                 else:
                     history_content = llm_output
@@ -1528,6 +1637,33 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
         """获取执行步骤"""
         return self._steps
 
+    @staticmethod
+    def _observation_succeeded(observation: Optional[str]) -> bool:
+        """判定工具 observation 是否表明调用成功（files_read 饿死防护，第七章）。
+
+        只排除"确证失败"：
+        - 「⚠️ 工具执行失败」（base.execute_tool 失败帧，内含必填缺失/
+          映射引导等错误明细）；
+        - 「⚠️ 工具 '...' 执行超时」/「⚠️ 任务已取消」；
+        - observation 以「必填参数缺失」/映射引导开头（直接返回的防御口径）。
+        observation 为 None 时不判失败（合成步骤/历史兼容；生产路径
+        step.observation 在 execute_tool 后必被赋值），空串视为无内容不计数。
+        """
+        if observation is None:
+            return True
+        if not isinstance(observation, str) or not observation.strip():
+            return False
+        if observation.startswith("⚠️ 工具执行失败"):
+            return False
+        if observation.startswith("⚠️ 工具 ") or observation.startswith("⚠️ 任务已取消"):
+            return False
+        if observation.startswith("必填参数缺失"):
+            return False
+        head = observation[:200]
+        if "必须是 JSON 对象" in head:
+            return False
+        return True
+
     def _collect_execution_report(self) -> Dict[str, List[str]]:
         """聚合本轮实际执行过的文件读取与搜索模式，上报 orchestrator 推进跨轮去重。
 
@@ -1548,6 +1684,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 action = getattr(step, "action", None)
                 action_input = getattr(step, "action_input", None)
                 if not action or not isinstance(action_input, dict):
+                    continue
+                # 第七章防护（files_read 饿死）：只统计执行成功的调用。
+                # 提取成功但执行失败（必填缺失/引导/超时/取消）时文件内容
+                # 实际未取得，计入"已读"会让跨轮禁读约束拒绝重读。
+                if not self._observation_succeeded(getattr(step, "observation", None)):
                     continue
                 if action == "read_file":
                     path = action_input.get("file_path")

@@ -108,6 +108,68 @@ _LANGUAGE_SINK_PATTERNS: dict[str, dict[str, list[str]]] = {
 }
 
 
+# P7-4：全部合法 canonical 类型（normalize 必须原样保留；别名表只做映射）
+_CANONICAL_VULN_TYPES = {
+    "sql_injection", "xss", "command_injection", "path_traversal", "ssrf",
+    "deserialization", "xxe", "hardcoded_secret", "insecure_cookie",
+    "expression_injection", "insecure_deserialization", "weak_crypto",
+    "open_redirect", "insecure_configuration", "other",
+}
+
+_VULN_TYPE_ALIASES = {
+    "sqli": "sql_injection",
+    "sql": "sql_injection",
+    "xss": "xss",
+    "rce": "command_injection",
+    "cmd": "command_injection",
+    "command": "command_injection",
+    "r.c.e": "command_injection",
+    "pathtrav": "path_traversal",
+    "path_traversal": "path_traversal",
+    "lfi": "path_traversal",
+    "ssrf": "ssrf",
+    "deserialization": "deserialization",
+    "deser": "deserialization",
+    "xxe": "xxe",
+    "insecure_cookie": "insecure_cookie",
+    "cookie": "insecure_cookie",
+    "expression_injection": "expression_injection",
+    "el_injection": "expression_injection",
+    "ssti": "expression_injection",
+}
+
+
+def _sandbox_command_action_input(sc: dict) -> dict:
+    """P7-4：强制引导所需的 sandbox_exec 参数（兼容扁平/旧包装两结构）。
+
+    扁平化后命令在顶层；旧结构在 sc["input"]。返回含 command/timeout 的
+    参数 dict（sandbox_exec 工具入参）。
+    """
+    if isinstance(sc.get("input"), dict):
+        return sc["input"]
+    action = {}
+    if sc.get("command"):
+        action["command"] = sc["command"]
+    if sc.get("timeout") is not None:
+        action["timeout"] = sc["timeout"]
+    return action
+
+
+def normalize_vuln_type(raw: str) -> str:
+    """P7-4（2026-10-07）：漏洞类型规范化（保存路径与 PoC 路径共用唯一入口）。
+
+    生产实证：两处各自实现且不一致（空格/别名在 PoC 路径漏规范化，
+    33% 候选落入通用模板空转）。
+    """
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in _CANONICAL_VULN_TYPES:
+        return key
+    for alias, canonical in _VULN_TYPE_ALIASES.items():
+        if key == alias or key.startswith(alias + "_"):
+            return canonical
+    return "other"
+
+
 def _language_sink_patterns(vuln_type: str, file_path: str) -> list[str]:
     """REQ-VP-1: 按目标文件扩展名返回该语言的危险 sink 检测 pattern 列表。"""
     ext = ""
@@ -135,6 +197,50 @@ FABRICATION_MARKERS = (
 # B3 严标准：真正的漏洞触发证据标记（confirmed 档要求含其中之一）
 # 仅 "退出码:0"/"Verification Complete" 等"PoC 跑完"标记不算真证据
 # 已去掉 "static_confirmed"（状态名，不应作为 sandbox 证据）和 "vulnerable"（太宽，"not vulnerable" 也匹配）
+# P7-1（2026-10-07）：LLM 自述 attempt 的可执行性守卫——生产实证占位符命令
+# `python3 -c "... check setHttpOnly ..."`（SyntaxError）与动作描述文本被短路
+# 绑定落库。裸省略号（"..."）与过短/纯描述文本一律判不可执行。
+_NEGATIVE_EVIDENCE_MARKERS = (
+    "false_positive", "false positive", "not vulnerable", "no vulnerability",
+    "非漏洞", "误报", "未发现漏洞",
+)
+
+
+def _is_executable_command(command: str) -> bool:
+    """P7-1：命令可执行性守卫（拒占位符/动作描述，放行真实 PoC 命令）。
+
+    P8 修正：旧实现 ``len < 15 直接拒`` 误伤真实短命令（"echo 1" 仅 6 字符），
+    导致其被从 finding 的 attempts 中剔除。判据改为**精确识别两类非执行文本**：
+    1. 含裸省略号（``...``/``…``）——占位符的典型形态
+       （``python3 -c "... check setHttpOnly ..."``）；
+    2. 纯自然语言祈使句（check/verify/analyze 等开头、且无任何代码/shell 结构）
+       ——动作描述（"check setHttpOnly flag in source"）。
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    if "..." in cmd or "…" in cmd:
+        return False
+    first_word = cmd.split(None, 1)[0].lower()
+    _DESC_VERBS = {"check", "verify", "analyze", "inspect", "review", "examine"}
+    if first_word in _DESC_VERBS:
+        # 含代码结构（引号/重定向/管道/换行）则可能是真实命令片段，放行
+        if not any(tok in cmd for tok in ('"', "'", "|", ">", "\n", "(", "=")):
+            return False
+    return True
+
+
+def _marker_negated(evidence_lower: str) -> bool:
+    """P7-1：标记+语义双条件——VULNERABILITY_CONFIRMED 后随否定语义
+    （false_positive 等）时该标记不作数（生产实证 L6 口径分裂）。"""
+    key = "vulnerability_confirmed"
+    idx = evidence_lower.find(key)
+    if idx < 0:
+        return False
+    tail = evidence_lower[idx + len(key): idx + len(key) + 80]
+    return any(neg in tail for neg in _NEGATIVE_EVIDENCE_MARKERS)
+
+
 VULN_EVIDENCE_MARKERS = (
     "VULNERABILITY_CONFIRMED", "vulnerability confirmed",
     "exploit successful", "injection successful",
@@ -211,12 +317,16 @@ def compute_verification_status(
     attempts: list[Any],
     attempt_has_vuln_evidence_fn=None,
     attempt_matches_finding_fn=None,
+    explicit_false_positive: bool = False,
 ) -> tuple[str, bool, dict]:
     """由 sandbox_attempts 确定性推导验证状态。
 
     - attempts: finding 的 sandbox_attempts（已由 _attach_runtime_sandbox_attempts 绑定）
     - attempt_has_vuln_evidence_fn / attempt_matches_finding_fn: 可注入的判定函数
       （默认用模块级轻量实现，便于单测；运行时由 Verification 实例注入复用 B3 严标准）
+    - explicit_false_positive: D10——LLM 在 Final Answer 中显式 verdict=false_positive
+      时为 True：跳过下方动态 confirmed/static_confirmed 升级，维持 false_positive；
+      默认 False（推导型 FP，如 reverify 的历史状态）仍按新证据如实重算。
     """
     # 过滤伪造/不可信证据
     real_attempts = [
@@ -228,6 +338,11 @@ def compute_verification_status(
     evidence_matches = (
         attempt_matches_finding_fn or _attempt_matches_finding_default
     )
+
+    # 0) D10 显式 FP 锁定：LLM 显式标注优先于动态证据升级（notes 口径与
+    # 第 3 步显式 FP 分支一致：空 notes，不新增说明）。推导型 FP 不进此分支。
+    if explicit_false_positive:
+        return VerificationStatus.FALSE_POSITIVE, False, {}
 
     # 1) confirmed：成功执行 + 漏洞触发证据 + 匹配 finding
     for a in real_attempts:
@@ -304,6 +419,8 @@ def _attempt_has_vuln_evidence_default(attempt: dict[str, Any]) -> bool:
     if "vulnerability_confirmed(static)" in ev_lower:
         return False
     if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+        return False
+    if _marker_negated(ev_lower):
         return False
     return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
@@ -734,19 +851,129 @@ class VerificationStep:
     final_answer: Optional[Dict] = None
 
 
+def normalize_attempt_command(command: str) -> str:
+    """P9-7/终局 sweep 共用的命令主体归一化。
+
+    剥除跨轮/跨路径差异后取命令主体：
+    1. 首行（或任意行首）``# FINDING_ID:xxx`` 注释——同一 PoC 被承接给不同
+       finding_id 时命令文本仅差此注释；
+    2. ``poc_N`` 下标——同一模板在不同 finding 位上仅差序号；
+    3. ``/tmp/...`` 暂存路径前缀——临时目录在不同调度间可能变化。
+    """
+    lines = []
+    for line in str(command or "").splitlines():
+        if line.strip().startswith("# FINDING_ID:"):
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+    # poc_N 下标归一
+    text = re.sub(r"poc_\d+", "poc_N", text)
+    # /tmp 暂存路径前缀归一（含 /tmp/lanjian/ 宿主机中转目录）
+    text = re.sub(r"/tmp/(?:lanjian/)?[^\s'\"]*", "", text)
+    return " ".join(text.split())[:500]
+
+
 def _normalize_tool_key(action: str, action_input: dict) -> str:
     """归一化工具调用 key，用于重复调用检测。
 
     sandbox_exec：对命令做空白归一化并截断，避免 LLM 微调输入
                   （空格/换行/变量名变化）绕过去重导致同一 PoC 被反复执行。
+                  D1：finding_id 纳入键——同命令跨 finding 的真实执行不再被
+                  误拦；同 finding 的微调仍归一为同键（检测不削弱）。
     其他工具：保持原 JSON 精确匹配（sort_keys 保证 key 顺序无关）。
     """
     if action == "sandbox_exec" and isinstance(action_input, dict):
         cmd = str(action_input.get("command") or "")
         # 归一化空白并截断到 500 字符（覆盖绝大多数 PoC，同时避免超长 payload key 膨胀）
         normalized_cmd = " ".join(cmd.split())[:500]
-        return f"sandbox_exec:{normalized_cmd}"
+        fid = str(action_input.get("finding_id") or "")
+        return f"sandbox_exec:{fid}:{normalized_cmd}"
     return f"{action}:{json.dumps(action_input or {}, sort_keys=True)}"
+
+
+# P3b（2026-10-03）：验证阶段低温压判定波动（生产实证同批候选跨机
+# 静态确认数 1 vs 3——LLM 参与判定的采样波动）。
+VERIFICATION_TEMPERATURE = 0.2
+
+def _should_block_repeat_call(count: int, error_streak: int) -> bool:
+    """P4（2026-10-03）：死循环防护的白名单化。
+
+    生产实证（任务 026ead34）：工具 TypeError 后的同参数重试被"超过3次"
+    防护误杀，沙箱验证断路。新语义：
+    - 同参数 + 工具错误连续 ≤3 次 → 放行重试（给模型修正参数的机会）；
+    - 错误连续 >3 次 → 拦（工具本身坏了，重试无意义）；
+    - 无错误（成功结果）同参数重复 >3 次 → 拦（真死循环，语义保留）。
+    """
+    if error_streak >= 4:
+        return True
+    if error_streak >= 1:
+        return False
+    return count > 3
+
+
+def _should_force_deterministic_rerun(sandbox_fail_streak: int, rerun_done: bool) -> bool:
+    """P4-3：LLM 沙箱类工具连续失败 ≥3 → 触发确定性 PoC 强制补跑一次。"""
+    return sandbox_fail_streak >= 3 and not rerun_done
+
+
+def _normalize_vuln_type_value(value: Any) -> str:
+    """P9-4：vuln_type 归一化（小写、空白/连字符→下划线）。"""
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+
+
+def _vuln_types_compatible(type_a: Any, type_b: Any) -> bool:
+    """P9-4：顺序对齐的错绑防护——仅当类型相容才允许承接。
+
+    相容规则（任一）：
+    1. normalize 后完全相等；
+    2. 一方为 ``other``；
+    3. 一方包含另一方且长度比 ≥0.5（避免短词 "xss" 沾光长类型）。
+    """
+    a = _normalize_vuln_type_value(type_a)
+    b = _normalize_vuln_type_value(type_b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a == "other" or b == "other":
+        return True
+    if a in b or b in a:
+        return min(len(a), len(b)) / max(len(a), len(b)) >= 0.5
+    return False
+
+
+
+def _count_verification_outcomes(findings: list) -> dict:
+    """P2a（2026-10-03）：验证收口五态计数（含 static_confirmed）。
+
+    原统计漏计 static_confirmed——静态确认的漏洞在收口文案中隐身，
+    用户看到"0 确认"误以为审计颗粒无收。"""
+    keys = ("confirmed", "static_confirmed", "false_positive",
+            "not_reproducible", "needs_context")
+    counts = {k: 0 for k in keys}
+    for f in findings or []:
+        status = str((f or {}).get("verification_status") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _elastic_budget(n_findings: int, per_finding_config: int) -> int:
+    """P3a（2026-10-03）：验证弹性预算自适应。
+
+    生产实证（任务 eec77e54）：8 个 Semgrep 兜底候选耗 34 万 token
+    （per_finding=8 × 8 + 20 = 84 轮上限，实际 13 轮继续验证）。
+    候选 >5 时 per_finding 减半——Semgrep 兜底候选是泛化规则产物，
+    逐个深验性价比低；LLM 深度候选（少量高价值）保持原预算。
+    """
+    per_finding = 4 if n_findings > 5 else per_finding_config
+    return min(per_finding * n_findings + 20, 160)
 
 
 class VerificationAgent(BaseAgent):
@@ -803,8 +1030,14 @@ class VerificationAgent(BaseAgent):
 
 
     
-    def _parse_llm_response(self, response: str) -> VerificationStep:
-        """解析 LLM 响应 - 增强版，更健壮地提取思考内容"""
+    def _parse_llm_response(
+        self, response: str
+    ) -> Optional[VerificationStep]:
+        """解析 LLM 响应 - 增强版，更健壮地提取思考内容。
+
+        P9：Action 存在但参数（标签/无标签）均无法提取时返回 None，
+        由主循环走格式 nudge（P9-1b）。
+        """
         step = VerificationStep(thought="")
 
         # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
@@ -880,9 +1113,22 @@ class VerificationAgent(BaseAgent):
                     default={"raw_input": input_text}
                 )
         elif step.action:
-            # 🔥 v2.1: 有 Action 但没有 Action Input，记录警告
-            logger.warning(f"[Verification] Action '{step.action}' found but no Action Input")
-            step.action_input = {}
+            # P9-1a：无 "Action Input:" 标签——尝试无标签 JSON 提取
+            # （生产实证约半数输出省略标签，参数完整跟在 Action 行后）
+            extracted = self._extract_unlabeled_input(step.action, cleaned_response)
+            if extracted is not None:
+                logger.info(
+                    f"[Verification] Unlabeled action input extracted for "
+                    f"'{step.action}' (keys={list(extracted.keys())})"
+                )
+                step.action_input = extracted
+            else:
+                # P9-1b：提取失败 = 输出格式错误，返回 None 由主循环 nudge
+                logger.warning(
+                    f"[Verification] Action '{step.action}' but no labeled/unlabeled "
+                    f"input could be extracted -> format failure"
+                )
+                return None
 
         # 🔥 最后的 fallback：如果整个响应没有任何标记，整体作为思考
         if not step.thought and not step.action and not step.is_final:
@@ -1012,39 +1258,37 @@ class VerificationAgent(BaseAgent):
     def _final_step_from_tool_calls(
         self, tool_calls: Optional[List[Dict[str, Any]]]
     ) -> Optional[VerificationStep]:
-        """tool_calls 响应映射为 Final Answer 步骤（与文本协议 _parse_llm_response 对等）。
+        """tool_calls 响应映射为步骤（X1/X2/X3 泛化，同 analysis 2026-09-27）。
 
-        仅 submit_findings 视为终态：function.arguments 由服务端 tool-call-parser
-        保证合法 JSON，直接 json.loads 作为 final_answer（不走 json-repair），
-        下游沙箱门禁/skip_reason 统计/归一化消费的字段与文本形态同构。
-        其他函数名 / 坏 JSON / 非对象参数 → None，调用方降级文本解析路径
-        （同轮混合形态 tool_calls 优先，Task 7 边界）。
+        - submit_findings（X2：坏 JSON 先 json-repair 抢救，下游沙箱门禁/
+          skip_reason 统计/归一化消费的字段与文本形态同构）→ 终态 final_answer；
+        - 其他已知工具（X3：name 损坏先修复；sandbox_exec 等验证工具）→
+          非终态 step（action/action_input），由主循环既有 execute_tool 链执行；
+        - 无法识别/无法抢救 → None（调用方降级文本解析）。
         """
         if not tool_calls:
             return None
         call = tool_calls[0] or {}
-        name = str(call.get("name") or "").strip()
-        if name != "submit_findings":
+        known = list(self.tools.keys()) + ["submit_findings"]
+        name = self._repair_tool_call_name(str(call.get("name") or ""), known)
+        parsed = self._parse_tool_call_arguments(call.get("arguments"))
+        if not name or parsed is None:
             return None
-        arguments = call.get("arguments")
-        if isinstance(arguments, dict):
-            parsed: Any = arguments
-        elif isinstance(arguments, str) and arguments.strip():
-            try:
-                parsed = json.loads(arguments)
-            except (json.JSONDecodeError, ValueError):
+        if name == "submit_findings":
+            if not isinstance(parsed.get("findings"), list):
                 return None
-        else:
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        # 与文本路径同构：findings 过滤非字典项
-        if isinstance(parsed.get("findings"), list):
             parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
-        step = VerificationStep(thought="")
-        step.is_final = True
-        step.final_answer = parsed
-        return step
+            step = VerificationStep(thought="")
+            step.is_final = True
+            step.final_answer = parsed
+            return step
+        # X1：中间验证工具泛化（sandbox_exec / reverify 等走既有 execute_tool 链）
+        if name in self.tools:
+            step = VerificationStep(thought="")
+            step.action = name
+            step.action_input = parsed
+            return step
+        return None
 
     async def run(self, input_data: Dict[str, Any]) -> AgentResult:
         """
@@ -1276,6 +1520,9 @@ class VerificationAgent(BaseAgent):
         # 绑定/回填消费索引，正确性不依赖命令文本注释反解）
         self._runtime_attempts_by_finding_id: Dict[str, List[Dict[str, Any]]] = {}
         self._backfill_used_indices = set()
+        # P9-4：报告条目的输入认领状态（每次 run 重置；同一 Agent 实例跨调度
+        # 复用，不重置会把上一轮已认领索引带入下一轮导致顺序对齐失效）
+        self._claimed_input_indices: set[int] = set()
         # B2 弹性总上限：按 finding 数量动态调整，避免队尾饿死
         n_findings = len(findings_to_verify)
         if n_findings > 0:
@@ -1288,7 +1535,7 @@ class VerificationAgent(BaseAgent):
             except Exception:
                 per_finding = 8
                 logger.warning("[Verification] 弹性预算配置读取失败，用默认值 per_finding=8", exc_info=True)
-            elastic_max = min(per_finding * n_findings + 20, 160)
+            elastic_max = _elastic_budget(n_findings, per_finding)
             if elastic_max > self.config.max_iterations:
                 self.config.max_iterations = elastic_max
                 logger.info(f"[Verification] 弹性预算: {n_findings} findings → {elastic_max} iterations")
@@ -1329,7 +1576,7 @@ class VerificationAgent(BaseAgent):
                     # 构建前3个发现的具体命令
                     cmd_lines = []
                     for sc in sandbox_commands[:3]:
-                        input_json = json.dumps(sc['input'], ensure_ascii=False)
+                        input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                         cmd_lines.append(f"- **{sc['label']}**:\n  Action: sandbox_exec\n  Action Input: {input_json}")
 
                     cmds_text = "\n".join(cmd_lines)
@@ -1346,7 +1593,7 @@ class VerificationAgent(BaseAgent):
                     # 更严厉的警告
                     remaining_cmds = []
                     for sc in sandbox_commands[:5]:
-                        input_json = json.dumps(sc['input'], ensure_ascii=False)
+                        input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                         remaining_cmds.append(f"- Action: sandbox_exec, Action Input: {input_json}")
                     force_msg = (
                         f"🚨 **最终警告 (第{self._iteration}轮)**: 你仍拒绝调用 sandbox_exec！\n\n"
@@ -1380,7 +1627,10 @@ class VerificationAgent(BaseAgent):
                     llm_output, tokens_this_round = await self.stream_llm_call(
                         self._conversation_history,
                         tools=verification_tools,
-                        # 🔥 不传递 temperature 和 max_tokens，使用用户配置
+                        temperature=VERIFICATION_TEMPERATURE,
+                        # P3b（2026-10-03）：验证阶段显式低温 0.2——判定一致性
+                        # 优先于探索创造性（用户配置 0.35 仍偏高）。max_tokens
+                        # 仍走用户配置。R-C2：思考保留由 base 集中注入。
                     )
                 except asyncio.CancelledError:
                     logger.info(f"[{self.name}] LLM call cancelled")
@@ -1420,6 +1670,22 @@ class VerificationAgent(BaseAgent):
                     step = self._final_step_from_tool_calls(tool_calls_this_round)
                 if step is None:
                     step = self._parse_llm_response(llm_output)
+                # P9-1b：解析失败（Action 存在但参数无法提取）→ 格式 nudge。
+                # 拦截点严格位于 _steps.append / emit_llm_thought / assistant
+                # 历史写入之前（坏轮不留任何 assistant 痕迹）
+                if step is None:
+                    _fmt = await self._handle_subagent_format_failure()
+                    if _fmt == "stalled":
+                        # 连续格式错误达上限：为未验证 finding 写 elastic-exit
+                        # 豁免后跳到收口
+                        self._mark_elastic_exit_exemptions(
+                            findings_to_verify,
+                            getattr(self, "_verified_finding_indices", set()),
+                        )
+                        break
+                    continue
+                # 成功解析轮：格式计数归零
+                self._sub_format_retry = 0
                 self._steps.append(step)
                 
                 # 🔥 发射 LLM 思考内容事件 - 展示验证的思考过程
@@ -1433,6 +1699,13 @@ class VerificationAgent(BaseAgent):
                     # assistant 空 content 在 tools 模式下造成后端对话状态混乱
                     raw_history_content = (
                         "Final Answer: " + json.dumps(step.final_answer, ensure_ascii=False)
+                    )
+                elif tool_calls_this_round and step is not None and step.action:
+                    # X1：中间验证工具 tool_calls 轮正文为空——合成 Action 文本入历史，
+                    # 保持多轮历史与文本协议自洽（避免 assistant 空 content）
+                    raw_history_content = (
+                        f"Action: {step.action}\n"
+                        + json.dumps(step.action_input or {}, ensure_ascii=False)
                     )
                 else:
                     raw_history_content = llm_output
@@ -1485,7 +1758,7 @@ class VerificationAgent(BaseAgent):
                             remaining = sandbox_commands[:3]
                         cmd_lines = []
                         for sc in remaining:
-                            input_json = json.dumps(sc['input'], ensure_ascii=False)
+                            input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
                             cmd_lines.append(f"- **{sc['label']}**: Action: sandbox_exec, Action Input: {input_json}")
                         self._conversation_history.append({
                             "role": "user",
@@ -1532,9 +1805,14 @@ class VerificationAgent(BaseAgent):
                         self._tool_call_counts = {}
                     
                     self._tool_call_counts[tool_call_key] = self._tool_call_counts.get(tool_call_key, 0) + 1
+                    if not hasattr(self, '_tool_call_error_streak'):
+                        self._tool_call_error_streak = {}
                     
                     # 如果同一操作重复尝试超过3次，强制干预
-                    if self._tool_call_counts[tool_call_key] > 3:
+                    if _should_block_repeat_call(
+                        self._tool_call_counts[tool_call_key],
+                        self._tool_call_error_streak.get(tool_call_key, 0),
+                    ):
                         logger.warning(f"[{self.name}] Detected repetitive tool call loop: {tool_call_key}")
                         observation = (
                             f"⚠️ **系统干预**: 你已经使用完全相同的参数调用了工具 '{step.action}' 超过3次。\n"
@@ -1565,6 +1843,27 @@ class VerificationAgent(BaseAgent):
                         step.action,
                         step.action_input or {}
                     )
+
+                    # P4（2026-10-03）：工具结果分类——维护 per-key 错误 streak
+                    # （死循环防护白名单用）与沙箱类全局失败 streak（断路兜底用）
+                    _is_tool_error = observation.startswith("⚠️ 工具执行失败")
+                    _is_sandbox_tool = step.action in (
+                        "sandbox_exec", "java_test", "python_test", "php_test",
+                        "verify_vulnerability", "command_injection_test",
+                        "sql_injection_test", "xss_test",
+                    )
+                    if _is_tool_error:
+                        self._tool_call_error_streak[tool_call_key] = (
+                            self._tool_call_error_streak.get(tool_call_key, 0) + 1
+                        )
+                        if _is_sandbox_tool:
+                            self._sandbox_tool_fail_streak = (
+                                getattr(self, "_sandbox_tool_fail_streak", 0) + 1
+                            )
+                    else:
+                        self._tool_call_error_streak[tool_call_key] = 0
+                        if _is_sandbox_tool:
+                            self._sandbox_tool_fail_streak = 0
 
                     # 🔥 追踪 sandbox_exec 调用
                     if step.action == "sandbox_exec":
@@ -1719,6 +2018,13 @@ class VerificationAgent(BaseAgent):
                         filtered = filtered[:len(findings_to_verify)]
                     final_result["findings"] = filtered
 
+                # P9-4：报告空身份条目顺序对齐——必须位于幻觉截断之后
+                # （否则被整体替换）、backfill/attach 循环之前；
+                # 无身份条目承接未认领输入 finding 的 _sandbox_finding_id 与身份
+                self._align_unidentified_report_entries(
+                    final_result["findings"], findings_to_verify
+                )
+
                 for f in final_result["findings"]:
                     # 🔥 FIX: 回填 LLM 丢失的原始元数据
                     self._backfill_original_metadata(f, findings_to_verify)
@@ -1773,20 +2079,48 @@ class VerificationAgent(BaseAgent):
                 self._bind_unbound_runtime_evidence(verified_findings)
             except Exception as _e:
                 logger.warning(f"[{self.name}] Final evidence binding failed: {_e}")
+ 
+            # P4-3（2026-10-03）：沙箱工具断路兜底——LLM 沙箱类调用连续失败 ≥3
+            # （空调用/TypeError 连发，生产实证 026ead34 全会话沙箱瘫痪）时，
+            # 强制补跑确定性 PoC（幂等台账自动只跑未落账命令），验证能力不随
+            # LLM 工具调用质量瘫痪。
+            if _should_force_deterministic_rerun(
+                getattr(self, "_sandbox_tool_fail_streak", 0),
+                getattr(self, "_deterministic_rerun_done", False),
+            ):
+                self._deterministic_rerun_done = True
+                logger.warning(
+                    f"[{self.name}] 沙箱类工具连续失败 "
+                    f"{getattr(self, '_sandbox_tool_fail_streak', 0)} 次，"
+                    "强制补跑确定性 PoC（幂等，仅未落账命令）"
+                )
+                try:
+                    await self._run_deterministic_sandbox_commands(
+                        getattr(self, "_sandbox_commands", None) or [],
+                        getattr(self, "_sandbox_project_root", None),
+                    )
+                except Exception as exc:
+                    logger.warning(f"[{self.name}] 确定性 PoC 补跑失败（非致命）: {exc!r}")
 
             # sandbox-verification-hard-gate Task 14：验证收尾——每个 finding 的
             # 终态/沙箱尝试摘要落审计追踪（helper 内部逐条 try/except，非致命）
             self._trace_verification_results(verified_findings)
 
-            # 统计
-            confirmed_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.CONFIRMED])
-            not_reproducible_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NOT_REPRODUCIBLE])
-            false_positive_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.FALSE_POSITIVE])
-            needs_context_count = len([f for f in verified_findings if f.get("verification_status") == VerificationStatus.NEEDS_CONTEXT])
+            # 统计（P2a 2026-10-03：static_confirmed 纳入收口——生产实证 B 机
+            # eec77e54 "0 确认"实为 0 动态确认 + 3 静态确认，文案漏计误导用户）
+            counts = _count_verification_outcomes(verified_findings)
+            confirmed_count = counts["confirmed"]
+            # P7-5：静态确认计数提取（handoff/返回数据统一五态口径）
+            static_confirmed_count = counts["static_confirmed"]
+            not_reproducible_count = counts["not_reproducible"]
+            false_positive_count = counts["false_positive"]
+            needs_context_count = counts["needs_context"]
 
             await self.emit_event(
                 "info",
-                f"Verification Agent 完成: {confirmed_count} 确认, {false_positive_count} 误报, {not_reproducible_count} 无法复现, {needs_context_count} 需上下文"
+                f"Verification Agent 完成: {counts['confirmed']} 确认, "
+                f"{counts['static_confirmed']} 静态确认, {counts['false_positive']} 误报, "
+                f"{counts['not_reproducible']} 无法复现, {counts['needs_context']} 需上下文"
             )
 
             # 🔥 CRITICAL: Log final findings count before returning
@@ -1796,6 +2130,21 @@ class VerificationAgent(BaseAgent):
             handoff = self._create_verification_handoff(
                 verified_findings, confirmed_count, false_positive_count, needs_context_count
             )
+
+            # P9 观测性：N 进 N 出核对——输入 findings 数 vs 产出结论数，
+            # 缺条时 metadata 标注 missing_conclusions（生产实证「7 进 6 出」：
+            # 同参死循环被去重拦截后未给结论）。
+            _result_meta: Dict[str, Any] = {}
+            _n_in = len(findings_to_verify)
+            _n_out = len(verified_findings)
+            if _n_out < _n_in:
+                _result_meta["missing_conclusions"] = _n_in - _n_out
+                _result_meta["input_findings"] = _n_in
+                _result_meta["output_findings"] = _n_out
+                logger.warning(
+                    f"[{self.name}] N进N出核对: {_n_in} 输入 / {_n_out} 结论，"
+                    f"{_n_in - _n_out} 条未给结论（metadata.missing_conclusions）"
+                )
 
             return AgentResult(
                 success=True,
@@ -1821,6 +2170,7 @@ class VerificationAgent(BaseAgent):
                 tokens_used=self._total_tokens,
                 duration_ms=duration_ms,
                 handoff=handoff,  # 🔥 添加 handoff
+                metadata=_result_meta,
             )
             
         except Exception as e:
@@ -2036,6 +2386,8 @@ class VerificationAgent(BaseAgent):
         # 绑定/回填消费索引（同一对象引用，避免双计）
         if finding_id:
             self._runtime_attempts_by_finding_id.setdefault(str(finding_id), []).append(attempt)
+        # P9 终局防御：同时双写持久归档（跨轮/跨调度可反查）
+        self._archive_attempt(attempt)
         return attempt
 
     def _resolve_finding_id_from_command(self, command: str) -> Optional[str]:
@@ -2128,26 +2480,60 @@ class VerificationAgent(BaseAgent):
             str(file_path_input) + "\n" + code
         )
 
-        self._sandbox_attempts.append(
-            {
-                "tool": tool_name,
-                "success": success,
-                "exit_code": exit_code,
-                "command": code,
-                "target_ref": target_ref,
-                "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
-                "network_enabled": False,
-                "evidence_summary": self._truncate_evidence_summary(observation),
-                "finding_id": finding_id,
-                # Task 1：language_test 同样经 Docker 沙箱执行，基础设施故障须打 infra_error，
-                # 否则该路径下沙箱缺席仍会被分支 4 伪装成 not_reproducible。
-                "infra_error": _is_infra_error(
-                    code, ran_in_container=exit_code is not None
-                ) or _is_infra_error(
-                    str(observation or ""), ran_in_container=exit_code is not None
-                ),
-            }
-        )
+        lang_attempt = {
+            "tool": tool_name,
+            "success": success,
+            "exit_code": exit_code,
+            "command": code,
+            "target_ref": target_ref,
+            "language": tool_name.rsplit("_", 1)[0] if "_" in tool_name else None,
+            "network_enabled": False,
+            "evidence_summary": self._truncate_evidence_summary(observation),
+            "finding_id": finding_id,
+            # Task 1：language_test 同样经 Docker 沙箱执行，基础设施故障须打 infra_error，
+            # 否则该路径下沙箱缺席仍会被分支 4 伪装成 not_reproducible。
+            "infra_error": _is_infra_error(
+                code, ran_in_container=exit_code is not None
+            ) or _is_infra_error(
+                str(observation or ""), ran_in_container=exit_code is not None
+            ),
+        }
+        self._sandbox_attempts.append(lang_attempt)
+        # P9 终局防御：language test attempt 同样双写持久归档
+        self._archive_attempt(lang_attempt)
+
+    # P9 终局防御（D9）：持久证据归档 FIFO 上限。
+    # 归档跨 LLM 循环轮次与跨调度累积（不随 run() 重置），供 orchestrator
+    # _final_evidence_sweep 在落库前反查绑定仍无证据的 finding。
+    PERSISTENT_ARCHIVE_LIMIT = 2000
+
+    def _archive_attempt(self, attempt: dict[str, Any]) -> None:
+        """attempt 双写进持久归档（FIFO：超限丢弃最旧，debug 留日志）。
+
+        按归一化语义键去重——确定性 PoC 跨调度重跑产出的同语义 attempt
+        不重复归档；扫描全量（≤2000，成本可忽略）。
+        """
+        archive = getattr(self, "_persistent_attempt_archive", None)
+        if archive is None:
+            archive = []
+            self._persistent_attempt_archive = archive
+        key = self._attempt_dedupe_key(attempt)
+        if any(
+            self._attempt_dedupe_key(existing) == key for existing in archive
+        ):
+            return
+        archive.append(attempt)
+        if len(archive) > self.PERSISTENT_ARCHIVE_LIMIT:
+            dropped = len(archive) - self.PERSISTENT_ARCHIVE_LIMIT
+            del archive[:dropped]
+            logger.debug(
+                f"[{type(self).__name__}] persistent attempt archive FIFO dropped "
+                f"{dropped} oldest (limit={self.PERSISTENT_ARCHIVE_LIMIT})"
+            )
+
+    def get_persistent_attempt_archive(self) -> List[dict[str, Any]]:
+        """只读暴露持久归档（供同进程 orchestrator sweep 消费）。"""
+        return list(getattr(self, "_persistent_attempt_archive", []) or [])
 
     @staticmethod
     def _truncate_evidence_summary(observation: str, capacity: int = 5000) -> str:
@@ -2165,9 +2551,13 @@ class VerificationAgent(BaseAgent):
 
     @staticmethod
     def _attempt_dedupe_key(attempt: dict[str, Any]) -> tuple:
-        """V6 B4：attempt 语义去重键（命令+退出码+证据摘要前缀）。"""
+        """V6 B4：attempt 语义去重键（归一化命令+退出码+证据摘要前缀）。
+
+        P9-7：命令经 normalize_attempt_command 归一（剥 FINDING_ID 注释/
+        poc_N 下标/tmp 前缀），跨轮同一 PoC 不因这些差异产生副本。
+        """
         return (
-            str(attempt.get("command") or "")[:200],
+            normalize_attempt_command(str(attempt.get("command") or ""))[:200],
             attempt.get("exit_code"),
             str(attempt.get("evidence_summary") or "")[:200],
         )
@@ -2277,8 +2667,9 @@ class VerificationAgent(BaseAgent):
             # _all_findings 同引用（previous_results["findings"] 直传，_deduplicate
             # 不复制 dict），证据落本体后即使调度超时/取消走不到 merge 也不丢
             # （生产 9344d5dd：40 findings 沙箱 attempts 全 null，断点 A）。
-            if not f.get("sandbox_attempts"):
-                self._attach_runtime_sandbox_attempts(f)
+            # P9-7：不再以「已有 attempts」短路——始终经 attach 合并后续轮新证据
+            # （内部按归一化语义键去重，含真证据的 LLM attempt 不覆盖）。
+            self._attach_runtime_sandbox_attempts(f)
             target = {
                 **f,
                 "verdict": "needs_context",
@@ -2298,8 +2689,23 @@ class VerificationAgent(BaseAgent):
            → 补入（判 static_confirmed，避免真漏洞被误判 not_reproducible）
         """
         existing_attempts = finding.get("sandbox_attempts") or []
-        # 若 LLM 已填了含真证据的成功 attempt，不覆盖
-        if any(isinstance(a, dict) and a.get("success") and self._attempt_has_vuln_evidence(a) for a in existing_attempts):
+        # P7-1：先剔除占位符/动作描述型自述 attempt（命令不可执行者不得落库）
+        cleaned_attempts = [
+            a for a in existing_attempts
+            if not (isinstance(a, dict)
+                    and a.get("command")
+                    and not _is_executable_command(str(a.get("command"))))
+        ]
+        if len(cleaned_attempts) != len(existing_attempts):
+            finding["sandbox_attempts"] = cleaned_attempts
+            existing_attempts = cleaned_attempts
+        # 若 LLM 已填了含真证据的成功 attempt（且命令可执行），不覆盖
+        if any(
+            isinstance(a, dict) and a.get("success")
+            and self._attempt_has_vuln_evidence(a)
+            and _is_executable_command(str(a.get("command") or ""))
+            for a in existing_attempts
+        ):
             return
         attempts = getattr(self, "_sandbox_attempts", [])
 
@@ -2343,64 +2749,69 @@ class VerificationAgent(BaseAgent):
         # 恢复（backfill 匹配失败），此时按 file_path+line_start 匹配运行时索引中的
         # attempt（target_ref/command 含路径）。兜底保证"确定性执行过的证据不丢"；
         # 优先精确行号，行号缺失时仅路径匹配。
-        if not finding.get("sandbox_attempts"):
-            index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
-            fp = (finding.get("file_path") or "").strip().lower()
-            ln = finding.get("line_start") or 0
-            position_matched = []
-            if fp:
-                for attempts_by_id in index.values():
-                    for a in attempts_by_id:
-                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
-                            continue
-                        ref = str(a.get("target_ref") or "").strip().lower()
-                        cmd = str(a.get("command") or "").lower()
-                        hay = f"{ref} {cmd}"
-                        if fp in hay or hay.endswith(fp):
-                            if ln and f":{ln}" in hay:
-                                position_matched.append(a)
-                            elif not ln:
-                                position_matched.append(a)
+        # P9-7：原「if not finding.sandbox_attempts」闸门取消——始终扫描合并
+        # （merge 内部按归一化语义键去重，不产生副本），后续轮新证据不再被挡。
+        index = getattr(self, "_runtime_attempts_by_finding_id", None) or {}
+        fp = (finding.get("file_path") or "").strip().lower()
+        ln = finding.get("line_start") or 0
+        position_matched = []
+        if fp:
+            for attempts_by_id in index.values():
+                for a in attempts_by_id:
+                    if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                        continue
+                    ref = str(a.get("target_ref") or "").strip().lower()
+                    cmd = str(a.get("command") or "").lower()
+                    hay = f"{ref} {cmd}"
+                    if fp in hay or hay.endswith(fp):
+                        if ln and f":{ln}" in hay:
+                            position_matched.append(a)
+                        elif not ln:
+                            position_matched.append(a)
+        if position_matched:
+            finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                existing_attempts, position_matched
+            )
+            logger.info(
+                f"[{self.name}] Position-based sandbox fallback: file={fp}:{ln} "
+                f"-> {len(position_matched)} attempts"
+            )
+            return
+        # REQ-VP-4: 第三级兜底——ID 与精确位置均失配（含 line 不匹配）时，
+        # 按 file_path 路径末 2 段后缀 + vuln_type 组合匹配，避免 Tribes 类证据丢失。
+        if fp:
+            fp_suffix = "/".join([s for s in fp.split("/") if s][-2:]) or fp
+            vuln_type = (finding.get("vulnerability_type") or "").lower()
+            vk = [vuln_type.replace("_", "")] if len(vuln_type.replace("_", "")) >= 3 else []
+            for attempts_by_id in index.values():
+                for a in attempts_by_id:
+                    if not isinstance(a, dict) or a.get("finding_id") == finding_id:
+                        continue
+                    ref = str(a.get("target_ref") or "").strip().lower()
+                    cmd = str(a.get("command") or "").lower()
+                    hay = f"{ref} {cmd}"
+                    if fp_suffix and (fp_suffix in hay or hay.endswith(fp_suffix)):
+                        if not vk or any(k in hay for k in vk):
+                            position_matched.append(a)
             if position_matched:
                 finding["sandbox_attempts"] = self._merge_attempts_deduped(
                     existing_attempts, position_matched
                 )
                 logger.info(
-                    f"[{self.name}] Position-based sandbox fallback: file={fp}:{ln} "
+                    f"[{self.name}] Path-suffix sandbox fallback (REQ-VP-4): "
+                    f"suffix={fp_suffix} type={vuln_type} "
                     f"-> {len(position_matched)} attempts"
                 )
                 return
-            # REQ-VP-4: 第三级兜底——ID 与精确位置均失配（含 line 不匹配）时，
-            # 按 file_path 路径末 2 段后缀 + vuln_type 组合匹配，避免 Tribes 类证据丢失。
-            if fp:
-                fp_suffix = "/".join([s for s in fp.split("/") if s][-2:]) or fp
-                vuln_type = (finding.get("vulnerability_type") or "").lower()
-                vk = [vuln_type.replace("_", "")] if len(vuln_type.replace("_", "")) >= 3 else []
-                for attempts_by_id in index.values():
-                    for a in attempts_by_id:
-                        if not isinstance(a, dict) or a.get("finding_id") == finding_id:
-                            continue
-                        ref = str(a.get("target_ref") or "").strip().lower()
-                        cmd = str(a.get("command") or "").lower()
-                        hay = f"{ref} {cmd}"
-                        if fp_suffix and (fp_suffix in hay or hay.endswith(fp_suffix)):
-                            if not vk or any(k in hay for k in vk):
-                                position_matched.append(a)
-                if position_matched:
-                    finding["sandbox_attempts"] = self._merge_attempts_deduped(
-                        existing_attempts, position_matched
-                    )
-                    logger.info(
-                        f"[{self.name}] Path-suffix sandbox fallback (REQ-VP-4): "
-                        f"suffix={fp_suffix} type={vuln_type} "
-                        f"-> {len(position_matched)} attempts"
-                    )
-                    return
 
         # 严匹配（含真证据）
         matched_attempts = [a for a in attempts if self._sandbox_attempt_matches_finding(a, finding)]
         if matched_attempts:
-            finding["sandbox_attempts"] = existing_attempts + matched_attempts
+            # P9-7：严匹配命中也走归一化合并（原 existing+matched 直拼在
+            # 始终合并的多次调用下会产生同源副本）
+            finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                existing_attempts, matched_attempts
+            )
             return
         # 宽松兜底（方案C）：LLM 自写 PoC 成功但无标准标记
         # I-1/I-2 收紧：避免跨 finding 误关联 + 避免"跑完但没复现"的 attempt 被当弱证据
@@ -2453,7 +2864,10 @@ class VerificationAgent(BaseAgent):
             # 打 weak_evidence 标记：has_weak_evidence 认此标记走 static_confirmed（非 confirmed）
             weak_a = dict(a)
             weak_a["weak_evidence"] = True
-            finding["sandbox_attempts"] = existing_attempts + [weak_a]
+            # P9-7：同样走归一化合并，多次 attach 不产生 weak 副本
+            finding["sandbox_attempts"] = self._merge_attempts_deduped(
+                existing_attempts, [weak_a]
+            )
             return
 
     def _bind_unbound_runtime_evidence(self, verified_findings: List[Dict]) -> None:
@@ -2506,21 +2920,25 @@ class VerificationAgent(BaseAgent):
                 verified_findings.append(target)
                 if fp:
                     seen_paths[fp] = target
-            if not target.get("sandbox_attempts"):
-                self._attach_runtime_sandbox_attempts(target)
-                # 证据可能改变状态（needs_context → confirmed/not_reproducible），重新归一化
-                if target.get("sandbox_attempts"):
-                    strict = self._normalize_verification_outcome(target)
-                    target.clear()
-                    target.update(strict)
-                elif not target.get("verification_status"):
-                    # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
-                    # 归一化经 compute_verification_status 分支 5 给 needs_context，
-                    # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
-                    # 不得留无状态 finding 出 Agent。
-                    strict = self._normalize_verification_outcome(target)
-                    target.clear()
-                    target.update(strict)
+            # P8（2026-10-07）：原守卫 `if not target.get("sandbox_attempts")`
+            # 导致 LLM 漏报且已携带（劣质）attempts 的 finding 既不补真实运行时
+            # 证据、也不重算状态——生产实证 autoindex finding 状态漂移
+            # （needs_context，按真实确定性证据应为 not_reproducible）。
+            # 运行时确定性证据是权威来源：始终合并（内部按 finding_id 幂等去重，
+            # 含真证据的 LLM attempt 不覆盖），随后始终按合并证据归一化状态。
+            self._attach_runtime_sandbox_attempts(target)
+            if target.get("sandbox_attempts"):
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
+            elif not target.get("verification_status"):
+                # Task 7（豁免路径 f）：零证据漏报 finding 也必须落终态——
+                # 归一化经 compute_verification_status 分支 5 给 needs_context，
+                # elastic_exit 等 sandbox_skip_reason 进入 notes（硬门禁条件 2），
+                # 不得留无状态 finding 出 Agent。
+                strict = self._normalize_verification_outcome(target)
+                target.clear()
+                target.update(strict)
             # 证据同步回待验本体：orig 是 findings_to_verify 元素，与 orchestrator
             # _all_findings 同引用（previous_results["findings"] 直传），绑定落本体后
             # 调度超时/取消走不到 merge 沙箱证据也不丢（生产 9344d5dd 断点 A）。
@@ -2541,6 +2959,10 @@ class VerificationAgent(BaseAgent):
             return False
         # R3 反伪造：模拟/源码缺失输出不得作为漏洞触发证据
         if any(marker.lower() in ev_lower for marker in FABRICATION_MARKERS):
+            return False
+        # P7-1：标记+语义双条件——"VULNERABILITY_CONFIRMED: false_positive" 类
+        # 冲突文本不得作为证据（生产实证 L6）
+        if _marker_negated(ev_lower):
             return False
         return any(m.lower() in ev_lower for m in VULN_EVIDENCE_MARKERS)
 
@@ -2683,11 +3105,18 @@ class VerificationAgent(BaseAgent):
                 # 不短路，状态由沙箱 attempt 推导
 
         attempts = finding.get("sandbox_attempts") or []
+        # D10：仅 LLM Final Answer 的显式 verdict=false_positive 触发锁定；
+        # verification_status 中的 FP（历史/推导位）不算显式标注，仍如实重算。
+        explicit_fp = (
+            str(finding.get("verdict") or "").lower().strip()
+            == VerificationStatus.FALSE_POSITIVE
+        )
         status, is_verified, notes = compute_verification_status(
             finding,
             attempts,
             attempt_has_vuln_evidence_fn=self._attempt_has_vuln_evidence,
             attempt_matches_finding_fn=self._sandbox_attempt_matches_finding,
+            explicit_false_positive=explicit_fp,
         )
 
         # 代码推理链确认（soft evidence）：沙箱环境受限无法动态复现时，
@@ -2731,6 +3160,18 @@ class VerificationAgent(BaseAgent):
                     finding.get("verification_method", "static_reasoning")
                     + " (沙箱受限，代码推理链确认)"
                 )
+
+        # P9-4（D2/D12）：顺序对齐条目的降级安全阀——身份按报告顺序承接，
+        # 可能错绑，顺序归并证据一律不得动态确认：confirmed 降为
+        # static_confirmed 并附人工复核 note。比较使用 VerificationStatus 常量。
+        # aligned 条目另由 finish 门禁统计处（_gate_evidence_findings）分桶排除。
+        if finding.get("_aligned_by_order") and status == VerificationStatus.CONFIRMED:
+            status = VerificationStatus.STATIC_CONFIRMED
+            is_verified = True
+            finding["verification_note"] = (
+                str(finding.get("verification_note") or "")
+                + " 顺序归并证据，请人工复核"
+            ).strip()
 
         normalized = dict(finding)
         normalized["verification_status"] = status
@@ -2798,6 +3239,98 @@ class VerificationAgent(BaseAgent):
                 )
             except Exception as e:
                 logger.warning(f"[{self.name}] trace add_verification_result 失败（非致命）: {e}")
+
+    @staticmethod
+    def _is_unidentified_report_entry(entry: Dict[str, Any]) -> bool:
+        """P9-4：报告条目是否「无身份」——file_path 缺失或为占位词。"""
+        fp = str(entry.get("file_path") or "").strip().lower()
+        return not fp or fp in ("unknown", "?", "n/a", "none", "null")
+
+    def _claim_input_indices(
+        self,
+        report_entries: List[Dict[str, Any]],
+        input_findings: List[Dict[str, Any]],
+    ) -> None:
+        """有身份报告条目按 file_path 认领输入 finding（精确行号优先）。"""
+        claimed = self._claimed_input_indices
+        for entry in report_entries:
+            if self._is_unidentified_report_entry(entry):
+                continue
+            e_fp = str(entry.get("file_path") or "").strip().lower()
+            e_ln = _to_int(entry.get("line_start")) or 0
+            best_idx: Optional[int] = None
+            for i, orig in enumerate(input_findings):
+                if i in claimed or not isinstance(orig, dict):
+                    continue
+                o_fp = str(orig.get("file_path") or "").strip().lower()
+                if o_fp != e_fp:
+                    continue
+                o_ln = _to_int(orig.get("line_start")) or 0
+                if e_ln and o_ln == e_ln:
+                    best_idx = i
+                    break
+                if best_idx is None:
+                    best_idx = i
+            if best_idx is not None:
+                claimed.add(best_idx)
+
+    def _align_unidentified_report_entries(
+        self,
+        report_entries: List[Dict[str, Any]],
+        input_findings: List[Dict[str, Any]],
+    ) -> int:
+        """P9-4：无身份报告条目按报告顺序承接未认领输入 finding 的身份。
+
+        启用条件（同时满足，否则原样返回 0）：
+        1. 存在无身份（无可用 file_path）报告条目；
+        2. 未被有身份条目认领的输入 finding 数 == 无身份条目数
+           （数量不等说明对应关系不可信）；
+        3. 每一对位的 vuln_type 相容（错绑防护；任一不相容则整体放弃——
+           严格数量相等下对应前提已破裂）。
+
+        承接：_sandbox_finding_id 与 file_path/line_start 身份字段，
+        打 _aligned_by_order 标记（D12 分桶；confirmed 由
+        _normalize_verification_outcome 降级 static_confirmed）。
+        """
+        if not isinstance(report_entries, list) or not input_findings:
+            return 0
+        unidentified = [
+            e for e in report_entries
+            if isinstance(e, dict) and self._is_unidentified_report_entry(e)
+        ]
+        if not unidentified:
+            return 0
+
+        self._claim_input_indices(report_entries, input_findings)
+        unclaimed = [
+            i for i in range(len(input_findings))
+            if i not in self._claimed_input_indices
+        ]
+        if len(unclaimed) != len(unidentified):
+            return 0
+
+        pairs = list(zip(unidentified, unclaimed))
+        for entry, idx in pairs:
+            orig = input_findings[idx]
+            if not _vuln_types_compatible(
+                entry.get("vulnerability_type"),
+                orig.get("vulnerability_type"),
+            ):
+                return 0
+
+        aligned = 0
+        for entry, idx in pairs:
+            orig = input_findings[idx]
+            fid = orig.get("_sandbox_finding_id") or orig.get("id")
+            if fid:
+                entry["_sandbox_finding_id"] = str(fid)
+            entry["file_path"] = orig.get("file_path")
+            if orig.get("line_start"):
+                entry["line_start"] = orig.get("line_start")
+            entry["_aligned_by_order"] = True
+            self._claimed_input_indices.add(idx)
+            aligned += 1
+        return aligned
 
     def _backfill_original_metadata(self, llm_finding: Dict[str, Any], original_findings: List[Dict[str, Any]]) -> None:
         """用原始 finding 的元数据回填 LLM 输出中的 unknown 字段"""
@@ -2978,7 +3511,9 @@ class VerificationAgent(BaseAgent):
         for sc in sandbox_commands:
             if self.is_cancelled:
                 break
-            cmd_input = sc.get("input") or {}
+            # P7-4：sandbox_commands 已扁平化（命令在顶层）；兼容旧包装结构
+            # {"input": {"command": ...}}（存量测试/历史调用方）
+            cmd_input = sc if sc.get("command") else (sc.get("input") or {})
             command = cmd_input.get("command", "")
             if not command:
                 continue
@@ -3089,16 +3624,28 @@ class VerificationAgent(BaseAgent):
         from uuid import uuid4
         commands = []
         for i, f in enumerate(findings):
-            vuln_type = (f.get('vulnerability_type') or '').lower()
+            # P7-4：PoC 路径与保存路径共用规范化（原为各自实现，别名漏匹配）
+            vuln_type = normalize_vuln_type(
+                str(f.get('vulnerability_type') or 'other')
+            )
             file_path = f.get('file_path', 'unknown')
             line = f.get('line_start', 0)
             title = f.get('title', '')
 
             # Opt-1: Assign a finding_id for precise sandbox-to-finding matching
-            finding_id = f.get("id") or str(uuid4())[:8]
+            # P9-5：跨轮 ID 三级优先——①已分配的 _sandbox_finding_id 必须复用
+            # （跨轮稳定，第二轮重入的旧 finding 不得换新 ID）；
+            # ②finding 自带 id（可能为 int 等非字符串，统一 str 化，
+            # 否则后续 finding_id 索引键类型混杂）；③生成新短 ID。
+            raw_fid = f.get("_sandbox_finding_id") or f.get("id")
+            finding_id = str(raw_fid) if raw_fid else str(uuid4())[:8]
             f["_sandbox_finding_id"] = finding_id
 
             cmd = self._gen_sandbox_command(vuln_type, file_path, line, title, i)
+            # P7-4：子串/默认匹配返回 {'label':..., 'input': {'command':...}} 包装，
+            # 精确命中直接返回 {'command':...}——统一 unwrap 后处理
+            if cmd and "command" not in cmd and isinstance(cmd.get("input"), dict):
+                cmd = cmd["input"]
             if cmd:
                 # Opt-1: Embed finding_id as comment in the command
                 original_command = cmd.get("command", "")
@@ -3134,6 +3681,52 @@ class VerificationAgent(BaseAgent):
         sink_regex = "|".join(sink_patterns) if sink_patterns else "noop_never_match"
 
         cmd_templates = {
+            'insecure_cookie': {
+                'command': (
+                    f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
+                    f"import os, re, sys\n"
+                    f"print('=== SANDBOX Cookie Security Verification ===')\n"
+                    f"print('Target: {file_ref}')\n"
+                    f"src_path = '/workspace/src/{safe_path}'\n"
+                    "if not os.path.exists(src_path):\n"
+                    "    print('SOURCE_NOT_FOUND'); sys.exit(2)\n"
+                    "with open(src_path) as fh: content = fh.read()\n"
+                    "issues = []\n"
+                    "# 语义匹配：检查 cookie 安全标志的显式设置\n"
+                    "for flag, pat in [\n"
+                    "    ('HttpOnly', r'setHttpOnly\\\\s*\\\\(\\\\s*(?:true|1)'),\n"
+                    "    ('Secure', r'setSecure\\\\s*\\\\(\\\\s*(?:true|1)'),\n"
+                    "]:\n"
+                    "    if not re.search(pat, content, re.I):\n"
+                    "        issues.append(flag)\n"
+                    "if issues:\n"
+                    "    print(f'STATIC_CONFIRMED: cookie missing flags: {issues}')\n"
+                    "else:\n"
+                    "    print('NO_ISSUE: HttpOnly/Secure flags explicitly set (false_positive)')\n"
+                    "print('=== Verification Complete ===')\n"
+                    "POC_EOF\npython3 /tmp/poc_%d.py" % index
+                )
+            },
+            'expression_injection': {
+                'command': (
+                    f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
+                    f"import os, re, sys\n"
+                    f"print('=== SANDBOX Expression Injection Verification ===')\n"
+                    f"print('Target: {file_ref}')\n"
+                    f"src_path = '/workspace/src/{safe_path}'\n"
+                    "if not os.path.exists(src_path):\n"
+                    "    print('SOURCE_NOT_FOUND'); sys.exit(2)\n"
+                    "with open(src_path) as fh: content = fh.read()\n"
+                    "# 语义匹配：检查动态表达式求值入口是否接收外部可控输入\n"
+                    "sinks = re.findall(r'\\.(?:eval|evaluate|getValue|invoke)\\s*\\(', content)\n"
+                    "if sinks:\n"
+                    "    print(f'STATIC_CONFIRMED: dynamic expression sinks found: {len(sinks)}')\n"
+                    "else:\n"
+                    "    print('NO_SINK: no dynamic expression evaluation found')\n"
+                    "print('=== Verification Complete ===')\n"
+                    "POC_EOF\npython3 /tmp/poc_%d.py" % index
+                )
+            },
             'sql_injection': {
                 'command': (
                     f"cat > /tmp/poc_{index}.py << 'POC_EOF'\n"
@@ -3696,6 +4289,21 @@ class VerificationAgent(BaseAgent):
                     break
 
         if not matched:
+            # P7-4：非源码语言扩展名（配置/文档类）走 sink-grep 通用模板必然
+            # NO_SINK（grep 的是代码 sink，文件里永远不会有）——无验证价值，
+            # 返回 None（调用方不发命令），避免空跑浪费沙箱预算。
+            _SOURCE_CODE_EXTS = {
+                ".java", ".py", ".js", ".ts", ".jsx", ".tsx", ".php", ".rb",
+                ".go", ".rs", ".c", ".cpp", ".h", ".hpp", ".cs", ".kt",
+                ".scala", ".groovy", ".swift", ".m", ".sh", ".bash",
+            }
+            _ext = os.path.splitext(safe_path)[1].lower()
+            if _ext and _ext not in _SOURCE_CODE_EXTS:
+                logger.info(
+                    f"[Verification] 跳过 sink-grep PoC：目标 {safe_path} 非源码"
+                    "（配置/文档类，无有效静态验证模式）"
+                )
+                return None
             matched = {
                 'label': f'发现{index+1}: {vuln_type} ({file_ref})',
                 'input': {
@@ -3753,21 +4361,32 @@ class VerificationAgent(BaseAgent):
         return "\n".join(parts)
 
     def _deduplicate(self, findings: List[Dict]) -> List[Dict]:
-        """去重"""
+        """去重。
+
+        P9-4 前置修复：空 file_path 的 finding 原键仅 (line,type)——多条空
+        路径同类型 finding 会被塌缩为一条（已实证）。空路径时追加 title
+        前 40 字符区分；有路径的常规 finding 键不变（跨轮同漏洞归并不受
+        标题改写影响）。
+        """
         seen = set()
         unique = []
-        
+
         for f in findings:
+            file_path = f.get("file_path", "")
+            title_part = (
+                str(f.get("title", ""))[:40] if not file_path else ""
+            )
             key = (
-                f.get("file_path", ""),
+                file_path,
                 f.get("line_start", 0),
                 f.get("vulnerability_type", ""),
+                title_part,
             )
-            
+
             if key not in seen:
                 seen.add(key)
                 unique.append(f)
-        
+
         return unique
     
     @staticmethod

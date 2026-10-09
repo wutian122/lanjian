@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.5.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.7.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -27,6 +27,10 @@
 - **E2E 六项缺陷修复**（v6.2.5）：EventQueue 生产端零阻塞 + thinking_token 聚合降频（消除 1493 条事件各等满 5s ≈ 124 分钟阻塞）；reverify 接入确定性证据引擎（重放真实沙箱证据，PoC 崩溃不再误降 not_reproducible）；统一路径解析器修复多语言 finding 落库丢失（src/ 层级误杀）；沙箱项目源码挂载一律只读；仪表盘统计聚合 agent_tasks；删除任务前取消收尾协程
 - **大项目审计时间预算治理**（v6.3.0）：根治"大项目审计正常结束但漏洞为 0"的结构性缺陷（nacos/tomcat 5 千文件级任务实证诊断）——任务超时 watchdog 化（到点先优雅收口 + 45s 宽限 + hard-cancel 兜底，修复 Python 3.12 吞取消导致超时兜底失效）；analysis 时间预算将尽**软停止交卷**（已完成的调查强制总结为 findings，不再被硬杀清零）；子 Agent 调度超时 = min(类型上限, 剩余预算) 且调度前复位取消锁存（一次超时不再永久废掉同类型 Agent 的补发调度）；失败子 Agent 已声明的发现保全落库；0 发现 + 调度失败如实标 `completed_with_gaps`（不再误报"发现 0 个漏洞"）
 - **沙箱验证硬门禁与产出下限**（v6.5.0）：封堵十条绕过沙箱直达终态的豁免路径（Semgrep 静态短路先执行确定性 PoC、软证据升级前置真实尝试、弹性退出/预算耗尽/兜底遍历三路径收口、三次放行未验证清单强制标记并在报告呈现"未沙箱验证"段落）；基础设施故障分离 `infra_error` 语义（Docker 缺席/镜像缺失不再伪装"漏洞未复现"）；Analysis 分层候选制（低置信候选交沙箱验证，替代"宁可漏报"）+ 维度级产出下限 + Semgrep 兜底落库（配置类不送沙箱防预算拖垮）；audit_trace 全链路闭环（工具/LLM/验证写点补全 + volume 持久化 + 执行轨迹摘要注入子 Agent 上下文）；LLM 调用韧性（空响应分型重试、无效 tool_calls 强引导自愈、litellm 出站线程池剥离根治事件循环同步阻塞、watchdog 强杀补丁）；LLM 预算治理（按 Agent 类型分阶段 max_tokens、repetition_penalty 治理、llmConfig 保存防回写陷阱）；任务管理（pending 搁浅任务手动启动入口、verification 预算预留）；前端预算输入项 / 时间预算显示 / 沙箱证据三标记可视化
+- **LLM 输出韧性与过载治理**（v6.6.0）：思考策略差异化（recon/analysis 恢复思考+预算 8192、verification 思考注入适配 agent 类型）；输出崩坏萌芽检测+静默重试与乱码墙治理（根治双机 0 发现）；tool_calls 通道健壮化（中间工具泛化执行+坏 JSON 抢救+name 修复）；空响应救援序列（分型退避重试扛过过载窗口）+ 止损阈值 3→5 + 空响应形态归因写 observations；评分输入改用落库口径（幻觉列表扣爆归零根治）；dispatch 预算守卫；前端 LLM 健康度横幅与指标面板（审计结论不可信时前端可见）+ 验证状态"静态确认"徽标
+- **空参失效簇根治**（v6.7.0）：无标签 JSON 提取 helper 接入四个解析器（LLM 省略 `Action Input:` 标签时不再静默丢参——工具失败真根因）；格式纠正 nudge（前端可见 warning + audit_trace marker + 连续 8 次止损豁免收口）；缺参错误模式组+短路防双份引导；R1 必填校验重写（pydantic v2 `is_required()` 权威+v1 回退）；映射参数形状防御 `coerce_mapping_arg`（六语言沙箱叶子+Universal+HTTP headers，坏形状不再直达 TypeError）；沙箱 wrapper 六语言注入加固（json.dumps/var_export 字面量，杜绝畸形 key/value 伪造 stdout 标记产生假确认）；files_read 只计成功读取（跨轮禁读约束不再饿死真实未读文件）
+- **验证证据绑定簇根治**（v6.7.0）：merge 阶段 poc/code_snippet/description 三字段安全归一+逐条 try/except 隔离（dict poc 不再 KeyError 中断 merge——dispatch_complete 必达，消除每轮仅首条 merge 成功引发的 verification 反复重调度与百万级 token 空烧）；verdict→verification_status 归一映射+证据前置防洗白（confirmed/likely 仅在 ≥1 个非伪造非基础设施真实沙箱尝试时采信，否则维持 needs_context）；finding_id 三级优先跨轮稳定；本体回写局部闸门清理+拼接统一 `_merge_attempts_deduped`+sandbox_exec 去重键纳入 finding_id（消除跨 finding 误拦）；报告空身份条目顺序对齐（confirmed→static_confirmed 降级+「请人工复核」标注+aligned 分桶不参与真验证口径）；fingerprint 落库接线（规范化 sha1，同指纹标 `duplicate_of` 不静默删，历史不回填）；持久证据归档（FIFO 2000）+落库前 `_final_evidence_sweep` 反查绑定（单调只升+幂等+gate marking 前时序）；显式 false_positive 遇新证据维持、推导型如实重算（D10）
+- **端点软熔断与观测**（v6.7.0）：EndpointHealth 按 base_url 滑动窗口（20 帧/10 样本/空率 50%）空响应+崩坏记账——degraded 全局降速（throttle 5s+退避放大，救援帧免收）+持续 30s 有序收口（复用 finish 流保留证据+120s 冷却），无物理调用帧不计窗；LLM 全局并发 6→4；崩坏/格式 warning 前端 amber 类型可见化+`garbled_drops` 如实归账；`agent_events.tokens_used` 写事件级当轮 usage（崩坏轮写 0）；verification N 进 N 出核对（缺条 metadata 标注 missing_conclusions）；MD 报告漏洞段渲染「验证说明」（verification_note 三格式可见补齐）；测试基建 endpoint_health autouse 重置 fixture
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -117,12 +121,12 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）：**backend `v6.5.0`**（本次发布：沙箱验证硬门禁与产出下限、audit_trace 闭环、LLM 调用韧性与预算治理）、**frontend `v6.5.0`**（任务预算输入项 / 时间预算显示 / 沙箱证据三标记 / 搁浅任务启动入口）、sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）：**backend `v6.7.0`**（本次发布：空参失效簇根治、验证证据绑定簇根治——含 dict poc merge 中断引发的空烧重调度根治、端点软熔断与观测增强）、**frontend `v6.7.0`**（amber warning 可见化 / 健康度面板 / 静态确认徽标）、sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
 ```bash
-IMAGE_TAG=v6.0.1 docker compose pull
+IMAGE_TAG=v6.7.0 docker compose pull
 IMAGE_TAG=v6.0.1 docker compose up -d
 ```
 

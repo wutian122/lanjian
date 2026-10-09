@@ -73,7 +73,7 @@ def _make_emitter():
 
 
 def _done_stream(tokens=128, finish_reason="stop", prompt=100, completion=28):
-    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+    async def _gen(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None, extra_params=None):
         yield {
             "type": "token", "kind": "content", "content": "答",
             "accumulated": "答", "accumulated_content": "答", "accumulated_reasoning": "",
@@ -254,7 +254,7 @@ def test_stream_llm_call_circuit_open_still_records_llm_call():
     circuit = get_llm_circuit()
     threshold = circuit.config.failure_threshold
 
-    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None):
+    async def _fail(messages=None, temperature=None, max_tokens=None, tools=None, response_format=None, extra_params=None):
         yield {
             "type": "error", "error_type": "connection", "error": "refused",
             "user_message": "conn failed", "accumulated": "",

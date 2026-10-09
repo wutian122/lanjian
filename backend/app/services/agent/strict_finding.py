@@ -34,6 +34,22 @@ def is_verification_work_item(finding: Any) -> bool:
     return isinstance(finding, Mapping) and finding.get("source") not in CONTEXT_ONLY_SOURCES
 
 
+def is_order_aligned_finding(finding: Any) -> bool:
+    """D12：顺序对齐条目（无身份承接）——单独分桶。
+
+    对齐条目的身份（file_path/_sandbox_finding_id）按报告顺序承接而非
+    LLM 显式给出，可能错绑：不参与 finish 门禁 D1/D2/D3 真验证口径、
+    不计入 completed 名义。标记来源两处任一即认：条目字段
+    ``_aligned_by_order`` 或持久化的 finding_metadata.aligned。
+    """
+    if not isinstance(finding, Mapping):
+        return False
+    if finding.get("_aligned_by_order"):
+        return True
+    metadata = finding.get("finding_metadata")
+    return isinstance(metadata, Mapping) and bool(metadata.get("aligned"))
+
+
 def _is_verification_candidate(finding: Mapping[str, Any], conf_value: float | None) -> bool:
     """分层候选判定：显式 needs_verification 标记且置信度落在候选区间。
 

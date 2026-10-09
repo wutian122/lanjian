@@ -22,6 +22,7 @@ from ..types import (
     DEFAULT_BASE_URLS,
 )
 from ..prompt_cache import prompt_cache_manager, estimate_tokens
+from app.core.llm_global_gate import llm_gate
 
 logger = logging.getLogger(__name__)
 
@@ -135,13 +136,19 @@ def _clean_text_node(text: str, path: str, hits: List[str], *, allow_no_think: b
     return result
 
 
-def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think: bool = False) -> Any:
+def _strip_thinking_off(
+    node: Any, path: str, hits: List[str], *, allow_no_think: bool = False,
+    allow_switch: bool = False,
+) -> Any:
     """递归剥除 dict/list/str 节点中的关思考参数与提示词标记（原地修改容器）。
 
     - dict：键名（大小写不敏感）为 enable_thinking 且值为关语义 → 删键并记录；
-      形如 chat message 的 dict（同时含 role 与 content 键）按 role 决定 content
-      子树是否允许清洗 /no_think（仅 system/user）；其余值递归；
-    - list：逐元素递归（messages 列表、多模态 content parts），allow_no_think 透传；
+      allow_switch=True（LLM_DISABLE_THINKING 开启，服务端已修复关思考缺陷）
+      时放行该键不剥；形如 chat message 的 dict（同时含 role 与 content 键）
+      按 role 决定 content 子树是否允许清洗 /no_think（仅 system/user）；其余
+      值递归；
+    - list：逐元素递归（messages 列表、多模态 content parts），allow_no_think
+      透传；<|think_off|> 防注入清洗不受 allow_switch 影响；
     - str：按 _clean_text_node 规则清洗。
 
     allow_no_think 仅在 system/user 消息的 content 子树内为 True；tools 描述、
@@ -160,21 +167,26 @@ def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think
                 and key.lower() == _THINK_SWITCH_KEY
                 and _is_thinking_off_value(node[key])
             ):
+                if allow_switch:
+                    continue
                 hits.append(f"{child_path}={node[key]!r}（关思考参数已剥除）")
                 del node[key]
             elif is_chat_message and key == "content":
                 node[key] = _strip_thinking_off(
-                    node[key], child_path, hits, allow_no_think=content_allows_no_think
+                    node[key], child_path, hits, allow_no_think=content_allows_no_think,
+                    allow_switch=allow_switch,
                 )
             else:
                 node[key] = _strip_thinking_off(
-                    node[key], child_path, hits, allow_no_think=allow_no_think
+                    node[key], child_path, hits, allow_no_think=allow_no_think,
+                    allow_switch=allow_switch,
                 )
         return node
     if isinstance(node, list):
         for idx, item in enumerate(node):
             node[idx] = _strip_thinking_off(
-                item, f"{path}[{idx}]", hits, allow_no_think=allow_no_think
+                item, f"{path}[{idx}]", hits, allow_no_think=allow_no_think,
+                allow_switch=allow_switch,
             )
         return node
     if isinstance(node, str):
@@ -182,9 +194,35 @@ def _strip_thinking_off(node: Any, path: str, hits: List[str], *, allow_no_think
     return node
 
 
-def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str, Any]:
-    """关思考护栏：在请求构造的最后出口对即将出站的 kwargs 调用，原地剥除一切
+def _thinking_off_allowed() -> bool:
+    """思考策略倒转（2026-09-29 层 2c）：默认强制关思考并放行注入。
+
+    True（默认）＝强制关思考生效：向端点注入 chat_template_kwargs=
+    {"enable_thinking": False}（覆盖请求级 True），并放行护栏对
+    enable_thinking 键的处理。仅当 LLM_ENABLE_THINKING 与
+    LLM_THINKING_SEPARATE_BUDGET 双开关齐 true（服务端已支持思考/正文
+    预算分离）时返回 False、放行请求级 True。
+
+    背景：实测 10.129.2.101（SGLang 部署 Qwen3_5 魔改权重）思考流
+    2048/8192 tokens 均不收敛、正文 0 字（任务 c6d6cd09 / 327b6430
+    双机实证 0 finding）；enable_thinking=False 时正文完整、自然停。
+    """
+    from app.core.config import settings
+
+    enable = bool(getattr(settings, "LLM_ENABLE_THINKING", False))
+    separate = bool(getattr(settings, "LLM_THINKING_SEPARATE_BUDGET", False))
+    return not (enable and separate)
+
+
+def _assert_no_thinking_off(
+    params: Dict[str, Any], *, source: str, allow: bool = False,
+) -> Dict[str, Any]:
+    """关思考护栏：在请求构造的最后出口对即将出站的 kwargs 调用，默认剥除一切
     关思考参数/提示词标记，保证请求以思考模式发出。
+
+    allow=True（LLM_DISABLE_THINKING 开启，服务端已修复关思考缺陷）时放行
+    enable_thinking 键的剥除——配置注入的 chat_template_kwargs 原样到达端点；
+    <|think_off|> / /no_think 的防注入清洗不受 allow 影响，恒生效。
 
     背景：Qwen3 thinking 经 SGLang（--reasoning-parser qwen3）服务端在 parser
     修正前，关思考会导致正文被吞进 reasoning_content、content 恒空（老板实测，
@@ -203,16 +241,20 @@ def _assert_no_thinking_off(params: Dict[str, Any], *, source: str) -> Dict[str,
     零命中时不修改 params、不输出日志（正常请求零行为变化）。
 
     解除条件：服务端 reasoning-parser 修正并实测验证后本护栏可移除。
+    2026-09-26：条件已实测满足（SGLang 关思考后 content/tool_calls 正常），
+    按 R-C1 折中为 allow 开关——LLM_DISABLE_THINKING 全局放行，护栏其余
+    防注入职责保留。
 
     Args:
         params: 即将发往端点的请求 kwargs（litellm/acompletion 或 openai create 风格）。
         source: 触发位置标识（"_send_request" / "stream_complete" / "_native_openai_call"）。
+        allow: True 时放行 enable_thinking 键（LLM_DISABLE_THINKING 开启）。
 
     Returns:
         {"stripped": [剥除项描述, ...]}；空列表表示零命中。
     """
     hits: List[str] = []
-    _strip_thinking_off(params, "", hits)
+    _strip_thinking_off(params, "", hits, allow_switch=allow)
     if hits:
         logger.warning(
             "关思考护栏拦截（位置=%s）：检测到 %d 处关思考参数/标记，已剥除并强制以思考模式"
@@ -413,57 +455,66 @@ class LiteLLMAdapter(BaseLLMAdapter):
         rp = self.config.repetition_penalty
         if rp is not None:
             merged.setdefault("repetition_penalty", rp)
+        # 思考策略倒转（2026-09-29 层 2c）：默认强制关思考。注入于 merge 层——
+        # native/litellm 非流式/litellm 流式三条出站路径统一呈现；护栏经 allow
+        # 通道放行该键（_assert_no_thinking_off）。强制赋值覆盖请求级显式
+        # True（思考矩阵已移除，但存量/未来调用方的 True 一律压制——单预算
+        # + 思考组合在服务端无分离预算支持时 = 思考烧光预算自毁）。
+        if _thinking_off_allowed():
+            chat_template_kwargs = merged.setdefault("chat_template_kwargs", {})
+            chat_template_kwargs["enable_thinking"] = False
         return merged
 
     async def _native_openai_call(self, **kwargs: Any):
-        """使用原生 OpenAI 客户端直接调用（绕过 LiteLLM）
+        async with llm_gate():
+            """使用原生 OpenAI 客户端直接调用（绕过 LiteLLM）
 
-        适用于设置了自定义 base_url 的 OpenAI 兼容 API（如讯飞 MaaS）。
-        """
-        # 关思考护栏（structured-output-protocol）：native 路径最后出口。
-        # 与 _send_request 出口那道幂等双保险——未来若有新调用方直接调本方法也绕不过。
-        _assert_no_thinking_off(kwargs, source="_native_openai_call")
+            适用于设置了自定义 base_url 的 OpenAI 兼容 API（如讯飞 MaaS）。
+            """
+            # 关思考护栏（structured-output-protocol）：native 路径最后出口。
+            # 与 _send_request 出口那道幂等双保险——未来若有新调用方直接调本方法也绕不过。
+            _assert_no_thinking_off(kwargs, source="_native_openai_call", allow=_thinking_off_allowed())
 
-        import openai
+            import openai
 
-        # 提取模型名（去掉 openai/ 前缀）
-        model = kwargs.get("model", "")
-        if "/" in model:
-            model = model.split("/", 1)[1]
+            # 提取模型名（去掉 openai/ 前缀）
+            model = kwargs.get("model", "")
+            if "/" in model:
+                model = model.split("/", 1)[1]
 
-        client = openai.AsyncOpenAI(
-            api_key=kwargs.get("api_key", ""),
-            base_url=kwargs.get("api_base", ""),
-            timeout=kwargs.get("timeout", 150),
-        )
+            client = openai.AsyncOpenAI(
+                api_key=kwargs.get("api_key", ""),
+                base_url=kwargs.get("api_base", ""),
+                timeout=kwargs.get("timeout", 150),
+            )
 
-        messages = kwargs.get("messages", [])
-        params: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-        }
-        if "temperature" in kwargs:
-            params["temperature"] = kwargs["temperature"]
-        if "max_tokens" in kwargs:
-            params["max_tokens"] = kwargs["max_tokens"]
+            messages = kwargs.get("messages", [])
+            params: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+            }
+            if "temperature" in kwargs:
+                params["temperature"] = kwargs["temperature"]
+            if "max_tokens" in kwargs:
+                params["max_tokens"] = kwargs["max_tokens"]
 
-        # 结构化输出协议（structured-output-protocol）：tools/response_format 为
-        # OpenAI 标准参数；extra_body（repetition_penalty 等 provider 特有参数）
-        # 必须原样透传给 create()——openai SDK 的官方透传机制会把 extra_body 合并
-        # 进 HTTP body 顶层（SGLang 收到的请求体语义不变）。
-        # 禁止 params.update(extra_body) 展开：create() 无 **kwargs 也无
-        # repetition_penalty 形参，展开必 TypeError（openai 2.12.0 实证）。
-        if kwargs.get("tools"):
-            params["tools"] = kwargs["tools"]
-        if kwargs.get("response_format"):
-            params["response_format"] = kwargs["response_format"]
-        # 配置级 repetition_penalty 集中注入（与 _send_request 出口幂等双保险——
-        # 直接调用本方法的未来调用方也绕不过）；合并后为空则不挂 extra_body 键。
-        extra_body = self._merge_config_sampling_params(kwargs.get("extra_body"))
-        if extra_body:
-            params["extra_body"] = extra_body
+            # 结构化输出协议（structured-output-protocol）：tools/response_format 为
+            # OpenAI 标准参数；extra_body（repetition_penalty 等 provider 特有参数）
+            # 必须原样透传给 create()——openai SDK 的官方透传机制会把 extra_body 合并
+            # 进 HTTP body 顶层（SGLang 收到的请求体语义不变）。
+            # 禁止 params.update(extra_body) 展开：create() 无 **kwargs 也无
+            # repetition_penalty 形参，展开必 TypeError（openai 2.12.0 实证）。
+            if kwargs.get("tools"):
+                params["tools"] = kwargs["tools"]
+            if kwargs.get("response_format"):
+                params["response_format"] = kwargs["response_format"]
+            # 配置级 repetition_penalty 集中注入（与 _send_request 出口幂等双保险——
+            # 直接调用本方法的未来调用方也绕不过）；合并后为空则不挂 extra_body 键。
+            extra_body = self._merge_config_sampling_params(kwargs.get("extra_body"))
+            if extra_body:
+                params["extra_body"] = extra_body
 
-        return await client.chat.completions.create(**params)
+            return await client.chat.completions.create(**params)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         """使用 LiteLLM 发送请求"""
@@ -475,369 +526,409 @@ class LiteLLMAdapter(BaseLLMAdapter):
             self.handle_error(error, f"LiteLLM ({self.config.provider.value}) API调用失败")
 
     async def _send_request(self, request: LLMRequest) -> LLMResponse:
-        """发送请求到 LiteLLM"""
-        import litellm
-        import openai
+        async with llm_gate():
+            """发送请求到 LiteLLM"""
+            import litellm
+            import openai
         
-        # 启用 LiteLLM 调试模式以获取更详细的错误信息
-        # 注释掉下一行可关闭调试模式
-        # litellm._turn_on_debug()
+            # 启用 LiteLLM 调试模式以获取更详细的错误信息
+            # 注释掉下一行可关闭调试模式
+            # litellm._turn_on_debug()
         
-        # 禁用 LiteLLM 的缓存，确保每次都实际调用 API
-        litellm.cache = None
+            # 禁用 LiteLLM 的缓存，确保每次都实际调用 API
+            litellm.cache = None
         
-        # 禁用 LiteLLM 自动添加的 reasoning_effort 参数
-        # 这可以防止模型名称被错误解析为 effort 参数
-        litellm.drop_params = True
+            # 禁用 LiteLLM 自动添加的 reasoning_effort 参数
+            # 这可以防止模型名称被错误解析为 effort 参数
+            litellm.drop_params = True
         
-        # 构建消息
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+            # 构建消息
+            messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
-        # 🔥 Prompt Caching: 为支持的 LLM 添加缓存标记
-        cache_enabled = False
-        if self.config.provider == LLMProvider.CLAUDE:
-            # 估算系统提示词 token 数
-            system_tokens = 0
-            for msg in messages:
-                if msg.get("role") == "system":
-                    system_tokens += estimate_tokens(msg.get("content", ""))
+            # 🔥 Prompt Caching: 为支持的 LLM 添加缓存标记
+            cache_enabled = False
+            if self.config.provider == LLMProvider.CLAUDE:
+                # 估算系统提示词 token 数
+                system_tokens = 0
+                for msg in messages:
+                    if msg.get("role") == "system":
+                        system_tokens += estimate_tokens(msg.get("content", ""))
             
-            messages, cache_enabled = prompt_cache_manager.process_messages(
-                messages=messages,
-                model=self.config.model,
-                provider=self.config.provider.value,
-                system_prompt_tokens=system_tokens,
-            )
-            
-            if cache_enabled:
-                logger.debug(f"🔥 Prompt Caching enabled for {self.config.model}")
-
-        # 构建请求参数
-        kwargs: Dict[str, Any] = {
-            "model": self._litellm_model,
-            "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else self.config.temperature,
-            "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
-            "top_p": request.top_p if request.top_p is not None else self.config.top_p,
-        }
-
-        # 结构化输出协议（structured-output-protocol）：
-        # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
-        # extra_body 经 litellm 官方透传机制合并进 HTTP body（litellm custom_httpx:
-        # data = {**data, **extra_body}），不受 drop_params 影响。层次 6 参数治理：
-        # 配置级 repetition_penalty（默认 1.15）在此集中并入 extra_body，调用方无需
-        # 显式传 extra_params；native 路径（_native_openai_call）出口同样注入，
-        # 两条路径对端点呈现的请求体一致。
-        if request.tools:
-            kwargs["tools"] = request.tools
-        if request.response_format:
-            kwargs["response_format"] = request.response_format
-        extra_body = self._merge_config_sampling_params(request.extra_params)
-        if extra_body:
-            kwargs["extra_body"] = extra_body
-
-        # 设置 API Key
-        if self.config.api_key and self.config.api_key != "ollama":
-            kwargs["api_key"] = self.config.api_key
-
-        # 设置 API Base URL
-        if self._api_base:
-            kwargs["api_base"] = self._api_base
-            logger.debug(f"🔗 使用自定义 API Base: {self._api_base}")
-
-        # 设置超时
-        kwargs["timeout"] = self.config.timeout
-
-        # 对于 OpenAI 提供商，添加额外参数
-        if self.config.provider == LLMProvider.OPENAI:
-            kwargs["frequency_penalty"] = self.config.frequency_penalty
-            kwargs["presence_penalty"] = self.config.presence_penalty
-
-        # 关思考护栏（structured-output-protocol）：非流式路径最后出口。
-        # kwargs 已完全成型，native/litellm 两个分支都在其后发出，统一在此清洗；
-        # native 分支内 _native_openai_call 还有一道幂等双保险。
-        _assert_no_thinking_off(kwargs, source="_send_request")
-
-        try:
-            # 当使用 OPENAI + 自定义 base_url 时，直接使用原生 OpenAI 客户端
-            # LiteLLM 在 uvicorn 上下文中与某些第三方 API 存在兼容问题（如讯飞 MaaS）
-            if (self.config.provider == LLMProvider.OPENAI
-                    and self._api_base
-                    and self.config.api_key):
-                response = await self._native_openai_call(**kwargs)
-            else:
-                # 调用 LiteLLM
-                response = await litellm.acompletion(**kwargs)
-        except litellm.exceptions.AuthenticationError as e:
-            api_response = self._extract_api_response(e)
-            raise LLMError(f"API Key 无效或已过期", self.config.provider, 401, api_response=api_response)
-        except litellm.exceptions.RateLimitError as e:
-            error_msg = str(e)
-            error_msg_lower = error_msg.lower()
-            api_response = self._extract_api_response(e)
-            # 余额不足 / 配额用尽
-            if any(keyword in error_msg_lower for keyword in _QUOTA_KEYWORDS):
-                raise LLMError(f"账户余额不足或配额已用尽，请充值后重试", self.config.provider, 402, api_response=api_response)
-            # 🔥 认证失败：LiteLLM 会把上游 401（authorization failed）也包装成 RateLimitError 抛出，
-            # 必须在此识别并归为 401，否则会误判为 429 限流导致 Orchestrator 走 30s×3 重试而非立即终止
-            if any(keyword in error_msg_lower for keyword in _AUTH_KEYWORDS):
-                raise LLMError(f"API Key 无效或已过期，请检查配置", self.config.provider, 401, api_response=api_response)
-            raise LLMError(f"API 调用频率超限，请稍后重试", self.config.provider, 429, api_response=api_response)
-        except litellm.exceptions.APIConnectionError as e:
-            api_response = self._extract_api_response(e)
-            raise LLMError(f"无法连接到 API 服务", self.config.provider, api_response=api_response)
-        except litellm.exceptions.APIError as e:
-            api_response = self._extract_api_response(e)
-            error_str = str(e)
-            # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
-            mt = _detect_max_tokens_error(error_str)
-            if mt:
-                limit, msg = mt
-                raise LLMError(msg, self.config.provider, 400, api_response=api_response)
-            raise LLMError(f"API 错误", self.config.provider, getattr(e, 'status_code', None), api_response=api_response)
-        except openai.AuthenticationError as e:
-            raise LLMError(f"API Key 无效或已过期", self.config.provider, 401,
-                           api_response=str(e))
-        except openai.RateLimitError as e:
-            raise LLMError(f"API 调用频率超限，请稍后重试", self.config.provider, 429,
-                           api_response=str(e))
-        except openai.APIConnectionError as e:
-            raise LLMError(f"无法连接到 API 服务", self.config.provider,
-                           api_response=str(e))
-        except openai.APIStatusError as e:
-            # 检测讯飞 MaaS (one-api) 特定错误，提供更精准的提示
-            error_str = str(e)
-            xunfei_msg = self._detect_xunfei_error(error_str)
-            if xunfei_msg:
-                raise LLMError(xunfei_msg, self.config.provider,
-                               status_code=e.status_code, api_response=error_str)
-            # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
-            mt = _detect_max_tokens_error(error_str)
-            if mt:
-                limit, msg = mt
-                raise LLMError(msg, self.config.provider, 400, api_response=error_str)
-            raise LLMError(f"API 服务异常 ({e.status_code})", self.config.provider,
-                           status_code=e.status_code, api_response=error_str)
-        except Exception as e:
-            # 捕获其他异常并重新抛出
-            error_msg = str(e)
-            api_response = self._extract_api_response(e)
-            if "invalid_api_key" in error_msg.lower() or "incorrect api key" in error_msg.lower():
-                raise LLMError(f"API Key 无效", self.config.provider, 401, api_response=api_response)
-            elif "authentication" in error_msg.lower():
-                raise LLMError(f"认证失败", self.config.provider, 401, api_response=api_response)
-            elif any(keyword in error_msg for keyword in ["余额不足", "资源包", "充值", "quota", "insufficient", "balance"]):
-                raise LLMError(f"账户余额不足或配额已用尽", self.config.provider, 402, api_response=api_response)
-            raise
-
-        # 解析响应
-        if not response:
-            raise LLMError("API 返回空响应", self.config.provider)
-            
-        choice = response.choices[0] if response.choices else None
-        if not choice:
-            raise LLMError("API响应格式异常: 缺少choices字段", self.config.provider)
-
-        usage = None
-        if hasattr(response, "usage") and response.usage:
-            usage = LLMUsage(
-                prompt_tokens=response.usage.prompt_tokens or 0,
-                completion_tokens=response.usage.completion_tokens or 0,
-                total_tokens=response.usage.total_tokens or 0,
-            )
-            
-            # 🔥 更新 Prompt Cache 统计
-            if cache_enabled and hasattr(response.usage, "cache_creation_input_tokens"):
-                prompt_cache_manager.update_stats(
-                    cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0),
-                    cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0),
-                    total_input_tokens=response.usage.prompt_tokens or 0,
+                messages, cache_enabled = prompt_cache_manager.process_messages(
+                    messages=messages,
+                    model=self.config.model,
+                    provider=self.config.provider.value,
+                    system_prompt_tokens=system_tokens,
                 )
+            
+                if cache_enabled:
+                    logger.debug(f"🔥 Prompt Caching enabled for {self.config.model}")
 
-        return LLMResponse(
-            content=choice.message.content or "",
-            model=response.model,
-            usage=usage,
-            finish_reason=choice.finish_reason,
-        )
+            # 构建请求参数
+            kwargs: Dict[str, Any] = {
+                "model": self._litellm_model,
+                "messages": messages,
+                "temperature": request.temperature if request.temperature is not None else self.config.temperature,
+                "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
+                "top_p": request.top_p if request.top_p is not None else self.config.top_p,
+            }
+
+            # 结构化输出协议（structured-output-protocol）：
+            # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
+            # extra_body 经 litellm 官方透传机制合并进 HTTP body（litellm custom_httpx:
+            # data = {**data, **extra_body}），不受 drop_params 影响。层次 6 参数治理：
+            # 配置级 repetition_penalty（默认 1.15）在此集中并入 extra_body，调用方无需
+            # 显式传 extra_params；native 路径（_native_openai_call）出口同样注入，
+            # 两条路径对端点呈现的请求体一致。
+            if request.tools:
+                kwargs["tools"] = request.tools
+            if request.response_format:
+                kwargs["response_format"] = request.response_format
+            extra_body = self._merge_config_sampling_params(request.extra_params)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
+            # 设置 API Key
+            if self.config.api_key and self.config.api_key != "ollama":
+                kwargs["api_key"] = self.config.api_key
+
+            # 设置 API Base URL
+            if self._api_base:
+                kwargs["api_base"] = self._api_base
+                logger.debug(f"🔗 使用自定义 API Base: {self._api_base}")
+
+            # 设置超时
+            kwargs["timeout"] = self.config.timeout
+
+            # 对于 OpenAI 提供商，添加额外参数
+            if self.config.provider == LLMProvider.OPENAI:
+                kwargs["frequency_penalty"] = self.config.frequency_penalty
+                kwargs["presence_penalty"] = self.config.presence_penalty
+
+            # 关思考护栏（structured-output-protocol）：非流式路径最后出口。
+            # kwargs 已完全成型，native/litellm 两个分支都在其后发出，统一在此清洗；
+            # native 分支内 _native_openai_call 还有一道幂等双保险。
+            _assert_no_thinking_off(kwargs, source="_send_request", allow=_thinking_off_allowed())
+
+            try:
+                # 当使用 OPENAI + 自定义 base_url 时，直接使用原生 OpenAI 客户端
+                # LiteLLM 在 uvicorn 上下文中与某些第三方 API 存在兼容问题（如讯飞 MaaS）
+                if (self.config.provider == LLMProvider.OPENAI
+                        and self._api_base
+                        and self.config.api_key):
+                    response = await self._native_openai_call(**kwargs)
+                else:
+                    # 调用 LiteLLM
+                    response = await litellm.acompletion(**kwargs)
+            except litellm.exceptions.AuthenticationError as e:
+                api_response = self._extract_api_response(e)
+                raise LLMError(f"API Key 无效或已过期", self.config.provider, 401, api_response=api_response)
+            except litellm.exceptions.RateLimitError as e:
+                error_msg = str(e)
+                error_msg_lower = error_msg.lower()
+                api_response = self._extract_api_response(e)
+                # 余额不足 / 配额用尽
+                if any(keyword in error_msg_lower for keyword in _QUOTA_KEYWORDS):
+                    raise LLMError(f"账户余额不足或配额已用尽，请充值后重试", self.config.provider, 402, api_response=api_response)
+                # 🔥 认证失败：LiteLLM 会把上游 401（authorization failed）也包装成 RateLimitError 抛出，
+                # 必须在此识别并归为 401，否则会误判为 429 限流导致 Orchestrator 走 30s×3 重试而非立即终止
+                if any(keyword in error_msg_lower for keyword in _AUTH_KEYWORDS):
+                    raise LLMError(f"API Key 无效或已过期，请检查配置", self.config.provider, 401, api_response=api_response)
+                raise LLMError(f"API 调用频率超限，请稍后重试", self.config.provider, 429, api_response=api_response)
+            except litellm.exceptions.APIConnectionError as e:
+                api_response = self._extract_api_response(e)
+                raise LLMError(f"无法连接到 API 服务", self.config.provider, api_response=api_response)
+            except litellm.exceptions.APIError as e:
+                api_response = self._extract_api_response(e)
+                error_str = str(e)
+                # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
+                mt = _detect_max_tokens_error(error_str)
+                if mt:
+                    limit, msg = mt
+                    raise LLMError(msg, self.config.provider, 400, api_response=api_response)
+                raise LLMError(f"API 错误", self.config.provider, getattr(e, 'status_code', None), api_response=api_response)
+            except openai.AuthenticationError as e:
+                raise LLMError(f"API Key 无效或已过期", self.config.provider, 401,
+                               api_response=str(e))
+            except openai.RateLimitError as e:
+                raise LLMError(f"API 调用频率超限，请稍后重试", self.config.provider, 429,
+                               api_response=str(e))
+            except openai.APIConnectionError as e:
+                raise LLMError(f"无法连接到 API 服务", self.config.provider,
+                               api_response=str(e))
+            except openai.APIStatusError as e:
+                # 检测讯飞 MaaS (one-api) 特定错误，提供更精准的提示
+                error_str = str(e)
+                xunfei_msg = self._detect_xunfei_error(error_str)
+                if xunfei_msg:
+                    raise LLMError(xunfei_msg, self.config.provider,
+                                   status_code=e.status_code, api_response=error_str)
+                # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
+                mt = _detect_max_tokens_error(error_str)
+                if mt:
+                    limit, msg = mt
+                    raise LLMError(msg, self.config.provider, 400, api_response=error_str)
+                raise LLMError(f"API 服务异常 ({e.status_code})", self.config.provider,
+                               status_code=e.status_code, api_response=error_str)
+            except Exception as e:
+                # 捕获其他异常并重新抛出
+                error_msg = str(e)
+                api_response = self._extract_api_response(e)
+                if "invalid_api_key" in error_msg.lower() or "incorrect api key" in error_msg.lower():
+                    raise LLMError(f"API Key 无效", self.config.provider, 401, api_response=api_response)
+                elif "authentication" in error_msg.lower():
+                    raise LLMError(f"认证失败", self.config.provider, 401, api_response=api_response)
+                elif any(keyword in error_msg for keyword in ["余额不足", "资源包", "充值", "quota", "insufficient", "balance"]):
+                    raise LLMError(f"账户余额不足或配额已用尽", self.config.provider, 402, api_response=api_response)
+                raise
+
+            # 解析响应
+            if not response:
+                raise LLMError("API 返回空响应", self.config.provider)
+            
+            choice = response.choices[0] if response.choices else None
+            if not choice:
+                raise LLMError("API响应格式异常: 缺少choices字段", self.config.provider)
+
+            usage = None
+            if hasattr(response, "usage") and response.usage:
+                usage = LLMUsage(
+                    prompt_tokens=response.usage.prompt_tokens or 0,
+                    completion_tokens=response.usage.completion_tokens or 0,
+                    total_tokens=response.usage.total_tokens or 0,
+                )
+            
+                # 🔥 更新 Prompt Cache 统计
+                if cache_enabled and hasattr(response.usage, "cache_creation_input_tokens"):
+                    prompt_cache_manager.update_stats(
+                        cache_creation_input_tokens=getattr(response.usage, "cache_creation_input_tokens", 0),
+                        cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", 0),
+                        total_input_tokens=response.usage.prompt_tokens or 0,
+                    )
+
+            return LLMResponse(
+                content=choice.message.content or "",
+                model=response.model,
+                usage=usage,
+                finish_reason=choice.finish_reason,
+            )
 
     async def stream_complete(self, request: LLMRequest):
-        """
-        流式调用 LLM，逐 token 返回
+        async with llm_gate():
+            """
+            流式调用 LLM，逐 token 返回
 
-        Yields:
-            dict: token 块 {"type": "token", "kind": "content"|"reasoning",
-                    "content": 增量文本, "accumulated": 思考+正文按序拼接（兼容键）,
-                    "accumulated_content": 正文累计, "accumulated_reasoning": 思考累计}；
-                  done 块 {"type": "done", "content": 正文累计, "reasoning": 思考累计,
-                    "accumulated": 拼接累计, "usage": dict, "finish_reason": str}；
-                  error 块 {"type": "error", ..., "accumulated": 拼接累计}
-        """
-        import litellm
+            Yields:
+                dict: token 块 {"type": "token", "kind": "content"|"reasoning",
+                        "content": 增量文本, "accumulated": 思考+正文按序拼接（兼容键）,
+                        "accumulated_content": 正文累计, "accumulated_reasoning": 思考累计}；
+                      done 块 {"type": "done", "content": 正文累计, "reasoning": 思考累计,
+                        "accumulated": 拼接累计, "usage": dict, "finish_reason": str}；
+                      error 块 {"type": "error", ..., "accumulated": 拼接累计}
+            """
+            import litellm
 
-        await self.validate_config()
+            await self.validate_config()
 
-        litellm.cache = None
-        litellm.drop_params = True
+            litellm.cache = None
+            litellm.drop_params = True
 
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+            messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
-        # 🔥 估算输入 token 数量（用于在无法获取真实 usage 时进行估算）
-        input_tokens_estimate = sum(estimate_tokens(msg["content"]) for msg in messages)
+            # 🔥 估算输入 token 数量（用于在无法获取真实 usage 时进行估算）
+            input_tokens_estimate = sum(estimate_tokens(msg["content"]) for msg in messages)
 
-        kwargs = {
-            "model": self._litellm_model,
-            "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else self.config.temperature,
-            "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
-            "top_p": request.top_p if request.top_p is not None else self.config.top_p,
-            "stream": True,  # 启用流式输出
-        }
+            kwargs = {
+                "model": self._litellm_model,
+                "messages": messages,
+                "temperature": request.temperature if request.temperature is not None else self.config.temperature,
+                "max_tokens": request.max_tokens if request.max_tokens is not None else self.config.max_tokens,
+                "top_p": request.top_p if request.top_p is not None else self.config.top_p,
+                "stream": True,  # 启用流式输出
+            }
 
-        # 结构化输出协议（structured-output-protocol）：与 _send_request 保持一致，
-        # tools/response_format 为标准参数；extra_body 透传请求级 extra_params 与
-        # 配置级 repetition_penalty（层次 6 参数治理，集中注入）。
-        if request.tools:
-            kwargs["tools"] = request.tools
-        if request.response_format:
-            kwargs["response_format"] = request.response_format
-        extra_body = self._merge_config_sampling_params(request.extra_params)
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+            # 结构化输出协议（structured-output-protocol）：与 _send_request 保持一致，
+            # tools/response_format 为标准参数；extra_body 透传请求级 extra_params 与
+            # 配置级 repetition_penalty（层次 6 参数治理，集中注入）。
+            if request.tools:
+                kwargs["tools"] = request.tools
+            if request.response_format:
+                kwargs["response_format"] = request.response_format
+            extra_body = self._merge_config_sampling_params(request.extra_params)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
-        # 🔥 对于支持的模型，请求在流式输出中包含 usage 信息
-        # OpenAI API 支持 stream_options
-        if self.config.provider in [LLMProvider.OPENAI, LLMProvider.DEEPSEEK]:
-            kwargs["stream_options"] = {"include_usage": True}
+            # 🔥 对于支持的模型，请求在流式输出中包含 usage 信息
+            # OpenAI API 支持 stream_options
+            if self.config.provider in [LLMProvider.OPENAI, LLMProvider.DEEPSEEK]:
+                kwargs["stream_options"] = {"include_usage": True}
 
-        if self.config.api_key and self.config.api_key != "ollama":
-            kwargs["api_key"] = self.config.api_key
+            if self.config.api_key and self.config.api_key != "ollama":
+                kwargs["api_key"] = self.config.api_key
 
-        if self._api_base:
-            kwargs["api_base"] = self._api_base
+            if self._api_base:
+                kwargs["api_base"] = self._api_base
 
-        kwargs["timeout"] = self.config.timeout
+            kwargs["timeout"] = self.config.timeout
 
-        # 🔥 重复惩罚参数（全局生效，与 complete() 保持一致）
-        if self.config.frequency_penalty:
-            kwargs["frequency_penalty"] = self.config.frequency_penalty
-        if self.config.presence_penalty:
-            kwargs["presence_penalty"] = self.config.presence_penalty
+            # 🔥 重复惩罚参数（全局生效，与 complete() 保持一致）
+            if self.config.frequency_penalty:
+                kwargs["frequency_penalty"] = self.config.frequency_penalty
+            if self.config.presence_penalty:
+                kwargs["presence_penalty"] = self.config.presence_penalty
 
-        # 关思考护栏（structured-output-protocol）：流式路径最后出口，
-        # kwargs 已完全成型，在 litellm.acompletion 发出前统一清洗
-        _assert_no_thinking_off(kwargs, source="stream_complete")
+            # 关思考护栏（structured-output-protocol）：流式路径最后出口，
+            # kwargs 已完全成型，在 litellm.acompletion 发出前统一清洗
+            _assert_no_thinking_off(kwargs, source="stream_complete", allow=_thinking_off_allowed())
 
-        # structured-output-protocol Task 3：思考流/正文流在 chunk 层分离。
-        # accumulated_content 仅累计 delta.content（正文），accumulated_reasoning
-        # 仅累计 delta.reasoning_content/delta.thinking（思考）；accumulated_all
-        # 按流到达顺序拼接两者，作为旧 "accumulated" 键的兼容值（Task 4 前
-        # base.py 仍读旧键），也用于输出 token 估算（思考 token 同样计费）。
-        accumulated_content = ""
-        accumulated_reasoning = ""
-        accumulated_all = ""
-        # structured-output-protocol Task 7：流式 tool_calls 聚合。
-        # OpenAI 流式形态：delta.tool_calls[{index, id, function:{name, arguments 增量}}]，
-        # id/name 通常仅首块到达，arguments 按块增量拼接；按 index 归槽。
-        aggregated_tool_calls: Dict[int, Dict[str, Any]] = {}
-        finished = False  # 是否已发射 finish_reason 的 done（防兜底路径重复发 done）
-        final_usage = None  # 🔥 存储最终的 usage 信息
-        chunk_count = 0  # 🔥 跟踪 chunk 数量
+            # structured-output-protocol Task 3：思考流/正文流在 chunk 层分离。
+            # accumulated_content 仅累计 delta.content（正文），accumulated_reasoning
+            # 仅累计 delta.reasoning_content/delta.thinking（思考）；accumulated_all
+            # 按流到达顺序拼接两者，作为旧 "accumulated" 键的兼容值（Task 4 前
+            # base.py 仍读旧键），也用于输出 token 估算（思考 token 同样计费）。
+            accumulated_content = ""
+            accumulated_reasoning = ""
+            accumulated_all = ""
+            # structured-output-protocol Task 7：流式 tool_calls 聚合。
+            # OpenAI 流式形态：delta.tool_calls[{index, id, function:{name, arguments 增量}}]，
+            # id/name 通常仅首块到达，arguments 按块增量拼接；按 index 归槽。
+            aggregated_tool_calls: Dict[int, Dict[str, Any]] = {}
+            finished = False  # 是否已发射 finish_reason 的 done（防兜底路径重复发 done）
+            final_usage = None  # 🔥 存储最终的 usage 信息
+            chunk_count = 0  # 🔥 跟踪 chunk 数量
 
-        try:
-            # F2/A1 事件循环冻结根治：litellm 流式封装 CustomStreamWrapper.__anext__
-            # 的 sync-iterable 分支用同步 next() 读 socket（无 await 点），在
-            # uvicorn 单 worker 上会整体冻结事件循环（生产任务 c286b0c1 卡 10h，
-            # watchdog/三层超时全失效）。同步 litellm.completion(stream=True) 全程
-            # （建连+迭代读）剥离到专用工作线程，chunk 经 asyncio.Queue 桥接；
-            # kwargs["timeout"]（默认 150s）在线程内作为 httpx 同步超时正常生效，
-            # 消费端取消经 threading.Event 协作停止。详见 sync_stream_bridge 模块文档。
-            from ..sync_stream_bridge import iter_sync_stream
+            try:
+                # F2/A1 事件循环冻结根治：litellm 流式封装 CustomStreamWrapper.__anext__
+                # 的 sync-iterable 分支用同步 next() 读 socket（无 await 点），在
+                # uvicorn 单 worker 上会整体冻结事件循环（生产任务 c286b0c1 卡 10h，
+                # watchdog/三层超时全失效）。同步 litellm.completion(stream=True) 全程
+                # （建连+迭代读）剥离到专用工作线程，chunk 经 asyncio.Queue 桥接；
+                # kwargs["timeout"]（默认 150s）在线程内作为 httpx 同步超时正常生效，
+                # 消费端取消经 threading.Event 协作停止。详见 sync_stream_bridge 模块文档。
+                from ..sync_stream_bridge import iter_sync_stream
 
-            chunk_stream = iter_sync_stream(
-                lambda: litellm.completion(**kwargs),
-                stream_name=f"llm-stream-{self.config.provider.value}",
-            )
-
-            async for chunk in chunk_stream:
-                chunk_count += 1
-
-                # 🔥 检查是否有 usage 信息（某些 API 会在最后的 chunk 中包含）
-                if hasattr(chunk, "usage") and chunk.usage:
-                    final_usage = {
-                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                        "completion_tokens": chunk.usage.completion_tokens or 0,
-                        "total_tokens": chunk.usage.total_tokens or 0,
-                    }
-                    logger.debug(f"Got usage from chunk: {final_usage}")
-
-                if not chunk.choices:
-                    # 🔥 某些模型可能发送没有 choices 的 chunk（如心跳）
-                    continue
-
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", "") or ""
-                # 推理模型的思考流（SGLang qwen3 parser: delta.reasoning_content；
-                # 部分后端用 delta.thinking）——与正文 content 是两个独立通道。
-                # 旧实现用 or 链把两者混进同一 content 流，思考退化噪声
-                # （stopstopSTOP 等）由此污染正文视野与 Final Answer 解析；
-                # 现按 kind 分流（structured-output-protocol Task 3）。
-                reasoning_piece = (
-                    getattr(delta, "reasoning_content", "")
-                    or getattr(delta, "thinking", "")
-                    or ""
+                chunk_stream = iter_sync_stream(
+                    lambda: litellm.completion(**kwargs),
+                    stream_name=f"llm-stream-{self.config.provider.value}",
                 )
-                finish_reason = chunk.choices[0].finish_reason
 
-                # 流式 tool_calls 聚合（Task 7）：同一 index 的 id/name 首块到达、
-                # arguments 增量拼接；缺失字段（后续块 id/name 为 None）不覆盖。
-                delta_tool_calls = getattr(delta, "tool_calls", None)
-                if delta_tool_calls:
-                    for tc in delta_tool_calls:
-                        tc_index = getattr(tc, "index", 0) or 0
-                        slot = aggregated_tool_calls.setdefault(
-                            tc_index, {"id": None, "name": None, "arguments": ""}
-                        )
-                        if getattr(tc, "id", None):
-                            slot["id"] = tc.id
-                        tc_function = getattr(tc, "function", None)
-                        if tc_function is not None:
-                            if getattr(tc_function, "name", None):
-                                slot["name"] = tc_function.name
-                            fn_arguments = getattr(tc_function, "arguments", None)
-                            if fn_arguments:
-                                slot["arguments"] += fn_arguments
+                async for chunk in chunk_stream:
+                    chunk_count += 1
 
-                # 思考与正文同轮出现时各自独立 yield（两个 if，非 if/else）；
-                # 思考阶段先于正文阶段到达，reasoning piece 先 yield。
-                if reasoning_piece:
-                    accumulated_reasoning += reasoning_piece
-                    accumulated_all += reasoning_piece
-                    yield {
-                        "type": "token",
-                        "kind": "reasoning",
-                        "content": reasoning_piece,
-                        "accumulated": accumulated_all,
-                        "accumulated_content": accumulated_content,
-                        "accumulated_reasoning": accumulated_reasoning,
-                    }
-                if content:
-                    accumulated_content += content
-                    accumulated_all += content
-                    yield {
-                        "type": "token",
-                        "kind": "content",
-                        "content": content,
-                        "accumulated": accumulated_all,
-                        "accumulated_content": accumulated_content,
-                        "accumulated_reasoning": accumulated_reasoning,
-                    }
-                # 🔥 ENHANCED: 处理没有 content 但也没有 finish_reason 的情况
-                # 某些模型（如智谱 GLM）可能在某些 chunk 中不返回内容
+                    # 🔥 检查是否有 usage 信息（某些 API 会在最后的 chunk 中包含）
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        final_usage = {
+                            "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                            "completion_tokens": chunk.usage.completion_tokens or 0,
+                            "total_tokens": chunk.usage.total_tokens or 0,
+                        }
+                        logger.debug(f"Got usage from chunk: {final_usage}")
 
-                if finish_reason:
-                    # 流式完成
-                    # 🔥 如果没有从 chunk 获取到 usage，进行估算
+                    if not chunk.choices:
+                        # 🔥 某些模型可能发送没有 choices 的 chunk（如心跳）
+                        continue
+
+                    delta = chunk.choices[0].delta
+                    content = getattr(delta, "content", "") or ""
+                    # 推理模型的思考流（SGLang qwen3 parser: delta.reasoning_content；
+                    # 部分后端用 delta.thinking）——与正文 content 是两个独立通道。
+                    # 旧实现用 or 链把两者混进同一 content 流，思考退化噪声
+                    # （stopstopSTOP 等）由此污染正文视野与 Final Answer 解析；
+                    # 现按 kind 分流（structured-output-protocol Task 3）。
+                    reasoning_piece = (
+                        getattr(delta, "reasoning_content", "")
+                        or getattr(delta, "thinking", "")
+                        or ""
+                    )
+                    finish_reason = chunk.choices[0].finish_reason
+
+                    # 流式 tool_calls 聚合（Task 7）：同一 index 的 id/name 首块到达、
+                    # arguments 增量拼接；缺失字段（后续块 id/name 为 None）不覆盖。
+                    delta_tool_calls = getattr(delta, "tool_calls", None)
+                    if delta_tool_calls:
+                        for tc in delta_tool_calls:
+                            tc_index = getattr(tc, "index", 0) or 0
+                            slot = aggregated_tool_calls.setdefault(
+                                tc_index, {"id": None, "name": None, "arguments": ""}
+                            )
+                            if getattr(tc, "id", None):
+                                slot["id"] = tc.id
+                            tc_function = getattr(tc, "function", None)
+                            if tc_function is not None:
+                                if getattr(tc_function, "name", None):
+                                    slot["name"] = tc_function.name
+                                fn_arguments = getattr(tc_function, "arguments", None)
+                                if fn_arguments:
+                                    slot["arguments"] += fn_arguments
+
+                    # 思考与正文同轮出现时各自独立 yield（两个 if，非 if/else）；
+                    # 思考阶段先于正文阶段到达，reasoning piece 先 yield。
+                    if reasoning_piece:
+                        accumulated_reasoning += reasoning_piece
+                        accumulated_all += reasoning_piece
+                        yield {
+                            "type": "token",
+                            "kind": "reasoning",
+                            "content": reasoning_piece,
+                            "accumulated": accumulated_all,
+                            "accumulated_content": accumulated_content,
+                            "accumulated_reasoning": accumulated_reasoning,
+                        }
+                    if content:
+                        accumulated_content += content
+                        accumulated_all += content
+                        yield {
+                            "type": "token",
+                            "kind": "content",
+                            "content": content,
+                            "accumulated": accumulated_all,
+                            "accumulated_content": accumulated_content,
+                            "accumulated_reasoning": accumulated_reasoning,
+                        }
+                    # 🔥 ENHANCED: 处理没有 content 但也没有 finish_reason 的情况
+                    # 某些模型（如智谱 GLM）可能在某些 chunk 中不返回内容
+
+                    if finish_reason:
+                        # 流式完成
+                        # 🔥 如果没有从 chunk 获取到 usage，进行估算
+                        if not final_usage:
+                            output_tokens_estimate = estimate_tokens(accumulated_all)
+                            final_usage = {
+                                "prompt_tokens": input_tokens_estimate,
+                                "completion_tokens": output_tokens_estimate,
+                                "total_tokens": input_tokens_estimate + output_tokens_estimate,
+                            }
+                            logger.debug(f"Estimated usage: {final_usage}")
+
+                        # 🔥 ENHANCED: 如果累积内容为空但有 finish_reason，记录警告
+                        if not accumulated_all and not aggregated_tool_calls:
+                            logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
+
+                        done_chunk: Dict[str, Any] = {
+                            "type": "done",
+                            # 语义拆分（Task 3）：content 仅正文累计、reasoning 仅思考累计；
+                            # accumulated 为两者拼接（兼容旧下游，Task 4 切换消费）
+                            "content": accumulated_content,
+                            "reasoning": accumulated_reasoning,
+                            "accumulated": accumulated_all,
+                            "usage": final_usage,
+                            "finish_reason": finish_reason,
+                        }
+                        # Task 7：tool_calls 聚合结果随 done 输出（无 tool_calls 不带该键）
+                        if aggregated_tool_calls:
+                            done_chunk["tool_calls"] = [
+                                aggregated_tool_calls[idx]
+                                for idx in sorted(aggregated_tool_calls)
+                            ]
+                        yield done_chunk
+                        finished = True
+                        break
+
+                # 🔥 ENHANCED: 如果循环结束但没有收到 finish_reason，也需要返回 done
+                # （finished 守卫：已发过 finish_reason done 的流不得再补发 done，
+                # 旧实现靠消费方拿到 done 后停止拉取隐式规避，全量排空时会重复发）
+                if (accumulated_all or aggregated_tool_calls) and not finished:
+                    logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_all)} chars)")
                     if not final_usage:
                         output_tokens_estimate = estimate_tokens(accumulated_all)
                         final_usage = {
@@ -845,175 +936,137 @@ class LiteLLMAdapter(BaseLLMAdapter):
                             "completion_tokens": output_tokens_estimate,
                             "total_tokens": input_tokens_estimate + output_tokens_estimate,
                         }
-                        logger.debug(f"Estimated usage: {final_usage}")
-
-                    # 🔥 ENHANCED: 如果累积内容为空但有 finish_reason，记录警告
-                    if not accumulated_all and not aggregated_tool_calls:
-                        logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
-
-                    done_chunk: Dict[str, Any] = {
+                    done_chunk = {
                         "type": "done",
-                        # 语义拆分（Task 3）：content 仅正文累计、reasoning 仅思考累计；
-                        # accumulated 为两者拼接（兼容旧下游，Task 4 切换消费）
                         "content": accumulated_content,
                         "reasoning": accumulated_reasoning,
                         "accumulated": accumulated_all,
                         "usage": final_usage,
-                        "finish_reason": finish_reason,
+                        "finish_reason": "complete",
                     }
-                    # Task 7：tool_calls 聚合结果随 done 输出（无 tool_calls 不带该键）
                     if aggregated_tool_calls:
                         done_chunk["tool_calls"] = [
                             aggregated_tool_calls[idx]
                             for idx in sorted(aggregated_tool_calls)
                         ]
                     yield done_chunk
-                    finished = True
-                    break
 
-            # 🔥 ENHANCED: 如果循环结束但没有收到 finish_reason，也需要返回 done
-            # （finished 守卫：已发过 finish_reason done 的流不得再补发 done，
-            # 旧实现靠消费方拿到 done 后停止拉取隐式规避，全量排空时会重复发）
-            if (accumulated_all or aggregated_tool_calls) and not finished:
-                logger.warning(f"Stream ended without finish_reason, returning accumulated content ({len(accumulated_all)} chars)")
-                if not final_usage:
-                    output_tokens_estimate = estimate_tokens(accumulated_all)
-                    final_usage = {
-                        "prompt_tokens": input_tokens_estimate,
-                        "completion_tokens": output_tokens_estimate,
-                        "total_tokens": input_tokens_estimate + output_tokens_estimate,
-                    }
-                done_chunk = {
-                    "type": "done",
-                    "content": accumulated_content,
-                    "reasoning": accumulated_reasoning,
-                    "accumulated": accumulated_all,
-                    "usage": final_usage,
-                    "finish_reason": "complete",
-                }
-                if aggregated_tool_calls:
-                    done_chunk["tool_calls"] = [
-                        aggregated_tool_calls[idx]
-                        for idx in sorted(aggregated_tool_calls)
-                    ]
-                yield done_chunk
-
-        except litellm.exceptions.RateLimitError as e:
-            # 速率限制错误 - 需要特殊处理
-            logger.error(f"Stream rate limit error: {e}")
-            error_msg = str(e)
-            error_msg_lower = error_msg.lower()
-            # 余额不足 / 配额用尽
-            if any(keyword in error_msg_lower for keyword in _QUOTA_KEYWORDS):
-                error_type = "quota_exceeded"
-                user_message = "API 配额已用尽，请检查账户余额或升级计划"
-            # 🔥 认证失败：LiteLLM 会把上游 401（authorization failed）也包装成 RateLimitError 抛出，
-            # 必须在此识别并归为 authentication，否则误判为 rate_limit 导致 Orchestrator 走 30s×3 重试
-            elif any(keyword in error_msg_lower for keyword in _AUTH_KEYWORDS):
-                error_type = "authentication"
-                user_message = "API Key 无效或已过期，请检查配置"
-            else:
-                error_type = "rate_limit"
-                # 尝试从错误消息中提取重试时间
-                import re
-                retry_match = re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, re.IGNORECASE)
-                retry_seconds = float(retry_match.group(1)) if retry_match else 60
-                user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
-
-            output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
-            yield {
-                "type": "error",
-                "error_type": error_type,
-                "error": error_msg,
-                "user_message": user_message,
-                "accumulated": accumulated_all,
-                "usage": {
-                    "prompt_tokens": input_tokens_estimate,
-                    "completion_tokens": output_tokens_estimate,
-                    "total_tokens": input_tokens_estimate + output_tokens_estimate,
-                } if accumulated_all else None,
-            }
-
-        except litellm.exceptions.AuthenticationError as e:
-            # 认证错误 - API Key 无效
-            logger.error(f"Stream authentication error: {e}")
-            yield {
-                "type": "error",
-                "error_type": "authentication",
-                "error": str(e),
-                "user_message": "API Key 无效或已过期，请检查配置",
-                "accumulated": accumulated_all,
-                "usage": None,
-            }
-
-        except litellm.exceptions.APIConnectionError as e:
-            # 连接错误 - 网络问题
-            logger.error(f"Stream connection error: {e}")
-            yield {
-                "type": "error",
-                "error_type": "connection",
-                "error": str(e),
-                "user_message": "无法连接到 API 服务，请检查网络连接",
-                "accumulated": accumulated_all,
-                "usage": None,
-            }
-
-        except Exception as e:
-            # 其他错误 - 检查是否是包装的速率限制错误
-            error_msg = str(e)
-            # 🔥 B4 修复: 某些 LLM 网关（如 opencode.ai）返回空错误体，str(e) 为空
-            # 此时日志仅输出 "Stream error: " 无法诊断。补全异常类型与 args。
-            # 注意: e.args 可能含敏感数据（API Key/URL），仅取类型名与 args 长度用于诊断，
-            # 不直接拼入会返回给前端的 error_msg（避免 SSE 信息泄露）。
-            if not error_msg.strip():
-                diagnostic = f"{type(e).__name__} (args_count={len(e.args)})"
-                logger.error(f"Stream error (empty message, diagnosed): {diagnostic} repr={repr(e)}")
-                error_msg = diagnostic
-            else:
-                logger.error(f"Stream error: {error_msg}")
-
-            # 检查是否是包装的速率限制错误（如 ServiceUnavailableError 包装 RateLimitError）
-            is_rate_limit = any(keyword in error_msg.lower() for keyword in [
-                "ratelimiterror", "rate limit", "429", "resource_exhausted",
-                "quota exceeded", "too many requests"
-            ])
-
-            if is_rate_limit:
-                # 按速率限制错误处理
-                import re
-                # 检查是否是配额用尽
-                if any(keyword in error_msg.lower() for keyword in ["quota", "exceeded", "billing"]):
+            except litellm.exceptions.RateLimitError as e:
+                # 速率限制错误 - 需要特殊处理
+                logger.error(f"Stream rate limit error: {e}")
+                error_msg = str(e)
+                error_msg_lower = error_msg.lower()
+                # 余额不足 / 配额用尽
+                if any(keyword in error_msg_lower for keyword in _QUOTA_KEYWORDS):
                     error_type = "quota_exceeded"
                     user_message = "API 配额已用尽，请检查账户余额或升级计划"
+                # 🔥 认证失败：LiteLLM 会把上游 401（authorization failed）也包装成 RateLimitError 抛出，
+                # 必须在此识别并归为 authentication，否则误判为 rate_limit 导致 Orchestrator 走 30s×3 重试
+                elif any(keyword in error_msg_lower for keyword in _AUTH_KEYWORDS):
+                    error_type = "authentication"
+                    user_message = "API Key 无效或已过期，请检查配置"
                 else:
                     error_type = "rate_limit"
+                    # 尝试从错误消息中提取重试时间
+                    import re
                     retry_match = re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, re.IGNORECASE)
                     retry_seconds = float(retry_match.group(1)) if retry_match else 60
                     user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
-            else:
-                # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
-                mt = _detect_max_tokens_error(error_msg)
-                if mt:
-                    limit, msg = mt
-                    error_type = "bad_request"
-                    user_message = msg
-                else:
-                    error_type = "unknown"
-                    user_message = "LLM 调用发生错误，请重试"
 
-            output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
-            yield {
-                "type": "error",
-                "error_type": error_type,
-                "error": error_msg,
-                "user_message": user_message,
-                "accumulated": accumulated_all,
-                "usage": {
-                    "prompt_tokens": input_tokens_estimate,
-                    "completion_tokens": output_tokens_estimate,
-                    "total_tokens": input_tokens_estimate + output_tokens_estimate,
-                } if accumulated_all else None,
-            }
+                output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
+                yield {
+                    "type": "error",
+                    "error_type": error_type,
+                    "error": error_msg,
+                    "user_message": user_message,
+                    "accumulated": accumulated_all,
+                    "usage": {
+                        "prompt_tokens": input_tokens_estimate,
+                        "completion_tokens": output_tokens_estimate,
+                        "total_tokens": input_tokens_estimate + output_tokens_estimate,
+                    } if accumulated_all else None,
+                }
+
+            except litellm.exceptions.AuthenticationError as e:
+                # 认证错误 - API Key 无效
+                logger.error(f"Stream authentication error: {e}")
+                yield {
+                    "type": "error",
+                    "error_type": "authentication",
+                    "error": str(e),
+                    "user_message": "API Key 无效或已过期，请检查配置",
+                    "accumulated": accumulated_all,
+                    "usage": None,
+                }
+
+            except litellm.exceptions.APIConnectionError as e:
+                # 连接错误 - 网络问题
+                logger.error(f"Stream connection error: {e}")
+                yield {
+                    "type": "error",
+                    "error_type": "connection",
+                    "error": str(e),
+                    "user_message": "无法连接到 API 服务，请检查网络连接",
+                    "accumulated": accumulated_all,
+                    "usage": None,
+                }
+
+            except Exception as e:
+                # 其他错误 - 检查是否是包装的速率限制错误
+                error_msg = str(e)
+                # 🔥 B4 修复: 某些 LLM 网关（如 opencode.ai）返回空错误体，str(e) 为空
+                # 此时日志仅输出 "Stream error: " 无法诊断。补全异常类型与 args。
+                # 注意: e.args 可能含敏感数据（API Key/URL），仅取类型名与 args 长度用于诊断，
+                # 不直接拼入会返回给前端的 error_msg（避免 SSE 信息泄露）。
+                if not error_msg.strip():
+                    diagnostic = f"{type(e).__name__} (args_count={len(e.args)})"
+                    logger.error(f"Stream error (empty message, diagnosed): {diagnostic} repr={repr(e)}")
+                    error_msg = diagnostic
+                else:
+                    logger.error(f"Stream error: {error_msg}")
+
+                # 检查是否是包装的速率限制错误（如 ServiceUnavailableError 包装 RateLimitError）
+                is_rate_limit = any(keyword in error_msg.lower() for keyword in [
+                    "ratelimiterror", "rate limit", "429", "resource_exhausted",
+                    "quota exceeded", "too many requests"
+                ])
+
+                if is_rate_limit:
+                    # 按速率限制错误处理
+                    import re
+                    # 检查是否是配额用尽
+                    if any(keyword in error_msg.lower() for keyword in ["quota", "exceeded", "billing"]):
+                        error_type = "quota_exceeded"
+                        user_message = "API 配额已用尽，请检查账户余额或升级计划"
+                    else:
+                        error_type = "rate_limit"
+                        retry_match = re.search(r"retry\s*(?:in|after)\s*(\d+(?:\.\d+)?)\s*s", error_msg, re.IGNORECASE)
+                        retry_seconds = float(retry_match.group(1)) if retry_match else 60
+                        user_message = f"API 调用频率超限，建议等待 {int(retry_seconds)} 秒后重试"
+                else:
+                    # 🔥 max_tokens 超限：解析服务商返回的限制值，给友好提示
+                    mt = _detect_max_tokens_error(error_msg)
+                    if mt:
+                        limit, msg = mt
+                        error_type = "bad_request"
+                        user_message = msg
+                    else:
+                        error_type = "unknown"
+                        user_message = "LLM 调用发生错误，请重试"
+
+                output_tokens_estimate = estimate_tokens(accumulated_all) if accumulated_all else 0
+                yield {
+                    "type": "error",
+                    "error_type": error_type,
+                    "error": error_msg,
+                    "user_message": user_message,
+                    "accumulated": accumulated_all,
+                    "usage": {
+                        "prompt_tokens": input_tokens_estimate,
+                        "completion_tokens": output_tokens_estimate,
+                        "total_tokens": input_tokens_estimate + output_tokens_estimate,
+                    } if accumulated_all else None,
+                }
 
     async def validate_config(self) -> bool:
         """验证配置"""

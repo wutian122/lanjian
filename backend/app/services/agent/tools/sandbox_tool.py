@@ -14,11 +14,25 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from dataclasses import dataclass
 
-from .base import AgentTool, ToolResult
+from .base import (
+    AgentTool,
+    ToolResult,
+    build_mapping_arg_error,
+    coerce_mapping_arg,
+    normalize_string_mapping,
+)
 from app.core.config import settings
 from ..utils.path_safety import resolve_safe_path, UnsafePathError
 
 logger = logging.getLogger(__name__)
+
+
+def _php_literal(value: str) -> str:
+    """PHP var_export 单引号字符串语义（先转义反斜杠、再转义单引号）。
+
+    与 sandbox_language._php_literal 同源（本模块不能反向导入，故内联）。
+    """
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 def _sandbox_failure(error: str, *, exit_code: Optional[int] = None) -> Dict[str, Any]:
@@ -163,9 +177,10 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker 不可用")
 
-        timeout = timeout or self.config.timeout
+        # P8：LLM 会把 timeout 发成 "30" 字符串，参与算术必 TypeError
+        from ..tools.file_tool import _coerce_int
 
-        # 禁用代理环境变量：从宿主机环境显式剔除代理变量，避免空字符串干扰 pip/curl
+        timeout = _coerce_int(timeout) or self.config.timeout
         _proxy_keys = {
             "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
             "ALL_PROXY", "all_proxy",
@@ -279,7 +294,10 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker 不可用")
 
-        timeout = timeout or self.config.timeout
+        # P8：timeout 字符串强转
+        from ..tools.file_tool import _coerce_int
+
+        timeout = _coerce_int(timeout) or self.config.timeout
 
         # read network mode from config if not specified
         if network_mode is None:
@@ -401,7 +419,9 @@ class SandboxManager:
         if not self.is_available:
             return _sandbox_failure("Docker not available")
 
-        timeout = timeout or self.config.timeout
+        from ..tools.file_tool import _coerce_int
+
+        timeout = _coerce_int(timeout) or self.config.timeout
         # 禁用代理环境变量：从宿主机环境剔除代理变量
         _proxy_keys = {
             "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
@@ -537,17 +557,30 @@ class SandboxManager:
     ) -> Dict[str, Any]:
         """
         在沙箱中执行 HTTP 请求
-        
+
         Args:
             method: HTTP 方法
             url: URL
             headers: 请求头
             data: 请求体
             timeout: 超时
-            
+
         Returns:
             HTTP 响应
         """
+        # P9-3：headers 形状防御——须在下面 headers 迭代与 network_mode 切换之前。
+        # LLM 偶发把 headers 发成 JSON 字符串（先尝试还原）或数组（直接引导）。
+        if headers is not None:
+            headers_map = coerce_mapping_arg(headers, "headers")
+            if headers_map is None:
+                return {
+                    "success": False,
+                    "status_code": 0,
+                    "body": "",
+                    "error": build_mapping_arg_error("headers", headers),
+                }
+            headers = normalize_string_mapping(headers_map)
+
         # 构建 curl 命令
         curl_parts = ["curl", "-s", "-S", "-w", "'\\n%{http_code}'", "-X", method]
         
@@ -1364,6 +1397,25 @@ class PhpTestTool(AgentTool):
         **kwargs
     ) -> ToolResult:
         """执行 PHP 测试"""
+        # P9-3：get_params/post_params 形状防御（在 wrapper 插值与 initialize
+        # 之前；坏参数不触发沙箱初始化）
+        if get_params is not None:
+            _m = coerce_mapping_arg(get_params, "get_params")
+            if _m is None:
+                return ToolResult(
+                    success=False,
+                    error=build_mapping_arg_error("get_params", get_params),
+                )
+            get_params = normalize_string_mapping(_m)
+        if post_params is not None:
+            _m = coerce_mapping_arg(post_params, "post_params")
+            if _m is None:
+                return ToolResult(
+                    success=False,
+                    error=build_mapping_arg_error("post_params", post_params),
+                )
+            post_params = normalize_string_mapping(_m)
+
         try:
             await self.sandbox_manager.initialize()
         except Exception as e:
@@ -1401,18 +1453,20 @@ class PhpTestTool(AgentTool):
         # 构建模拟 $_GET 和 $_POST 的包装代码
         wrapper_parts = ["<?php"]
 
-        # 模拟 $_GET
+        # 模拟 $_GET（P9-3：key/value 用 var_export 语义字面量，
+        # 旧实现仅转义单引号，key 含引号、value 尾反斜杠均可逃逸）
         if get_params:
             for key, value in get_params.items():
-                # 安全转义
-                escaped_value = value.replace("'", "\\'")
-                wrapper_parts.append(f"$_GET['{key}'] = '{escaped_value}';")
+                wrapper_parts.append(
+                    f"$_GET[{_php_literal(str(key))}] = {_php_literal(str(value))};"
+                )
 
         # 模拟 $_POST
         if post_params:
             for key, value in post_params.items():
-                escaped_value = value.replace("'", "\\'")
-                wrapper_parts.append(f"$_POST['{key}'] = '{escaped_value}';")
+                wrapper_parts.append(
+                    f"$_POST[{_php_literal(str(key))}] = {_php_literal(str(value))};"
+                )
 
         # 移除 php_code 开头的 <?php 标签
         clean_code = php_code.strip()
@@ -1655,11 +1709,13 @@ class CommandInjectionTestTool(AgentTool):
 
     async def _test_php_injection(self, code: str, param_name: str, test_command: str) -> Dict[str, Any]:
         """测试 PHP 命令注入"""
-        # 构建模拟环境
+        # 构建模拟环境（P9-3：param_name/test_command 用 var_export 语义字面量）
+        name_lit = _php_literal(str(param_name))
+        cmd_lit = _php_literal(str(test_command))
         wrapper = f"""<?php
-$_GET['{param_name}'] = '{test_command}';
-$_POST['{param_name}'] = '{test_command}';
-$_REQUEST['{param_name}'] = '{test_command}';
+$_GET[{name_lit}] = {cmd_lit};
+$_POST[{name_lit}] = {cmd_lit};
+$_REQUEST[{name_lit}] = {cmd_lit};
 """
         # 移除原代码的 PHP 标签
         clean_code = code.strip()
@@ -1681,13 +1737,16 @@ $_REQUEST['{param_name}'] = '{test_command}';
 
     async def _test_python_injection(self, code: str, param_name: str, test_command: str) -> Dict[str, Any]:
         """测试 Python 命令注入"""
-        # 模拟 request.args.get
+        # 模拟 request.args.get（P9-3：param_name/test_command 用 json 字面量，
+        # 旧实现原样插入单引号可逃逸执行任意 Python）
+        name_lit = json.dumps(str(param_name), ensure_ascii=False)
+        cmd_lit = json.dumps(str(test_command), ensure_ascii=False)
         wrapper = f"""
 import sys
 class MockArgs:
     def get(self, key, default=None):
-        if key == '{param_name}':
-            return '{test_command}'
+        if key == {name_lit}:
+            return {cmd_lit}
         return default
 
 class MockRequest:
@@ -1695,7 +1754,7 @@ class MockRequest:
     form = MockArgs()
 
 request = MockRequest()
-sys.argv = ['script.py', '{test_command}']
+sys.argv = ['script.py', {cmd_lit}]
 
 """
         full_code = wrapper + code

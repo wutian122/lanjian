@@ -47,9 +47,11 @@ from app.services.agent.agents.base import AgentResult
 from app.services.agent.event_manager import EventManager
 from app.services.agent.strict_finding import (
     is_context_only_finding,
+    is_order_aligned_finding,
     is_strict_finding,
     _to_int,
 )
+from app.services.agent.utils.finding_fingerprint import assign_fingerprints
 from app.services.agent.task_cleanup import cleanup_agent_task_resources
 from app.services.git_ssh_service import GitSSHOperations
 from app.services.llm.service import LLMService
@@ -264,11 +266,18 @@ class AgentTaskResponse(BaseModel):
     low_count: int = 0
 
     # 评分
-    quality_score: float = 0.0
+    # 层 5a（2026-09-29）：completed_with_gaps 且 0 发现时返回 None（无法评分）。
+    # 必须可空——否则 response_model 校验对详情/列表接口直接 500（审查 C1 实证）。
+    quality_score: float | None = None
     security_score: float | None = None
 
     # 进度百分比
     progress_percentage: float = 0.0
+
+    # 层 5b（2026-09-29）：门禁/健康度观察明细（llm_health / candidates 等）。
+    # 未在响应模型声明会被 FastAPI 按 response_model 静默过滤（审查 C2 实证），
+    # 前端健康度横幅与报告段整条链路随之失效。
+    observations: list[dict] | None = None
 
     # 时间
     created_at: datetime
@@ -1343,8 +1352,18 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                         logger.debug(f"[AgentTask] Finding {i+1}: {f.get('title', 'N/A')[:50]} - {f.get('severity', 'N/A')}")
 
                 # 🔥 v2.1: 传递 project_root 用于文件路径验证
-                saved_count = await _save_findings(db, task_id, findings, project_root=project_root)
-                logger.info(f"[AgentTask] Saved {saved_count}/{len(findings)} findings (filtered {len(findings) - saved_count} hallucinations)")
+                # P8：传入 filtered_observations 列表，被过滤的确认态 finding 留痕于此
+                filtered_observations: list = []
+                saved_count = await _save_findings(
+                    db, task_id, findings,
+                    project_root=project_root,
+                    filtered_observations=filtered_observations,
+                )
+                if filtered_observations:
+                    existing_obs = list(task.observations or [])
+                    existing_obs.extend(filtered_observations)
+                    task.observations = existing_obs
+                logger.info(f"[AgentTask] Saved {saved_count}/{len(findings)} findings (filtered {len(findings) - saved_count}, logged {len(filtered_observations)} confirmed-but-filtered)")
 
                 # 更新任务统计
                 # 🔥 CRITICAL FIX: 在设置完成前再次检查取消状态
@@ -1377,16 +1396,42 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 # verified_count 仅统计 confirmed/verified/true_positive 且 is_verified=True。
                 await _recalc_task_counters_from_db(db, task, task_id)
 
-                # 计算安全评分
-                task.security_score = _calculate_security_score(findings)
+                # LLM 健康度（2026-09-29 层 5b）：统计任务全程 LLM 输出质量剖面，
+                # degraded 且任务以 completed 收口时升级为 completed_with_gaps——
+                # 结论不完整比假满分诚实（生产实证 c6d6cd09 双机 0 finding 满分）。
+                try:
+                    llm_health = await _compute_llm_health(db, task_id)
+                    observations_list = list(task.observations or [])
+                    observations_list.append({
+                        "llm_health": llm_health,
+                        "time": datetime.now(UTC).isoformat(),
+                    })
+                    task.observations = observations_list
+                    if (
+                        llm_health.get("degraded")
+                        and task.status == AgentTaskStatus.COMPLETED
+                    ):
+                        task.status = AgentTaskStatus.COMPLETED_WITH_GAPS
+                except Exception as exc:  # 健康度统计非致命：失败不阻断收口
+                    logger.warning(f"LLM 健康度统计失败（非致命）: {exc!r}")
+
+                # 计算安全评分（P6：输入改用落库口径，与原始幻觉列表解耦）
+                scoring_gaps = (
+                    task.status == AgentTaskStatus.COMPLETED_WITH_GAPS
+                )
+                saved_for_scoring = await _load_saved_findings_for_scoring(db, task_id)
+                task.security_score = _calculate_security_score(
+                    saved_for_scoring, gaps=scoring_gaps
+                )
                 # P4: 质量评分（agent 流程之前恒为 0）
                 _cov_info = (_meta or {}).get("coverage_info", {}) if isinstance(_meta, dict) else {}
                 task.quality_score = _calculate_quality_score(
-                    findings,
+                    saved_for_scoring,
                     verified_count=task.verified_count,
                     coverage_covered=_cov_info.get("covered_count", 0),
                     coverage_total=_cov_info.get("total_dimensions", 0) or 10,
                     saved_count=saved_count,
+                    gaps=scoring_gaps,
                 )
                 # 🔥 注意: progress_percentage 是计算属性，不需要手动设置
                 # 当 status = COMPLETED 时会自动返回 100.0
@@ -2095,12 +2140,15 @@ async def _save_findings(
     task_id: str,
     findings: list[dict],
     project_root: str | None = None,
+    filtered_observations: list[dict] | None = None,
 ) -> int:
     """
     保存发现到数据库
 
     🔥 增强版：支持多种 Agent 输出格式，健壮的字段映射
     🔥 v2.1: 添加文件路径验证，过滤幻觉发现
+    🔥 P8（2026-10-07）：被过滤的确认态 finding 写入本函数局部
+       filtered_observations 列表，随结果返回供调用方合并进 task.observations。
 
     Args:
         db: 数据库会话
@@ -2111,6 +2159,8 @@ async def _save_findings(
     Returns:
         int: 实际保存的发现数量
     """
+    if filtered_observations is None:
+        filtered_observations = []
     from app.models.agent_task import VulnerabilityType
 
     logger.info(f"[SaveFindings] Starting to save {len(findings)} findings for task {task_id}")
@@ -2118,6 +2168,22 @@ async def _save_findings(
     if not findings:
         logger.warning(f"[SaveFindings] No findings to save for task {task_id}")
         return 0
+
+    # P9-9：落库前统一计算 fingerprint（此时全部对齐/绑定已完成；
+    # 空身份不参与；仅本次新增 finding，历史不回填 D13）。
+    # 同 fp 后到条目标注 duplicate_of，不静默删除。
+    try:
+        fp_stats = assign_fingerprints(findings)
+        if fp_stats["duplicates"]:
+            logger.info(
+                f"[SaveFindings] {fp_stats['duplicates']} same-root entries "
+                f"annotated with duplicate_of (kept, not deleted)"
+            )
+    except Exception:
+        logger.warning(
+            "[SaveFindings] fingerprint assignment failed (non-fatal)",
+            exc_info=True,
+        )
 
     # 🔥 Case-insensitive mapping preparation
     severity_map = {
@@ -2175,12 +2241,22 @@ async def _save_findings(
                 f"[SaveFindings] Skipping context-only recon lead: "
                 f"{str(finding.get('title', 'N/A'))[:60]}"
             )
+            _fobs = _build_filtered_finding_observation(
+                finding, reason="context-only recon lead 不进持久化"
+            )
+            if _fobs:
+                filtered_observations.append(_fobs)
             continue
 
         # B1-fix: strict finding validation - reject findings without file_path, line, or low confidence
         if not is_strict_finding(finding):
             _f_title = str(finding.get("title", "N/A"))[:60]
             logger.info(f"[SaveFindings] Filtered by is_strict_finding: {_f_title}")
+            _fobs = _build_filtered_finding_observation(
+                finding, reason=f"is_strict_finding 校验未通过: {_f_title}"
+            )
+            if _fobs:
+                filtered_observations.append(_fobs)
             continue
 
 
@@ -2363,6 +2439,14 @@ async def _save_findings(
                 except ValueError:
                     cvss_score = None
 
+            # D12：aligned 分桶标记持久化进 finding_metadata（供后续查询/
+            # 报告按桶呈现），不改动 verification_status 降级外的其他口径
+            if is_order_aligned_finding(finding):
+                aligned_meta = dict(finding.get("finding_metadata") or {})
+                if not aligned_meta.get("aligned"):
+                    aligned_meta["aligned"] = True
+                    finding["finding_metadata"] = aligned_meta
+
             db_finding = AgentFinding(
                 id=str(uuid4()),
                 task_id=task_id,
@@ -2393,6 +2477,8 @@ async def _save_findings(
                 # 🔥 P3: 发现来源追踪 — Semgrep vs LLM
                 matched_rule_code=finding.get("matched_rule_code"),
                 matched_pattern=finding.get("matched_pattern"),
+                # P9-9：指纹落库（空身份为 None，历史不回填）
+                fingerprint=finding.get("fingerprint"),
                 finding_metadata=(
                     finding.get("finding_metadata")
                     or ({"discovery_source": "semgrep"} if finding.get("matched_rule_code") else {"discovery_source": "llm"})
@@ -2419,10 +2505,104 @@ async def _save_findings(
     return saved_count
 
 
-def _calculate_security_score(findings: list[dict]) -> float:
-    """计算安全评分"""
+def _build_filtered_finding_observation(finding: dict, *, reason: str) -> dict | None:
+    """P7-5（2026-10-07）：验证判确认但落库被过滤的项必须留痕。
+
+    生产实证 L6：verification 判 confirmed/static_confirmed 的项落库被
+    is_strict_finding 过滤后零记录，用户无法解释"验证说 1 确认、落库 0"。
+    非确认态（needs_context 等）被过滤属正常质量门，不专门留痕。
+    """
+    status = str(finding.get("verification_status") or "")
+    if status not in ("confirmed", "static_confirmed"):
+        return None
+    return {
+        "gate": "filtered_confirmed_finding",
+        "time": datetime.now(UTC).isoformat(),
+        "title": str(finding.get("title", ""))[:120],
+        "file_path": str(finding.get("file_path", ""))[:300],
+        "verification_status": status,
+        "reason": reason,
+    }
+
+
+async def _load_saved_findings_for_scoring(db: AsyncSession, task_id: str) -> list[dict]:
+    """P6（2026-10-06）：加载落库 findings 作为评分输入（与原始列表解耦）。
+
+    生产实证（B 机任务 5f6487a4）：orchestrator 原始列表 17 项、落库仅 4 项
+    （幻觉过滤/去重/路径反查剔除）——评分用原始列表扣分爆表（security=0，
+    应 66）。落库口径与 _recalc_task_counters_from_db 对齐。
+    """
+    stmt = select(
+        AgentFinding.severity,
+        AgentFinding.verification_status,
+        AgentFinding.ai_confidence,
+    ).where(AgentFinding.task_id == task_id)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "severity": (r.severity or "low"),
+            "verification_status": (r.verification_status or ""),
+            "ai_confidence": r.ai_confidence,
+        }
+        for r in rows
+    ]
+
+
+async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
+    """LLM 健康度统计（2026-09-29 层 5b）：从事件流还原 LLM 输出质量剖面。
+
+    llm_calls 以 thinking_start 数为准（每轮流式调用恰好发射一次）；
+    truncations/empty_responses/format_retries/garbled_drops 按事件消息
+    关键词归账（与 base.py/orchestrator.py 的告警文案同源）。degraded =
+    调用数>0 且 (截断+空响应) 占比 ≥ 0.5——达到该比例说明多数调用轮次
+    LLM 输出不可用，审计结论不可信（生产实证：任务 c6d6cd09/327b6430
+    截断率近 100% 且 0 finding）。
+    """
+    stmt = select(
+        AgentEvent.event_type, AgentEvent.message
+    ).where(AgentEvent.task_id == task_id)
+    rows = (await db.execute(stmt)).all()
+    llm_calls = 0
+    truncations = 0
+    empty_responses = 0
+    format_retries = 0
+    garbled_drops = 0
+    for event_type, message in rows:
+        msg = message or ""
+        if event_type == "thinking_start":
+            llm_calls += 1
+        if "max_tokens 截断" in msg:
+            truncations += 1
+        if "空响应" in msg and event_type in ("warning", "error", "info", "llm_decision"):
+            # 一条事件消息只记一次（token 流事件不进此账）
+            empty_responses += 1
+        if "格式解析失败" in msg:
+            format_retries += 1
+        if "乱码" in msg or "崩坏" in msg:
+            # P9 D6：degenerate 掐断 warning（「崩坏」）同归 garbled_drops
+            garbled_drops += 1
+    degraded = llm_calls > 0 and (truncations + empty_responses) / llm_calls >= 0.5
+    return {
+        "llm_calls": llm_calls,
+        "truncations": truncations,
+        "empty_responses": empty_responses,
+        "format_retries": format_retries,
+        "garbled_drops": garbled_drops,
+        "degraded": degraded,
+    }
+
+
+def _calculate_security_score(
+    findings: list[dict], *, gaps: bool = False
+) -> float | None:
+    """计算安全评分。
+
+    2026-09-29 层 5a：无 findings 且任务以 completed_with_gaps 收口（审计
+    未完整——LLM 空响应/覆盖不足等）时返回 None（"无法评分"），拒绝把
+    "审计没跑通"呈现为"项目非常安全"的满分。正常完成且确实无发现维持 100。
+    """
     if not findings:
-        return 100.0
+        return None if gaps else 100.0
 
     # 基于发现的严重程度计算扣分
     deductions = {
@@ -2507,6 +2687,13 @@ async def _recalc_task_counters_from_db(db: AsyncSession, task: AgentTask, task_
     )
     task.static_confirmed_count = (await db.execute(static_stmt)).scalar() or 0
 
+    # P8：false_positive_count 原为死字段（定义后无写入点）——按落库口径补齐
+    fp_stmt = select(func.count()).where(
+        AgentFinding.task_id == task_id,
+        AgentFinding.verification_status == VerificationStatus.FALSE_POSITIVE,
+    )
+    task.false_positive_count = (await db.execute(fp_stmt)).scalar() or 0
+
 
 async def _get_verification_status_breakdown(db: AsyncSession, task_id: str) -> dict:
     """Q1: 聚合任务下 AgentFinding 的 verification_status 分布。
@@ -2542,20 +2729,23 @@ def _calculate_quality_score(
     coverage_covered: int,
     coverage_total: int,
     saved_count: int | None = None,
-) -> float:
+    *,
+    gaps: bool = False,
+) -> float | None:
     """计算 agent 审计任务质量评分（P4）。
 
     组成：
     - 验证覆盖率（40%）：verified_count / findings_count
     - 误报率（30%）：1 - false_positive / findings_count
     - 平均置信度（30%）：finding 的 ai_confidence 均值
-    无 finding 时返回 100.0（无问题即满分）。
+    无 finding 时：gaps=True（审计未完整收口）返回 None（无法评分）；
+    正常完成返回 100.0（无问题即满分）。
 
     注意：findings_count 须用落库数（saved_count），与 verified_count 同口径，
     避免原始 findings 列表含幻觉 finding 导致分母虚大、质量分被压低。
     """
     if not findings:
-        return 100.0
+        return None if gaps else 100.0
 
     # P4-fix: 分母用落库数（与 verified_count 同口径），未提供时回退到 len(findings)
     findings_count = saved_count if saved_count is not None else len(findings)
@@ -3010,9 +3200,16 @@ async def get_agent_task(
             "high_count": task.high_count or 0,
             "medium_count": task.medium_count or 0,
             "low_count": task.low_count or 0,
-            "quality_score": float(task.quality_score or 0.0),
+            "quality_score": (
+                float(task.quality_score)
+                if task.quality_score is not None
+                else None
+            ),
             "security_score": float(task.security_score) if task.security_score is not None else None,
             "progress_percentage": progress,
+            # 层 5b（2026-09-29）：门禁/健康度观察明细随详情下发，
+            # 前端据此渲染 LLM 健康度横幅与静态线索段
+            "observations": task.observations or [],
             "created_at": task.created_at,
             "started_at": task.started_at,
             "completed_at": task.completed_at,
@@ -5076,6 +5273,51 @@ def _finding_source(finding: Any) -> str | None:
     return None
 
 
+def _build_unverified_static_leads_section(observations: list) -> list[str]:
+    """层 5c（2026-09-29）：渲染"未验证静态线索"报告段。
+
+    来源 = orchestrator gate observations 中被过滤的 Semgrep 兜底候选明细
+    （无确定性 PoC 模板 / 低严重度 / EL-SSTI 类）。这些线索不落库、不进
+    验证队列（预算保护），但绝不静默消失——报告读者能看到具体位置与规则。
+    """
+    leads: list[dict] = []
+    for obs in observations or []:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("gate") not in (
+            "semgrep_fallback_filtered",
+            "semgrep_fallback_unverifiable",
+            "semgrep_leads",  # P7-2：正常路径的预扫命中全量留痕
+        ):
+            continue
+        for cand in obs.get("candidates") or []:
+            if isinstance(cand, dict):
+                leads.append(cand)
+    if not leads:
+        return []
+    lines = [
+        "## 未验证静态线索（报告仅呈现，未执行验证）",
+        "",
+        f"以下 {len(leads)} 条静态扫描命中的线索缺少确定性 PoC 验证条件，"
+        "未进入沙箱验证流程；仅作为人工复核参考，不代表已确认漏洞：",
+        "",
+    ]
+    for c in leads:
+        title = str(c.get("title") or "未知线索")
+        file_path = str(c.get("file_path") or "")
+        line = c.get("line") or 0
+        ctype = str(c.get("type") or "unknown")
+        if file_path and line:
+            location = f"{file_path}:{line}"
+        elif file_path:
+            location = file_path
+        else:
+            location = "位置未知"
+        lines.append(f"- **{title}**（`{location}`，类型 {ctype}）— 未验证静态线索")
+    lines.append("")
+    return lines
+
+
 def _build_semgrep_fallback_section(findings: list) -> list[str]:
     """sandbox-verification-hard-gate Task 11: 构造"静态扫描兜底候选"报告段落。
 
@@ -5361,6 +5603,18 @@ async def generate_audit_report(
                     md_lines.append(f.description)
                     md_lines.append("")
 
+                # P9 Fix-2: verification_note 三格式可见（第七章）——JSON/前端已
+                # 支持，MD 在漏洞描述之后条件追加「验证说明」；note 无独立列，
+                # 仅存于 verification_result JSON；空/缺失 note 不输出（无空标题）
+                _vresult = f.verification_result
+                _vnote = (
+                    _vresult.get("verification_note")
+                    if isinstance(_vresult, dict) else None
+                )
+                if _vnote and str(_vnote).strip():
+                    md_lines.append(f"**验证说明:** {str(_vnote).strip()}")
+                    md_lines.append("")
+
                 if f.code_snippet:
                     # 🔥 v2.1: 增强语言检测，避免默认 python 标记错误
                     lang = "text"  # 默认使用 text 而非 python
@@ -5466,6 +5720,7 @@ async def generate_audit_report(
     # sandbox-verification-hard-gate Task 11: 静态扫描兜底候选清单（Analysis 0
     # 产出时 Semgrep 发现转待验证候选，与人工级发现区分标注）
     md_lines.extend(_build_semgrep_fallback_section(findings))
+    md_lines.extend(_build_unverified_static_leads_section(task.observations or []))
 
     # Remediation Priority
     if critical > 0 or high > 0:

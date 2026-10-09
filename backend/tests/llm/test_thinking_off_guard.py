@@ -510,9 +510,13 @@ class TestGuardOnThreePaths:
             )
 
         body = fake_client.created_kwargs
-        # extra_body 透传容器内关思考参数被剥，正常 provider 参数保留
-        assert body["extra_body"] == {"repetition_penalty": 1.15}
-        assert "enable_thinking" not in body
+        # 思考策略倒转（2026-09-29 层 2c）：默认强制关思考——请求级 False 不再
+        # 被剥除，且 merge 层注入 chat_template_kwargs；防注入标记清洗保持
+        assert body["extra_body"] == {
+            "enable_thinking": False,
+            "repetition_penalty": 1.15,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
         # 消息内有害标记被剥，正文保留
         assert "<|think_off|>" not in body["messages"][0]["content"]
         assert body["messages"][0]["content"].endswith("hi")
@@ -533,8 +537,10 @@ class TestGuardOnThreePaths:
             )
 
         body = fake_client.created_kwargs
-        assert "enable_thinking" not in body
-        assert "extra_body" not in body or "enable_thinking" not in body.get("extra_body", {})
+        # 新契约：关思考参数保留到端点（默认策略即关思考），/no_think 清洗不变
+        eb = body.get("extra_body") or {}
+        assert (eb.get("enable_thinking") is False
+                or eb.get("chat_template_kwargs", {}).get("enable_thinking") is False)
         assert "/no_think" not in body["messages"][0]["content"]
 
     @pytest.mark.asyncio
@@ -562,8 +568,12 @@ class TestGuardOnThreePaths:
             )
 
         assert response.content == "ok"
-        assert "enable_thinking" not in captured
-        assert captured["extra_body"] == {"repetition_penalty": 1.15}
+        # 新契约：请求级 enable_thinking="false" 保留 + merge 注入 chat_template_kwargs
+        assert captured["extra_body"] == {
+            "repetition_penalty": 1.15,
+            "enable_thinking": "false",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
         assert "/no_think" not in captured["messages"][0]["content"]
 
     @pytest.mark.asyncio
@@ -590,10 +600,8 @@ class TestGuardOnThreePaths:
             ]
 
         assert chunks[-1]["type"] == "done"
-        assert "enable_thinking" not in captured
-        # 剥除后 chat_template_kwargs 可能残留为空容器（{} 对端点无开关语义，无害），
-        # 安全属性是 enable_thinking 键在任意层级都到不了 acompletion
-        assert "enable_thinking" not in captured.get("extra_body", {}).get("chat_template_kwargs", {})
+        # 新契约：请求级关思考参数保留到端点（默认策略即关思考）
+        assert captured["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
         assert "<|think_off|>" not in captured["messages"][0]["content"]
 
     @pytest.mark.asyncio
@@ -611,8 +619,12 @@ class TestGuardOnThreePaths:
                 temperature=0.6,
                 max_tokens=100,
             )
+        # 新契约：默认出站强制携带 chat_template_kwargs（关思考）
         assert set(fake_client.created_kwargs.keys()) == {
-            "model", "messages", "temperature", "max_tokens",
+            "model", "messages", "temperature", "max_tokens", "extra_body",
+        }
+        assert fake_client.created_kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         assert fake_client.created_kwargs["messages"][0]["content"] == "hi /think"
 
@@ -629,8 +641,7 @@ class TestGuardOnThreePaths:
             await adapter2._send_request(
                 _make_request(messages=[LLMMessage(role="user", content="hi")])
             )
-        for absent in ("enable_thinking", "chat_template_kwargs"):
-            assert absent not in captured2
+        assert captured2["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
         assert captured2["messages"][0]["content"] == "hi"
 
         # --- litellm 流式 ---
@@ -645,6 +656,5 @@ class TestGuardOnThreePaths:
             [c async for c in adapter3.stream_complete(
                 _make_request(messages=[LLMMessage(role="user", content="hi")])
             )]
-        for absent in ("enable_thinking", "chat_template_kwargs"):
-            assert absent not in captured3
+        assert captured3["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
         assert captured3["messages"][0]["content"] == "hi"
