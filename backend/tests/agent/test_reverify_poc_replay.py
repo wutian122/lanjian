@@ -12,7 +12,7 @@ exit=0 + VULNERABILITY_CONFIRMED 铁证），但 poc_code 存的是 LLM 输出�
 4. 有历史 confirmed 铁证时，单次 rerun 未复现不推翻历史结论。
 """
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,6 +22,7 @@ from app.models.agent_task import (
     AgentTask,
     AgentTaskStatus,
     VerificationStatus,
+    finding_counts_as_verified,
 )
 from app.models.project import Project
 
@@ -36,6 +37,10 @@ class FakeDB:
         self._project = project
         self._finding = finding
         self.committed = False
+        self.commit_count = 0
+        # P10-T4：reverify 后须重算计数器，记录查询次数（固定 5 条）
+        self.counter_query_count = 0
+        self._query_index = 0
 
     async def get(self, model, ident):
         return {
@@ -46,9 +51,37 @@ class FakeDB:
 
     async def commit(self):
         self.committed = True
+        self.commit_count += 1
 
     async def rollback(self):
         pass
+
+    async def execute(self, stmt):
+        """按 _recalc_task_counters_from_db 的固定调用顺序返回结果，
+        值由 finding 当前状态推导（与生产口径一致）。"""
+        idx = self._query_index
+        self._query_index += 1
+        self.counter_query_count += 1
+        f = self._finding
+        result = MagicMock()
+        if idx == 0:  # severity GROUP BY
+            result.all.return_value = [(f.severity, 1)]
+        elif idx == 1:  # files distinct
+            result.scalar.return_value = 1
+        elif idx == 2:  # verified_count（新口径）
+            result.scalar.return_value = 1 if finding_counts_as_verified(f) else 0
+        elif idx == 3:  # static_confirmed_count
+            result.scalar.return_value = (
+                1
+                if f.verification_status == VerificationStatus.STATIC_CONFIRMED
+                and f.is_verified
+                else 0
+            )
+        else:  # false_positive_count
+            result.scalar.return_value = (
+                1 if f.verification_status == VerificationStatus.FALSE_POSITIVE else 0
+            )
+        return result
 
 
 class FakeSandboxManager:
@@ -101,18 +134,22 @@ async def _run(base_setup, finding, fake_mgr):
     with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project"), \
          patch("app.services.agent.tools.sandbox_tool.SandboxManager", return_value=fake_mgr), \
          patch("app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True):
-        return await reverify_finding(TASK_ID, FIND_ID, db=db, current_user=None)
+        result = await reverify_finding(TASK_ID, FIND_ID, db=db, current_user=None)
+    return result, db
 
 
 def test_replays_last_successful_attempt_command(base_setup):
     finding = make_finding()  # poc_code 是 URL，但历史有成功 attempt
     mgr = FakeSandboxManager()
-    result = asyncio.run(_run(base_setup, finding, mgr))
+    result, db_seen = asyncio.run(_run(base_setup, finding, mgr))
     # 重放的是历史真实命令，不是 URL poc_code
     assert mgr.last_poc_code == "python3 -c 'print(\"VULNERABILITY_CONFIRMED\")'"
     assert result["verification_status"] == VerificationStatus.CONFIRMED
     assert finding.verification_status == VerificationStatus.CONFIRMED
     assert len(finding.sandbox_attempts) == 2  # 新 attempt 追加
+    # P10-T4：状态落库后计数器重算（5 条查询）并二次提交
+    assert db_seen.counter_query_count == 5
+    assert db_seen.commit_count == 2
 
 
 def test_unexecutable_poc_without_history_returns_400(base_setup):
@@ -141,9 +178,12 @@ def test_poc_error_keeps_needs_context(base_setup):
         "stdout": "",
         "stderr": "Traceback (most recent call last):\nModuleNotFoundError",
     }
-    result = asyncio.run(_run(base_setup, finding, mgr))
+    result, _db = asyncio.run(_run(base_setup, finding, mgr))
     assert result["verification_status"] == VerificationStatus.NEEDS_CONTEXT
     assert finding.verification_status == VerificationStatus.NEEDS_CONTEXT
+    # P10-T4：即使状态保持 needs_context，计数器仍须重算
+    assert _db.counter_query_count == 5
+    assert _db.commit_count == 2
 
 
 def test_prior_confirmed_evidence_not_overridden_by_single_failure(base_setup):
@@ -153,8 +193,10 @@ def test_prior_confirmed_evidence_not_overridden_by_single_failure(base_setup):
     )
     mgr = FakeSandboxManager()
     mgr.result = {"success": True, "exit_code": 0, "stdout": "no confirmation output\n", "stderr": ""}
-    result = asyncio.run(_run(base_setup, finding, mgr))
+    result, _db = asyncio.run(_run(base_setup, finding, mgr))
     assert result["verification_status"] == VerificationStatus.CONFIRMED
+    assert _db.counter_query_count == 5
+    assert _db.commit_count == 2
 
 
 def test_no_poc_returns_400(base_setup):

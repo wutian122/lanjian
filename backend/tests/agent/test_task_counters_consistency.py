@@ -8,6 +8,9 @@ D1/D2/D3 修复测试：任务统计计数器与 findings 表保持一致
 - D3: not_reproducible 被错误计入 is_verified（verification_method+confidence>=0.85 覆盖了语义）
 
 修复：提取 _recalc_task_counters_from_db，从已落库 AgentFinding 重查计数器。
+
+P10-T4（2026-10-09）口径演进：verified_count 在 is_verified=True 前提下
+纳入 static_confirmed（与 confirmed 并列），消除 UI 与报告的口径裂缝。
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -100,8 +103,9 @@ class TestRecalcCountersFromDB:
     async def test_not_reproducible_excluded_from_verified(self):
         """D3: verification_status=not_reproducible 不计入 verified_count
 
-        修复后 verified_count 仅统计 verification_status in
-        (confirmed/verified/true_positive) AND is_verified=True。
+        P10-T4 后 verified_count 统计 verification_status in
+        (confirmed, static_confirmed) AND is_verified=True，not_reproducible
+        仍被排除。
         """
         task = _make_task()
         db = AsyncMock()
@@ -116,16 +120,39 @@ class TestRecalcCountersFromDB:
         assert task.verified_count == 0
 
     @pytest.mark.asyncio
-    async def test_verified_count_only_confirmed_statuses(self):
-        """D3: 仅 confirmed/verified/true_positive 且 is_verified=True 计入"""
+    async def test_verified_count_includes_confirmed_and_static_confirmed(self):
+        """P10-T4: confirmed 与 static_confirmed 且 is_verified=True 均计入"""
         task = _make_task()
         db = AsyncMock()
         db.execute.side_effect = [
             _mock_all([("high", 2)]),
             _mock_scalar(2),
-            _mock_scalar(2),
+            _mock_scalar(3),  # 新口径 verified_count（2 动态 + 1 静态）
+            _mock_scalar(1),  # static_confirmed_count
+            _mock_scalar(0),  # P8: false_positive_count
+        ]
+        await _recalc_task_counters_from_db(db, task, "task-1")
+        assert task.verified_count == 3
+
+    @pytest.mark.asyncio
+    async def test_verified_predicate_includes_static_confirmed(self):
+        """P10-T4 RED 锁定：verified_count 的 SQL 谓词须同时纳入 static_confirmed。
+
+        直接编译真实 SQLAlchemy 语句检查（mock 的返回值无法证明谓词语义）。
+        """
+        task = _make_task()
+        db = AsyncMock()
+        db.execute.side_effect = [
+            _mock_all([]),
+            _mock_scalar(0),
+            _mock_scalar(0),
             _mock_scalar(0),  # static_confirmed_count
             _mock_scalar(0),  # P8: false_positive_count
         ]
         await _recalc_task_counters_from_db(db, task, "task-1")
-        assert task.verified_count == 2
+        # 第 3 次 execute 为 verified_count 计数语句
+        verified_stmt = db.execute.call_args_list[2].args[0]
+        compiled = str(verified_stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "static_confirmed" in compiled
+        assert "confirmed" in compiled
+        assert "is_verified" in compiled

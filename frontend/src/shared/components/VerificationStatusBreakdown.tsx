@@ -2,12 +2,15 @@
  * Q1: 验证状态分布展示组件
  *
  * 展示 finding 的 verification_status 五类分布：
- * 已验证(confirmed) / 静态确认(static_confirmed) / 不可复现(not_reproducible) /
+ * 动态确认(confirmed) / 静态确认(static_confirmed) / 不可复现(not_reproducible) /
  * 待确认(needs_context) / 误报(false_positive)
  *
- * P5-4（2026-10-04）：补 static_confirmed 徽标——生产实证（任务 1fe2d9ce）
- * 6 个静态确认在概览分布中被吞，用户看到"已验证 0"误以为没验证。
- * 保留 verified_count 严格语义（仅 confirmed），同时展示其余状态，避免用户误解。
+ * P10-T4（2026-10-09）口径统一：
+ * - 「已验证」改为「动态确认」，并显式给出合计（含静态）——
+ *   动态确认与静态确认不相交，合计 = 两者之和，防止旧文案「已验证 N」
+ *   与「静态确认 M」并列被误读为重复计数（生产实证 84d97d33：
+ *   UI「已验证 1」vs 报告「已验证 3」裂缝）。
+ * - breakdown 由详情接口实时聚合，历史任务徽标随新口径回溯生效。
  */
 import { Badge } from "@/components/ui/badge";
 
@@ -39,11 +42,13 @@ export function VerificationStatusBreakdown({
     needs_context,
     false_positive,
   } = breakdown;
+  // 合计（含静态）：动态确认与静态确认不相交
+  const totalVerified = confirmed + static_confirmed;
 
   if (variant === "compact") {
     return (
       <div className={`text-xs text-muted-foreground ${className}`}>
-        已验证 {confirmed} / 静态确认 {static_confirmed} / 不可复现 {not_reproducible} / 待确认 {needs_context} / 误报 {false_positive}
+        动态确认 {confirmed} · 合计 {totalVerified}（含静态） / 不可复现 {not_reproducible} / 待确认 {needs_context} / 误报 {false_positive}
       </div>
     );
   }
@@ -51,7 +56,10 @@ export function VerificationStatusBreakdown({
   return (
     <div className={`flex flex-wrap gap-1.5 ${className}`}>
       <Badge variant="outline" className="text-[10px] text-green-600 border-green-200">
-        已验证 {confirmed}
+        动态确认 {confirmed}
+      </Badge>
+      <Badge variant="outline" className="text-[10px] text-emerald-700 border-emerald-300">
+        合计 {totalVerified}（含静态）
       </Badge>
       <Badge variant="outline" className="text-[10px] text-blue-600 border-blue-200">
         静态确认 {static_confirmed}

@@ -127,12 +127,12 @@ class LLMService:
             max_tokens = user_llm_config.get('llmMaxTokens') or int(getattr(settings, 'LLM_MAX_TOKENS', 4096))
 
             # 🔥 Repetition Penalty 优先级：用户配置 > 环境变量
-            # （structured-output-protocol 层次 6：默认 1.15，压制 thinking 模型
+            # （structured-output-protocol 层次 6：默认 1.2，压制 thinking 模型
             # 退化重复循环；适配器层集中注入 extra_body，SGLang/vLLM 接受）
             repetition_penalty = (
                 user_llm_config.get('repetitionPenalty')
                 if user_llm_config.get('repetitionPenalty') is not None
-                else float(getattr(settings, 'LLM_REPETITION_PENALTY', 1.15))
+                else float(getattr(settings, 'LLM_REPETITION_PENALTY', 1.2))
             )
 
             self._config = LLMConfig(

@@ -1393,7 +1393,8 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
 
                 # D1/D2/D3: 计数器从已落库的 AgentFinding 重查，保证与 findings 表一致。
                 # 旧逻辑遍历含幻觉 finding 的原始列表做 += 累加，导致统计虚高；
-                # verified_count 仅统计 confirmed/verified/true_positive 且 is_verified=True。
+                # P10-T4：verified_count = is_verified=True 且状态 in
+                # (confirmed, static_confirmed)，与报告/前端同口径。
                 await _recalc_task_counters_from_db(db, task, task_id)
 
                 # LLM 健康度（2026-09-29 层 5b）：统计任务全程 LLM 输出质量剖面，
@@ -2630,8 +2631,11 @@ async def _recalc_task_counters_from_db(db: AsyncSession, task: AgentTask, task_
     - D1: 严重度计数器（critical/high/medium/low_count）改为 DB GROUP BY severity 重查，
           替代遍历含幻觉 finding 的原始列表做 += 累加（旧逻辑无归零、含被过滤的幻觉 finding）。
     - D2: files_with_findings 改为 COUNT(DISTINCT file_path) WHERE file_path IS NOT NULL。
-    - D3: verified_count 仅统计 verification_status in (confirmed/verified/true_positive)
-          AND is_verified=True，排除 not_reproducible/false_positive。
+    - D3: verified_count 仅统计 is_verified=True 的 finding。
+      P10-T4（2026-10-09）口径演进：状态谓词由仅 confirmed 扩展为
+      verification_status in (confirmed, static_confirmed)，与报告
+      sum(is_verified) 对齐；P9-8 证据前置已防 static_confirmed 洗白，
+      采信口径安全。not_reproducible/false_positive/needs_context 仍排除。
 
     必须在 _save_findings 落库 commit 之后调用，否则查不到数据。
     """
@@ -2669,17 +2673,20 @@ async def _recalc_task_counters_from_db(db: AsyncSession, task: AgentTask, task_
     )
     task.files_with_findings = (await db.execute(files_stmt)).scalar() or 0
 
-    # D3: verified_count - 仅 confirmed（_save_findings 已把 verified/true_positive 映射为 confirmed）
-    #      且 is_verified=True，排除 not_reproducible/false_positive
-    from app.models.agent_task import VerificationStatus
+    # D3 / P10-T4: verified_count 合计 - is_verified=True 且
+    #      verification_status in (confirmed, static_confirmed)；
+    #      _save_findings 已把 verified/true_positive 映射为 confirmed。
+    #      与报告 sum(is_verified)、前端合计（含静态）同口径。
+    from app.models.agent_task import VERIFIED_COUNT_STATUSES, VerificationStatus
     verified_stmt = select(func.count()).where(
         AgentFinding.task_id == task_id,
         AgentFinding.is_verified == True,  # noqa: E712
-        AgentFinding.verification_status == VerificationStatus.CONFIRMED,
+        AgentFinding.verification_status.in_(VERIFIED_COUNT_STATUSES),
     )
     task.verified_count = (await db.execute(verified_stmt)).scalar() or 0
 
-    # D3b: static_confirmed_count - 代码推理确认数（未动态复现，不计入 verified_count）
+    # D3b: static_confirmed_count - verified_count 合计中的代码推理确认子集
+    #      （未动态复现；前端据此双标「动态确认 / 合计（含静态）」）
     static_stmt = select(func.count()).where(
         AgentFinding.task_id == task_id,
         AgentFinding.is_verified == True,  # noqa: E712
@@ -2698,9 +2705,10 @@ async def _recalc_task_counters_from_db(db: AsyncSession, task: AgentTask, task_
 async def _get_verification_status_breakdown(db: AsyncSession, task_id: str) -> dict:
     """Q1: 聚合任务下 AgentFinding 的 verification_status 分布。
 
-    返回 {confirmed, not_reproducible, needs_context, false_positive} 四类计数。
-    用于前端展示完整验证状态分布，避免仅展示 verified_count 导致用户误解。
-    verified_count 严格语义（仅 confirmed 且 is_verified=True）保持不变。
+    返回 {confirmed, static_confirmed, not_reproducible, needs_context,
+    false_positive} 五类计数。用于前端展示完整验证状态分布。
+    P10-T4：本聚合为详情接口实时计算，历史任务徽标随新口径回溯生效——
+    前端合计（含静态）= confirmed + static_confirmed。
     """
     from sqlalchemy import func, select
 
@@ -3652,6 +3660,12 @@ async def reverify_finding(
     finding.verification_status = new_status
     finding.is_verified = new_is_verified
     finding.verified_at = now
+    await db.commit()
+
+    # P10-T4：finding 状态落库后重算任务计数器（verified_count 等），
+    # 否则 agent_tasks 与 agent_findings 陈旧不一致（对齐完成路径 :1397）。
+    # 必须在上方 commit 之后调用——重算从已落库数据查询。
+    await _recalc_task_counters_from_db(db, task, task_id)
     await db.commit()
 
     return {

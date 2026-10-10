@@ -126,6 +126,24 @@ async def test_reverify_finding_runs_poc_and_updates_status():
 
     db.get.side_effect = fake_get
 
+    # P10-T4：reverify 后重算计数器（severity GROUP BY + files + verified
+    # + static + false_positive 共 5 条查询），finding 终态 confirmed
+    _sev_rows = MagicMock()
+    _sev_rows.all.return_value = [("low", 1)]
+
+    def _scalar_result(value):
+        r = MagicMock()
+        r.scalar.return_value = value
+        return r
+
+    db.execute.side_effect = [
+        _sev_rows,
+        _scalar_result(1),  # files_with_findings
+        _scalar_result(1),  # verified_count（confirmed）
+        _scalar_result(0),  # static_confirmed_count
+        _scalar_result(0),  # false_positive_count
+    ]
+
     fake_result = {"success": True, "exit_code": 0, "stdout": "VULNERABILITY_CONFIRMED: poc executed", "stderr": ""}
     with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
         "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
@@ -145,6 +163,9 @@ async def test_reverify_finding_runs_poc_and_updates_status():
     assert finding.verification_status == VerificationStatus.CONFIRMED
     assert finding.sandbox_attempts and len(finding.sandbox_attempts) == 1
     assert finding.verification_result["method"] == "poc-rerun"
+    # P10-T4：计数器重算 5 条查询，首末各提交一次
+    assert db.execute.await_count == 5
+    assert db.commit.await_count == 2
 
 
 async def test_reverify_finding_marks_not_reproducible_on_failure():
@@ -166,6 +187,23 @@ async def test_reverify_finding_marks_not_reproducible_on_failure():
 
     db.get.side_effect = fake_get
 
+    # P10-T4：finding 终态 needs_context——verified/static/fp 计数均 0
+    _sev_rows = MagicMock()
+    _sev_rows.all.return_value = [("low", 1)]
+
+    def _scalar_result(value):
+        r = MagicMock()
+        r.scalar.return_value = value
+        return r
+
+    db.execute.side_effect = [
+        _sev_rows,
+        _scalar_result(1),  # files_with_findings
+        _scalar_result(0),  # verified_count
+        _scalar_result(0),  # static_confirmed_count
+        _scalar_result(0),  # false_positive_count
+    ]
+
     fake_result = {"success": False, "exit_code": 1, "stdout": "", "stderr": "boom"}
     with patch("app.api.v1.endpoints.agent_tasks.assert_can_access_project", new=MagicMock()), patch(
         "app.api.v1.endpoints.agent_tasks.os.path.isdir", return_value=True
@@ -182,3 +220,6 @@ async def test_reverify_finding_marks_not_reproducible_on_failure():
     assert resp["success"] is False
     # #2 修复：PoC 崩溃 → NEEDS_CONTEXT（PoC 错误），不再误判 NOT_REPRODUCIBLE
     assert finding.verification_status == VerificationStatus.NEEDS_CONTEXT
+    # P10-T4：计数器仍重算并二次提交
+    assert db.execute.await_count == 5
+    assert db.commit.await_count == 2

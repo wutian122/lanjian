@@ -5,10 +5,10 @@
 即中止本轮、丢弃本轮内容、按"无效轮"走既有重试/止损流（静默重试）。
 
 契约：
-- BaseAgent._detect_output_degeneracy(text)：
-  * 同字符连续 run >= 30（字符墙萌芽）→ True；
-  * 尾 500 字符中存在 >= 25 字符重复子串（循环）→ True；
-  * 正常审计文本（含代码分隔线/常规重复短语）→ False；
+- BaseAgent._detect_output_degeneracy(text)（P10 步骤 0 起返回形态枚举）：
+  * 同字符连续 run >= 30（字符墙萌芽）→ "F1"；
+  * 尾 500 字符中存在 >= 25 字符重复子串（循环）→ "F2"；
+  * 正常审计文本（含代码分隔线/常规重复短语）→ None；
 - stream_llm_call：检测命中 → 本轮返回 ("", tokens)（丢弃崩坏内容），
   _last_empty_kind="degenerate"（供 nudge/止损消费），已发射的
   content_end 不携带崩坏文本；
@@ -50,13 +50,13 @@ class TestDetectOutputDegeneracy:
     def test_charwall_detected(self):
         agent = _make_agent()
         text = "正常审计分析文本。" + "A" * 35 + "继续"
-        assert agent._detect_output_degeneracy(text) is True
+        assert agent._detect_output_degeneracy(text) == "F1"
 
     def test_loop_detected(self):
         agent = _make_agent()
         frag = "international law human rights rule of lawdemocracy"[:30]
         text = "分析开始。" + (frag + frag + frag + frag)[:300] + "结尾"
-        assert agent._detect_output_degeneracy(text) is True
+        assert agent._detect_output_degeneracy(text) == "F2"
 
     def test_normal_text_not_flagged(self):
         agent = _make_agent()
@@ -67,12 +67,12 @@ class TestDetectOutputDegeneracy:
             "3. " + "-" * 28 + " 分隔线\n"
             "4. 常规重复短语：需要关注需要关注（两次，正常强调）\n"
         )
-        assert agent._detect_output_degeneracy(text) is False
+        assert agent._detect_output_degeneracy(text) is None
 
     def test_empty_and_short_text_not_flagged(self):
         agent = _make_agent()
-        assert agent._detect_output_degeneracy("") is False
-        assert agent._detect_output_degeneracy("正常短文本") is False
+        assert agent._detect_output_degeneracy("") is None
+        assert agent._detect_output_degeneracy("正常短文本") is None
 
 
 class TestStreamSilentRetry:

@@ -1301,12 +1301,27 @@ class BaseAgent(ABC):
         self._last_llm_truncated = False
         # P5-3：本轮 usage 快照（供空响应止损归因——usage 全 0 = 疑似过载）
         self._last_round_usage = None
+        # P10 终审 Fix-1：本轮请求侧 prompt token 本地估算槽（轮启动
+        # 挂点写入；崩坏在 done 前掐断、端点 usage 不可得时的核账凭证）
+        self._last_round_est_prompt_tokens = None
         # 本轮是否发生过最后一搏（I2：决定外层是否跳过 trace 记账）
         ditch_happened = False
         # Task 20：每轮重置空响应形态（与截断标志同生命周期）
         self._last_empty_kind = None
         # Task 7：每轮重置 tool_calls 暴露槽（done chunk 聚合结果写入）
         self._last_tool_calls = None
+        # P10 步骤 2a：每轮重置 F2 节流游标——上轮残留（>新轮长度）会使
+        # 「len(text) - _deg_last_loop_check >= 间隔」恒假，新轮短循环完全
+        # 不跑 F2（跨轮失明实证：stale=1500 时 198 字符循环漏检）。
+        self._deg_last_loop_check = 0
+        # P10 终审 Fix-1：轮启动处记录请求侧 prompt token 本地估算。
+        # 挂点选在此（messages 已经 auto_compress 收口、reset 块之后）：
+        # 此时 messages 即实际发出规模。本地估算口径，非端点计费值；
+        # 与掐断时对 accumulated 现算的 completion 估算共同构成崩坏轮
+        # 浪费核账凭证（端点 usage 仅 done/error 写入，崩坏在其前掐断）。
+        self._last_round_est_prompt_tokens = self._estimate_prompt_tokens(
+            messages
+        )
 
         # 🔥 在开始 LLM 调用前检查取消
         if self.is_cancelled:
@@ -1415,10 +1430,12 @@ class BaseAgent(ABC):
                             # L2：崩坏萌芽检测（每 chunk 后毫秒级尾部窗口检查）——
                             # 字符墙/循环刚萌芽即掐断本轮：丢弃全部内容走"无效轮"
                             # 静默重试（nudge/止损），崩坏文本不对用户固化展示。
-                            if self._detect_output_degeneracy(accumulated):
+                            # P10 步骤 0：检测器返回形态枚举（F1-F4/None）。
+                            degeneracy = self._detect_output_degeneracy(accumulated)
+                            if degeneracy:
                                 logger.warning(
                                     f"[{self.name}] Degenerate output detected "
-                                    "(charwall/loop), discarding round for retry"
+                                    f"({degeneracy}), discarding round for retry"
                                 )
                                 self._last_empty_kind = "degenerate"
                                 # P9 D6：degenerate 丢弃可见化——补前端 warning
@@ -1435,6 +1452,12 @@ class BaseAgent(ABC):
                                     )
                                 # P9：有序收口标志（仅 orchestrator 轮）
                                 self._note_orderly_stop()
+                                # P10 步骤 0：崩坏样本留存必须在三累计变量置空
+                                # 之前完成（崩坏全文唯一在内存存活的窗口）；
+                                # 独立诊断通道，不进 SSE/前端/报告/audit_trace。
+                                await self._persist_degenerate_sample(
+                                    degeneracy, accumulated
+                                )
                                 accumulated = ""
                                 accumulated_content = ""
                                 accumulated_reasoning = ""
@@ -1993,7 +2016,15 @@ class BaseAgent(ABC):
     # run 极少超过 30；25 字符重复子串在正常文本中几乎不出现。
     DEGENERACY_CHAR_RUN_LIMIT = 30
     DEGENERACY_LOOP_MIN = 25
-    DEGENERACY_LOOP_CHECK_INTERVAL = 1024
+    # P10 步骤 2c：F2 节流间隔（文本每增长该字符数才扫一次 tail500）。
+    # 旧值 1024 是从未接线的死常量（实际代码裸写 64）——清理后复用本名、
+    # 收紧为 24（前提：步骤 1 良性语料全绿；每次最多早抓 40 字符）。
+    DEGENERACY_LOOP_CHECK_INTERVAL = 24
+    # P10 步骤 2b 防护：同一物理行内 25 字符窗口配对须再向后比对该长度。
+    # 真周期循环窗口之后字符仍一致（与循环单元长度无关）；JSON/数据中
+    # 路径+相邻字段被不同对象引用形成的偶合在该扩展窗口内分歧（实测
+    # 「file...description」配对在 +37 处分歧）→ 偶合豁免。
+    DEGENERACY_LOOP_CONFIRM_LEN = 48
 
     # F3 字符异常墙（2026-09-29 层 3b）：截断轮输出被垃圾字符（如 "ÿd½ôÿéúÇ"、
     # "max ~ff files"）污染时源头丢弃。正常文本误伤面评估：扩展 Latin-1 连片
@@ -2011,82 +2042,412 @@ class BaseAgent(ABC):
     PUNCT_DRIFT_WINDOW = 500
     PUNCT_DRIFT_MIN_MARKS = 3
     _PUNCT_MARKS = frozenset("。！？；：，、.!?;:\n\r")
+    # P10 步骤 1：F4 数据字面量豁免——尾窗口内成对引号区间字符占比 ≥60%
+    # （窗口主体是 hex/base64 等数据而非正文）时不判标点漂移。
+    PUNCT_DRIFT_DATA_FRACTION = 0.6
+
+    # P10 步骤 1：F1/F2/F3 行级与字面量豁免形态。
+    # F1 分隔线/标题整行白名单字符（markdown HR：-/*/_；setext 标题：=/−）。
+    _SEPARATOR_LINE_CHARS = frozenset("-=_*")
+    # P10 终审 Fix-2：豁免长度上界——现实 markdown HR / setext 标题 ≤100；
+    # 代码缩进 run ≤120。超长同符整行恢复判 F1（防豁免被超长崩坏利用）。
+    BENIGN_SEPARATOR_RUN_MAX = 100
+    BENIGN_INDENT_RUN_MAX = 120
+    # F2 跨行整行重复的结构性样板白名单（import/include/using 声明）。
+    _BOILERPLATE_LINE_RE = re.compile(
+        r"^\s*(?:import\s|#\s*include\b|from\s+[\w.]+\s+import\s"
+        r"|using\s+[\w:]+;)"
+    )
+    # P10 终审 Fix-3：样板配对豁免重复上界——同一整行在尾窗口（tail500）
+    # 出现 ≥8 行时不再视为结构样板，仍判 F2。
+    BOILERPLATE_REPEAT_MAX = 8
+
+    # P10 步骤 0：崩坏样本独立诊断通道。文件名固定于任务 trace 目录
+    # （<AUDIT_TRACE_DIR>/<task_id[:8]>/，目录解析与 audit_trace.py 同构），
+    # 追加模式；尾部样本取 accumulated 最后 DEGENERATE_SAMPLE_TAIL 字符。
+    DEGENERATE_SAMPLES_FILENAME = "degenerate_samples.jsonl"
+    DEGENERATE_SAMPLE_TAIL = 800
 
     @staticmethod
-    def _has_punctuation_drift(text: str) -> bool:
-        """F4 标点密度漂移检测（纯函数）。"""
-        if not text or len(text) < BaseAgent.PUNCT_DRIFT_MIN_LENGTH:
-            return False
-        tail = text[-BaseAgent.PUNCT_DRIFT_WINDOW:]
-        marks = sum(1 for ch in tail if ch in BaseAgent._PUNCT_MARKS)
-        return marks < BaseAgent.PUNCT_DRIFT_MIN_MARKS
+    def _estimate_token_count(text: str) -> int:
+        """本地 token 估算（tiktoken cl100k_base）。
 
-    @staticmethod
-    def _has_garbled_wall(text: str) -> bool:
-        """F3 字符异常墙检测（尾 200 窗口，纯函数，无状态）。"""
+        ⚠️ 本地估算口径，非端点计费值——仅用于崩坏轮等端点 usage 不可得
+        场景的浪费核账；空文本为 0；tiktoken 不可用/异常时按
+        ``max(1, len(text)//4)`` 粗估（口径同 rag/splitter.py 的兜底）。
+        """
         if not text:
-            return False
+            return 0
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            return max(1, len(text) // 4)
+
+    def _estimate_prompt_tokens(
+        self, messages: list[dict[str, Any]] | None
+    ) -> int:
+        """请求侧 prompt token 本地估算（轮启动挂点，cl100k_base）。
+
+        取 auto_compress 之后实际发出的消息列表，拼接各条 content 估算；
+        content 为非字符串（多模态/结构化）时按 JSON 序列化计入。
+        ⚠️ 本地估算口径，非端点计费值。
+        """
+        parts: list[str] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif content is not None:
+                parts.append(json.dumps(content, ensure_ascii=False))
+        return self._estimate_token_count("\n".join(parts))
+
+    async def _persist_degenerate_sample(
+        self, degeneracy: Optional[str], accumulated: str
+    ) -> None:
+        """P10 步骤 0：崩坏样本留存（独立诊断通道）。
+
+        ⚠️ 防护铁律：崩坏文本严禁进 SSE / 前端 / 报告 / audit_trace 业务
+        统计——崩坏文本不对用户固化展示。本通道完全独立：不调用
+        event_manager/emit（无任何事件外发），不写 AuditTraceManager 的
+        trace_md/trace_json 业务写点，仅追加本地诊断文件
+        ``<AUDIT_TRACE_DIR>/<task_id[:8]>/degenerate_samples.jsonl``；目录
+        解析复用 audit_trace.py 的 ``base_dir / task_id[:8]`` 约定。
+
+        任何失败（无 task_id、建目录/写文件异常）仅 logger.debug，绝不
+        阻断掐断主流程。任务目录权限收紧为 0700、样本文件权限 0600。
+
+        保留期限：样本仅作崩坏核账诊断，建议保留 30 天，由运维定期
+        清理；或在任务删除时随任务 trace 目录（本目录与 audit_trace
+        共用 ``<AUDIT_TRACE_DIR>/<task_id[:8]>/``）一并清理。
+        """
+        try:
+            task_id = getattr(self, "task_id", None)
+            if not task_id or not degeneracy:
+                return
+            import os
+            from pathlib import Path
+
+            from app.core.config import settings
+
+            # 目录解析与 AuditTraceManager 一致（audit_trace.py:54-56）
+            task_dir = Path(settings.AUDIT_TRACE_DIR) / task_id[:8]
+            task_dir.mkdir(parents=True, exist_ok=True)
+            # P10 终审 Fix-4：任务目录权限 0700（既有目录同样收紧；
+            # chmod 失败不阻断，仅吞 OSError）
+            try:
+                os.chmod(task_dir, 0o700)
+            except OSError:
+                pass
+            sample_path = task_dir / self.DEGENERATE_SAMPLES_FILENAME
+            text = accumulated or ""
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "task_id": task_id,
+                "agent": self.name,
+                "iteration": getattr(self, "_iteration", None),
+                "degeneracy": degeneracy,
+                "len": len(text),
+                "tail": text[-self.DEGENERATE_SAMPLE_TAIL:],
+                # 保留原 usage 键：端点真值（done/error 携带）若可得仍写
+                "usage": getattr(self, "_last_round_usage", None),
+                # P10 终审 Fix-1：usage 不可得（崩坏在 done 前掐断）时的
+                # 浪费核账凭证。均为本地估算口径，非端点计费值——
+                # est_completion_tokens 对 accumulated 现算；
+                # est_prompt_tokens 为轮启动处记录的请求侧估算。
+                "est_completion_tokens": self._estimate_token_count(text),
+                "est_prompt_tokens": getattr(
+                    self, "_last_round_est_prompt_tokens", None
+                ),
+            }
+            with open(sample_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write("\n")
+            try:
+                os.chmod(sample_path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            logger.debug(
+                f"[{getattr(self, 'name', 'agent')}] persist degenerate "
+                "sample failed",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _has_punctuation_drift(text: str) -> Optional[str]:
+        """F4 标点密度漂移检测（纯函数）。命中返回形态 "F4"，否则 None。"""
+        if not text or len(text) < BaseAgent.PUNCT_DRIFT_MIN_LENGTH:
+            return None
+        window_start = len(text) - BaseAgent.PUNCT_DRIFT_WINDOW
+        window = text[window_start:]
+        # P10 步骤 1：数据字面量豁免——逐行统计窗口内落在成对引号区间
+        # （hex/base64 等数据）的字符数；窗口主体是数据而非正文时不判漂移。
+        data_chars = 0
+        # 引号区间不跨行：只需检查与窗口相交的物理行（从窗口起点所在行开始）
+        pos = text.rfind("\n", 0, window_start) + 1
+        while pos < len(text):
+            next_nl = text.find("\n", pos)
+            if next_nl == -1:
+                next_nl = len(text)
+            line = text[pos:next_nl]
+            if next_nl > window_start:
+                base_in_line = window_start - pos
+                for span_start, span_end in BaseAgent._quoted_literal_spans(line):
+                    lo = max(span_start, base_in_line)
+                    hi = min(span_end, len(line))
+                    if hi > lo:
+                        data_chars += hi - lo
+            pos = next_nl + 1
+        if (
+            data_chars
+            >= BaseAgent.PUNCT_DRIFT_DATA_FRACTION * len(window)
+        ):
+            return None
+        marks = sum(1 for ch in window if ch in BaseAgent._PUNCT_MARKS)
+        if marks < BaseAgent.PUNCT_DRIFT_MIN_MARKS:
+            return "F4"
+        return None
+
+    @staticmethod
+    def _quoted_literal_spans(line: str) -> List[Tuple[int, int]]:
+        """同行成对引号的字面量内部区间（左闭右开，不含引号本身）。
+
+        按引号类型分别配对（连续两个为一对）；不成对的引号不产生区间。
+        可解释规则：合法代码/数据中引号在同一物理行内成对出现；崩坏文本
+        的引号不成对、或 run 冲出引号，均不构成豁免。
+        """
+        spans: List[Tuple[int, int]] = []
+        for quote in ('"', "'", "`"):
+            positions = [i for i, ch in enumerate(line) if ch == quote]
+            for k in range(0, len(positions) - 1, 2):
+                spans.append((positions[k] + 1, positions[k + 1]))
+        return spans
+
+    @staticmethod
+    def _inside_quoted_literal(text: str, start: int, end: int) -> bool:
+        """[start, end) 是否完全位于某行的成对引号字面量区间内。"""
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end == -1:
+            line_end = len(text)
+        local_start = start - line_start
+        local_end = end - line_start
+        for span_start, span_end in BaseAgent._quoted_literal_spans(
+            text[line_start:line_end]
+        ):
+            if span_start <= local_start and local_end <= span_end:
+                return True
+        return False
+
+    @staticmethod
+    def _has_garbled_wall(text: str) -> Optional[str]:
+        """F3 字符异常墙检测（尾 200 窗口，纯函数，无状态）。
+
+        命中返回形态 "F3"，否则 None（P10 步骤 0 起；真值语义不变，
+        既有 bool 上下文调用方判真值兼容）。P10 步骤 1 起：扩展 Latin-1
+        连片仅在被同行成对引号包裹（源码字节数据）时豁免；U+FFFD/U+FFFE/
+        U+FFFF 损坏符任何位置都命中（解码失败标记，无合法角色）。
+        """
+        if not text:
+            return None
         tail = text[-200:]
+        offset = len(text) - len(tail)
         if any(ch in BaseAgent._GARBLED_RARE_CHARS for ch in tail):
-            return True
+            return "F3"
         run = 0
-        for ch in tail:
+        for idx, ch in enumerate(tail):
             if 0x80 <= ord(ch) <= 0xFF:
                 run += 1
                 if run >= BaseAgent.GARBLED_EXT_LATIN_RUN_LIMIT:
-                    return True
+                    end = offset + idx + 1
+                    start = end - run
+                    if not BaseAgent._inside_quoted_literal(
+                        text, start, end
+                    ):
+                        return "F3"
             else:
                 run = 0
-        return False
+        return None
 
     def _is_garbled_truncated_output(self, step: Any, llm_output: str) -> bool:
         """截断轮乱码守门（2026-09-29 层 3a）：仅当本轮 length 截断 且 解析出
         step 且 输出含字符异常墙时判 True——调用方据此丢弃本轮决策（不执行、
         不传子 Agent），追加压缩输出提示后重试。非截断轮乱码留给 degeneracy
         检测管线，截断正常轮不误伤。"""
-        return (
+        return bool(
             step is not None
-            and bool(getattr(self, "_last_llm_truncated", False))
-            and self._has_garbled_wall(llm_output or "")
+            and getattr(self, "_last_llm_truncated", False)
+            # _has_garbled_wall P10 起返回形态 "F3"/None：本守门契约为
+            # bool，bool() 归一，调用方真值语义不变。
+            and bool(self._has_garbled_wall(llm_output or ""))
         )
 
-    def _detect_output_degeneracy(self, text: str) -> bool:
-        """检测生成文本的崩坏萌芽特征（字符墙 / 循环），命中即丢弃本轮静默重试。
+    def _detect_output_degeneracy(self, text: str) -> Optional[str]:
+        """检测生成文本的崩坏萌芽特征，命中即丢弃本轮静默重试。
 
-        - F1 字符墙：同字符连续 run >= DEGENERACY_CHAR_RUN_LIMIT（尾 200 窗口，
-          每 chunk 后调用，毫秒级）；
-        - F2 循环：尾 500 窗口存在 >= DEGENERACY_LOOP_MIN 字符重复子串
-          （节流：文本每增长 DEGENERACY_LOOP_CHECK_INTERVAL 才查一次）。
+        P10 步骤 0 起返回形态枚举（未命中返回 None；调用点判真值，与旧
+        bool 形态兼容）：
+        - "F1" 字符墙：同字符连续 run >= DEGENERACY_CHAR_RUN_LIMIT（尾 200
+          窗口，每 chunk 后调用，毫秒级）；
+        - "F2" 循环：尾 500 窗口存在 >= DEGENERACY_LOOP_MIN 字符重复子串
+          （节流：文本每增长 DEGENERACY_LOOP_CHECK_INTERVAL 才查一次）；
+        - "F3" 字符异常墙：混入垃圾字符（截断/采样崩坏残留）；
+        - "F4" 标点密度漂移：长正文无句读（关思考后输出通道的温和退化形态）。
         正常文本（含 '----' 分隔线、常规重复强调）不触发。
         """
         if not text or len(text) < self.DEGENERACY_CHAR_RUN_LIMIT:
-            return False
+            return None
         tail = text[-200:]
+        tail_offset = len(text) - len(tail)
         cur = 1
         prev = ""
-        for ch in tail:
+        for idx, ch in enumerate(tail):
             if ch == prev:
                 cur += 1
                 if cur >= self.DEGENERACY_CHAR_RUN_LIMIT:
-                    return True
+                    end = tail_offset + idx + 1
+                    start = end - cur
+                    if not self._is_benign_char_run(text, start, end):
+                        return "F1"
             else:
                 cur = 1
                 prev = ch
-        if len(text) >= 120 and len(text) - getattr(self, "_deg_last_loop_check", 0) >= 64:
+        prev_len = getattr(self, "_deg_last_loop_check", 0)
+        if len(text) >= 120 and len(text) - prev_len >= (
+            self.DEGENERACY_LOOP_CHECK_INTERVAL
+        ):
             self._deg_last_loop_check = len(text)
-            tail500 = text[-500:]
             loop_min = self.DEGENERACY_LOOP_MIN
-            for i in range(0, max(0, min(len(tail500) - loop_min, 220))):
-                frag = tail500[i:i + loop_min]
-                if frag in tail500[i + loop_min:]:
-                    return True
+            # P10 步骤 2b：反向搜索「终点新进入窗口」的第二落点。旧实现
+            # 仅正向枚举片段起点且硬编码上限——长干净基底后正文循环的片段
+            # 起点在 tail500 深位时漏扫，首命中实测迟至正文 330 字符。
+            # 若配对在上次检查时已完整落在 tail500 内，当时即应被发现；
+            # 故新配对的第二落点终点必在新增长区间（prev_len, len(text)]
+            # 内——只枚举这些候选 k，向窗口前半部反向 find 首次出现。
+            # 与全窗口正向扫描结果逐构造等价（9 类语料实证），成本由
+            # O(W²)/轮降为 O(n)/轮。
+            win_start = max(0, len(text) - 500)
+            k_lo = max(win_start, prev_len - loop_min)
+            k_hi = len(text) - loop_min
+            for k in range(k_lo, k_hi + 1):
+                frag = text[k:k + loop_min]
+                i = text.find(frag, win_start, k)
+                if i == -1:
+                    continue
+                if self._is_benign_repetition(text, i, k):
+                    continue
+                # 同物理行内的窗口配对须确认扩展后缀：真周期循环窗口后
+                # 字符仍一致；JSON 字段/路径引用偶合随即分歧（见常量注释）。
+                ls_i, _ = self._line_anchor(text, i)
+                ls_k, _ = self._line_anchor(text, k)
+                if ls_i == ls_k:
+                    avail = min(
+                        len(text) - i,
+                        len(text) - k,
+                        self.DEGENERACY_LOOP_CONFIRM_LEN,
+                    )
+                    if text[i:i + avail] != text[k:k + avail]:
+                        continue
+                return "F2"
         # F3 字符异常墙：混入垃圾字符（截断/采样崩坏残留）同样判崩坏丢弃
-        if self._has_garbled_wall(text):
-            return True
+        f3 = self._has_garbled_wall(text)
+        if f3:
+            return f3
         # F4 标点密度漂移：长正文无句读（关思考后输出通道的温和退化形态）
-        if self._has_punctuation_drift(text):
+        f4 = self._has_punctuation_drift(text)
+        if f4:
+            return f4
+        return None
+
+    def _is_benign_char_run(
+        self, text: str, start: int, end: int
+    ) -> bool:
+        """P10 步骤 1：F1 良性形态判定（精确形态，非阈值放松）。
+
+        ①整行（允许行尾 CR）仅由分隔符 -/=/ * /_ 构成且 3–100 字符——
+        markdown 水平分隔线 / setext 标题下划线（P10 终审 Fix-2 加 ≤100
+        上界）；②行首纯空白 run 且 ≤120——代码缩进（Fix-2 加 ≤120 上界）；
+        ③run 完全位于同行成对引号的字面量区间内——字符串数据。
+        """
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        ch = text[start]
+        # ① 行级分隔线 / 标题（长度上界 100，超长恢复判 F1）
+        if ch in self._SEPARATOR_LINE_CHARS:
+            stripped = line.rstrip("\r")
+            if (
+                3 <= len(stripped) <= self.BENIGN_SEPARATOR_RUN_MAX
+                and stripped == ch * len(stripped)
+            ):
+                return True
+        # ② 行首缩进空白（run 上界 120，超长恢复判 F1）
+        if (
+            start == line_start
+            and ch in " \t"
+            and (end - start) <= self.BENIGN_INDENT_RUN_MAX
+        ):
             return True
+        # ③ 字面量内数据
+        local_start = start - line_start
+        local_end = end - line_start
+        for span_start, span_end in self._quoted_literal_spans(line):
+            if span_start <= local_start and local_end <= span_end:
+                return True
         return False
+
+    def _is_benign_repetition(
+        self, text: str, first: int, second: int
+    ) -> bool:
+        """P10 步骤 1：F2 良性重复形态判定。
+
+        - 同一物理行内重复：真循环（行内重复无枚举/样板语义），不豁免；
+        - 跨行且两处列偏移相同：整行相同 → 仅 import/include 样板行豁免
+          （P10 终审 Fix-3：该整行在尾窗口出现 ≥8 行时不豁免，仍判 F2）；
+          行后缀分歧（仅共享前缀）→ 编号枚举/列表，豁免；
+        - 跨行但列偏移不同：命中。
+        位置恰在 '\\n' 上时视为下一物理行的起点（跨行边界片段）。
+        """
+        ls1, off1 = self._line_anchor(text, first)
+        ls2, off2 = self._line_anchor(text, second)
+        if ls1 == ls2:
+            return False
+        if off1 != off2:
+            return False
+        le1 = text.find("\n", ls1)
+        if le1 == -1:
+            le1 = len(text)
+        le2 = text.find("\n", ls2)
+        if le2 == -1:
+            le2 = len(text)
+        line1 = text[ls1:le1]
+        line2 = text[ls2:le2]
+        if line1 == line2 and self._BOILERPLATE_LINE_RE.match(line1):
+            # Fix-3：统计该整行在尾窗口（tail500，与 F2 扫描同窗）的出现
+            # 次数——≥8 行的样板重复超出结构声明现实形态，不豁免。
+            win_start = max(0, len(text) - 500)
+            count = sum(
+                1 for ln in text[win_start:].split("\n") if ln == line1
+            )
+            return count < self.BOILERPLATE_REPEAT_MAX
+        if line1 == line2:
+            return False
+        return True
+
+    @staticmethod
+    def _line_anchor(text: str, pos: int) -> Tuple[int, int]:
+        """返回 (物理行起点, 列偏移)；pos 恰在 '\\n' 上视为下一行起点。"""
+        if pos < len(text) and text[pos] == "\n":
+            return pos + 1, 0
+        line_start = text.rfind("\n", 0, pos) + 1
+        return line_start, pos - line_start
 
     # ============ X1/X2/X3：tool_calls 通道健壮化（2026-09-27） ============
     # 生产实证（任务 2ccc598a/059300c9）：sglang qwen3_coder parser 流式分片

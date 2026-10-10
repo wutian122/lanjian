@@ -86,11 +86,14 @@ def test_static_confirmed_low_confidence_not_promoted():
     assert normalized["is_verified"] is False
 
 
-def test_static_confirmed_excluded_from_verified_count_semantic():
-    """static_confirmed 的 is_verified=True 但状态不是 confirmed。
+def test_static_confirmed_included_in_verified_count_semantic():
+    """P10-T4：static_confirmed + is_verified=True 与 confirmed 并列计入
+    verified_count 合计（旧口径将其排除，造成 UI/报告裂缝）。
 
     Task 6：软证据升级现要求真实 attempt——此处 PoC 在沙箱真实执行（exit 0，
-    无动态铁证），升级合法生效后再验计数语义。"""
+    无动态铁证），升级合法生效后再验计数口径。"""
+    from app.models.agent_task import VERIFIED_COUNT_STATUSES
+
     agent = VerificationAgent.__new__(VerificationAgent)
     finding = {
         "verification_status": "confirmed",
@@ -113,5 +116,5 @@ def test_static_confirmed_excluded_from_verified_count_semantic():
     normalized = agent._normalize_verification_outcome(finding)
     assert normalized["verification_status"] == VerificationStatus.STATIC_CONFIRMED
     assert normalized["is_verified"] is True
-    # verified_count 仅统计 CONFIRMED，static_confirmed 不计入
-    assert normalized["verification_status"] != VerificationStatus.CONFIRMED
+    # P10-T4 新口径：static_confirmed 在 verified_count 计入集合内
+    assert normalized["verification_status"] in VERIFIED_COUNT_STATUSES

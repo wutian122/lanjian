@@ -238,7 +238,7 @@ const EnhancedStatsPanel = memo(function EnhancedStatsPanel({
     },
     {
       icon: <CheckCircle2 className="w-4 h-4" />,
-      label: "已验证",
+      label: "已确认（含静态）",
       value: verified,
       color: "text-emerald-600 dark:text-emerald-400",
       iconColor: "text-emerald-600 dark:text-emerald-400",
@@ -1449,7 +1449,7 @@ export const ReportExportDialog = memo(function ReportExportDialog({
           <div class="stat-card">
             <div class="stat-card-header">
               <div class="stat-card-icon verified">✓</div>
-              <span class="stat-card-label">验证</span>
+              <span class="stat-card-label">已确认</span>
             </div>
             <div class="stat-card-value" style="color:var(--success)">${verifiedCount}</div>
           </div>

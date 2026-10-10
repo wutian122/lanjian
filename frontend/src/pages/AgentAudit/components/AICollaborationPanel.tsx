@@ -125,7 +125,7 @@ export function AICollaborationPanel({
           </div>
           <div className="rounded-md border border-border bg-card px-2.5 py-2">
             <div>验证</div>
-            <div className="mt-1 text-foreground">{context.verifiedFindings} 个已验证</div>
+            <div className="mt-1 text-foreground">{context.verifiedFindings} 个已确认（含静态）</div>
           </div>
         </div>
 

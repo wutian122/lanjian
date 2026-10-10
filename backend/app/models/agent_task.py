@@ -107,8 +107,10 @@ class AgentTask(Base):
     
     # 发现统计
     findings_count = Column(Integer, default=0)  # 发现总数
-    verified_count = Column(Integer, default=0)  # 已验证数（仅 confirmed 动态复现）
-    static_confirmed_count = Column(Integer, default=0)  # 代码推理确认数（未动态复现）
+    # P10-T4：verified_count 合计 = confirmed（动态）+ static_confirmed（静态），
+    # 均 is_verified=True；静态子项数见 static_confirmed_count
+    verified_count = Column(Integer, default=0)  # 已确认数（含动态复现与代码推理）
+    static_confirmed_count = Column(Integer, default=0)  # 其中代码推理确认数（未动态复现）
     false_positive_count = Column(Integer, default=0)  # 误报数
     
     # 严重程度统计
@@ -363,6 +365,34 @@ class VerificationStatus:
     NOT_REPRODUCIBLE = "not_reproducible"
     NEEDS_CONTEXT = "needs_context"
     ALL = {CONFIRMED, STATIC_CONFIRMED, FALSE_POSITIVE, NOT_REPRODUCIBLE, NEEDS_CONTEXT}
+
+
+# P10-T4（2026-10-09）口径统一：verified_count 合计的状态集合——
+# 动态确认(confirmed) + 代码推理确认(static_confirmed)，二者不相交。
+# 旧口径仅 confirmed，static_confirmed 被排除，导致 UI 与报告口径裂缝
+# （B·tomcat 84d97d33：UI「已验证 1」、报告 sum(is_verified)=3）。
+# P9-8 证据前置已防洗白：static_confirmed 升级须有真实非 infra 的沙箱
+# attempt + dataflow + code_snippet + confidence≥0.75，采信口径与
+# confirmed 同安全级。
+VERIFIED_COUNT_STATUSES: tuple[str, str] = (
+    VerificationStatus.CONFIRMED,
+    VerificationStatus.STATIC_CONFIRMED,
+)
+
+
+def finding_counts_as_verified(finding) -> bool:
+    """P10-T4 口径谓词：finding 是否计入 verified_count 合计。
+
+    计入条件：verification_status in VERIFIED_COUNT_STATUSES
+    且 is_verified=True（is_verified 为硬前提，防静态项脏数据计入）。
+    """
+    if isinstance(finding, dict):
+        is_verified = finding.get("is_verified")
+        status = finding.get("verification_status")
+    else:
+        is_verified = getattr(finding, "is_verified", None)
+        status = getattr(finding, "verification_status", None)
+    return is_verified is True and str(status or "") in VERIFIED_COUNT_STATUSES
 
 
 class AgentFinding(Base):

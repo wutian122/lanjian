@@ -150,7 +150,7 @@ export function TaskReferencePanel({
                       </div>
 
                       <div className="mt-2 text-xs text-muted-foreground">
-                        发现 {task.findings_count} 个问题，已验证 {task.verified_count} 个，进度 {(task.progress_percentage || 0).toFixed(0)}%
+                        发现 {task.findings_count} 个问题，动态确认 {task.verification_status_breakdown?.confirmed ?? task.verified_count} · 合计（含静态）{task.verified_count} 个，进度 {(task.progress_percentage || 0).toFixed(0)}%
                       </div>
                       <VerificationStatusBreakdown
                         breakdown={task.verification_status_breakdown}

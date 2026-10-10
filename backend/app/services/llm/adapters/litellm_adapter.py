@@ -442,7 +442,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
         """合并请求级 extra_params 与配置级采样参数（structured-output-protocol 层次 6）。
 
         repetition_penalty（用户配置 llmConfig.repetitionPenalty > settings
-        .LLM_REPETITION_PENALTY，默认 1.15）集中在适配器层注入：Service/Agent
+        .LLM_REPETITION_PENALTY，默认 1.2）集中在适配器层注入：Service/Agent
         调用方无需显式传 extra_params，三条出站路径（litellm 非流式/流式、
         native openai）对端点呈现的请求体一致——litellm 经 custom_httpx 把
         extra_body 合并进 HTTP body（drop_params 不丢弃），native 经 openai
@@ -577,7 +577,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
             # tools/response_format 是 OpenAI 标准参数（openai/ 前缀下 drop_params 不丢）；
             # extra_body 经 litellm 官方透传机制合并进 HTTP body（litellm custom_httpx:
             # data = {**data, **extra_body}），不受 drop_params 影响。层次 6 参数治理：
-            # 配置级 repetition_penalty（默认 1.15）在此集中并入 extra_body，调用方无需
+            # 配置级 repetition_penalty（默认 1.2）在此集中并入 extra_body，调用方无需
             # 显式传 extra_params；native 路径（_native_openai_call）出口同样注入，
             # 两条路径对端点呈现的请求体一致。
             if request.tools:

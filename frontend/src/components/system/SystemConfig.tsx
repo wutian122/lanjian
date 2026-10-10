@@ -60,7 +60,7 @@ interface SystemConfigData {
 // 加载失败/后端空响应时的兜底表单值
 const FALLBACK_CONFIG: SystemConfigData = {
   llmProvider: 'openai', llmApiKey: '', llmModel: '', llmBaseUrl: '',
-  llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.15,
+  llmTimeout: 150000, llmTemperature: 0.1, llmMaxTokens: 4096, repetitionPenalty: 1.2,
   llmFirstTokenTimeout: 30, llmStreamTimeout: 60,
   agentTimeout: 1800, subAgentTimeout: 600, toolTimeout: 60,
   githubToken: '', gitlabToken: '', giteaToken: '',
@@ -163,7 +163,7 @@ export function SystemConfig() {
           llmTimeout: llmConfig.llmTimeout || 150000,
           llmTemperature: llmConfig.llmTemperature ?? 0.1,
           llmMaxTokens: llmConfig.llmMaxTokens || 4096,
-          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.15,
+          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.2,
           // Agent超时配置
           llmFirstTokenTimeout: llmConfig.llmFirstTokenTimeout || 30,
           llmStreamTimeout: llmConfig.llmStreamTimeout || 60,
@@ -375,7 +375,7 @@ export function SystemConfig() {
           llmTimeout: llmConfig.llmTimeout || 150000,
           llmTemperature: llmConfig.llmTemperature ?? 0.1,
           llmMaxTokens: llmConfig.llmMaxTokens || 4096,
-          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.15,
+          repetitionPenalty: llmConfig.repetitionPenalty ?? 1.2,
           // Agent超时配置
           llmFirstTokenTimeout: llmConfig.llmFirstTokenTimeout || 30,
           llmStreamTimeout: llmConfig.llmStreamTimeout || 60,
