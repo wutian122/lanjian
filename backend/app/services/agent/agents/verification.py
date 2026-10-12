@@ -1577,7 +1577,7 @@ class VerificationAgent(BaseAgent):
                     cmd_lines = []
                     for sc in sandbox_commands[:3]:
                         input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
-                        cmd_lines.append(f"- **{sc['label']}**:\n  Action: sandbox_exec\n  Action Input: {input_json}")
+                        cmd_lines.append(f"- **{sc.get('label', 'sandbox_exec')}**:\n  Action: sandbox_exec\n  Action Input: {input_json}")
 
                     cmds_text = "\n".join(cmd_lines)
                     force_msg = (
@@ -1759,7 +1759,7 @@ class VerificationAgent(BaseAgent):
                         cmd_lines = []
                         for sc in remaining:
                             input_json = json.dumps(_sandbox_command_action_input(sc), ensure_ascii=False)
-                            cmd_lines.append(f"- **{sc['label']}**: Action: sandbox_exec, Action Input: {input_json}")
+                            cmd_lines.append(f"- **{sc.get('label', 'sandbox_exec')}**: Action: sandbox_exec, Action Input: {input_json}")
                         self._conversation_history.append({
                             "role": "user",
                             "content": (
@@ -3644,8 +3644,9 @@ class VerificationAgent(BaseAgent):
             cmd = self._gen_sandbox_command(vuln_type, file_path, line, title, i)
             # P7-4：子串/默认匹配返回 {'label':..., 'input': {'command':...}} 包装，
             # 精确命中直接返回 {'command':...}——统一 unwrap 后处理
+            # P11 热修：unwrap 时保留 label（此前丢失导致收口分支对 label 直接索引 KeyError）
             if cmd and "command" not in cmd and isinstance(cmd.get("input"), dict):
-                cmd = cmd["input"]
+                cmd = {**cmd["input"], "label": cmd.get("label", "")}
             if cmd:
                 # Opt-1: Embed finding_id as comment in the command
                 original_command = cmd.get("command", "")
