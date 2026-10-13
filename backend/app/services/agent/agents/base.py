@@ -1246,6 +1246,27 @@ class BaseAgent(ABC):
             extra_params = self._thinking_override_for(
                 getattr(self.config, "agent_type", None)
             )
+        # P11：崩坏重试差异化采样——崩坏（F1-F4 命中）后的重试请求临时注入
+        # rp 增量（+0.15×boost，封顶 +0.45），打破「同 prompt 确定性再崩」的
+        # 连续簇（P10 spike 实证 59% 崩坏聚集于此；fp8 权重漂移对相同输入复现
+        # 相同崩坏，采样扰动是唯一低成本破局手段）。请求级 extra_params 优先
+        # 于 config（adapter setdefault 语义），成功轮归零后自然恢复用户配置。
+        _boost = getattr(self, "_degenerate_retry_boost", 0)
+        if _boost > 0:
+            _base_rp = getattr(self.config, "repetition_penalty", None)
+            if _base_rp is None:
+                from app.core.config import settings
+
+                _base_rp = settings.LLM_REPETITION_PENALTY
+            extra_params = dict(extra_params or {})
+            extra_params["repetition_penalty"] = round(
+                float(_base_rp) + 0.15 * _boost, 3
+            )
+            logger.info(
+                f"[{self.name}] 崩坏重试差异化采样: "
+                f"repetition_penalty={extra_params['repetition_penalty']} "
+                f"(boost={_boost})"
+            )
         """
         统一的流式 LLM 调用方法
 
@@ -1458,6 +1479,12 @@ class BaseAgent(ABC):
                                 await self._persist_degenerate_sample(
                                     degeneracy, accumulated
                                 )
+                                # P11：崩坏后递增差异化采样档位（封顶 3），供
+                                # 下一轮重试请求注入 rp 增量；成功轮归零。
+                                self._degenerate_retry_boost = min(
+                                    getattr(self, "_degenerate_retry_boost", 0) + 1,
+                                    3,
+                                )
                                 accumulated = ""
                                 accumulated_content = ""
                                 accumulated_reasoning = ""
@@ -1560,6 +1587,10 @@ class BaseAgent(ABC):
                     fetch_task.cancel()
                 await _safe_aclose_stream(iterator)
 
+            # P11：成功轮归零差异化采样档位（崩坏轮 _last_empty_kind=="degenerate"
+            # 不归零，保持 boost 供下一轮注入；归零后自然恢复用户配置参数）。
+            if getattr(self, "_last_empty_kind", None) != "degenerate":
+                self._degenerate_retry_boost = 0
             return accumulated, total_tokens
 
         endpoint = self._llm_endpoint_key()
