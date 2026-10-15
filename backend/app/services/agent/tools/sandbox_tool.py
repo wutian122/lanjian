@@ -53,6 +53,34 @@ def _sandbox_failure(error: str, *, exit_code: Optional[int] = None) -> Dict[str
     }
 
 
+def resolve_sandbox_network_enabled(user_config: Optional[dict] = None) -> bool:
+    """P13 T3：统一沙箱联网判定（用户配置优先，env 双保险兜底）。
+
+    数据流：前端开关 → DB user_configs.other_config.sandboxNetworkEnabled →
+    （endpoint `_get_user_config`/`resolve_effective_config` 现取，不落快照）→ 本
+    helper。判定顺序（前者显式存在即胜出）：
+      1. user_config["otherConfig"]["sandboxNetworkEnabled"]（或直接传 otherConfig
+         层 dict 时的 ["sandboxNetworkEnabled"]）—— 用户显式保存值优先，False 可
+         显式关网（覆盖 env 的 double-opt-in）；
+      2. settings.SANDBOX_NETWORK_ENABLED（环境变量双保险）；
+      3. 均缺失 → False（安全侧默认关，与 kill-switch 语义一致）。
+    读不到配置时不抛异常，任何异常一律落 False（安全侧）。
+    """
+    try:
+        candidate = None
+        if isinstance(user_config, dict):
+            other = user_config.get("otherConfig")
+            if isinstance(other, dict) and other.get("sandboxNetworkEnabled") is not None:
+                candidate = other.get("sandboxNetworkEnabled")
+            elif user_config.get("sandboxNetworkEnabled") is not None:
+                candidate = user_config.get("sandboxNetworkEnabled")
+        if candidate is not None:
+            return bool(candidate)
+        return bool(getattr(settings, "SANDBOX_NETWORK_ENABLED", False))
+    except Exception:
+        return False
+
+
 @dataclass
 class SandboxConfig:
     """沙箱配置"""
@@ -64,15 +92,18 @@ class SandboxConfig:
     read_only: bool = True
     user: str = "1000:1000"
     network_enabled: bool = False  # 是否允许沙箱联网
+    # P13 T3：注入的用户级配置（前端沙箱联网开关），None 时回退环境变量。
+    user_config: Optional[dict] = None
 
     def __post_init__(self):
         if self.image is None:
             self.image = settings.SANDBOX_IMAGE
-        # 从系统配置读取联网设置
+        # P13 T3：联网判定统一走 resolve_sandbox_network_enabled（用户配置优先，
+        # env 双保险兜底），替代此前只读 settings 的硬编码口径。
         try:
-            self.network_enabled = getattr(settings, 'SANDBOX_NETWORK_ENABLED', False)
+            self.network_enabled = resolve_sandbox_network_enabled(self.user_config)
         except Exception:
-            pass
+            self.network_enabled = False
         if self.network_enabled:
             self.network_mode = "bridge"
 
@@ -745,10 +776,19 @@ class SandboxTool(AgentTool):
         "md5sum", "sha256sum", "strings",
     ]
     
-    def __init__(self, sandbox_manager: Optional[SandboxManager] = None, project_root: Optional[str] = None):
+    def __init__(
+        self,
+        sandbox_manager: Optional[SandboxManager] = None,
+        project_root: Optional[str] = None,
+        user_config: Optional[dict] = None,
+    ):
         super().__init__()
         self.sandbox_manager = sandbox_manager or SandboxManager()
         self.project_root = os.path.abspath(project_root) if project_root else None
+        # P13 T3：用户级沙箱联网配置（前端开关存 DB otherConfig）。门禁判定统一走
+        # resolve_sandbox_network_enabled；None 时回退 sandbox_manager.config 的
+        # 既有值（保持单测/旧调用方口径不变）。
+        self._user_config = user_config
     
     @property
     def name(self) -> str:
@@ -858,12 +898,17 @@ class SandboxTool(AgentTool):
             else None
         )
         needs_project_mount = self._command_needs_project_mount(command)
-        # Task 3：网络双门禁——LLM 的 network_enabled=true 仅在管理员全局开关
-        # （SANDBOX_NETWORK_ENABLED → SandboxConfig.network_enabled）开启时才给
-        # bridge，防止模型自授网络绕过 kill-switch；读不到配置时安全侧落 false。
-        network_allowed = bool(
-            getattr(getattr(self.sandbox_manager, "config", None), "network_enabled", False)
-        )
+        # Task 3 / P13 T3：网络双门禁——LLM 的 network_enabled=true 仅在管理员全局
+        # 开关开启时才给 bridge，防止模型自授网络绕过 kill-switch。P13 T3 起开关口径
+        # 统一：注入了用户配置时走 resolve_sandbox_network_enabled（DB 用户开关优先，
+        # env 兜底）；未注入时回退 sandbox_manager.config.network_enabled（旧调用方/
+        # 单测口径不变）。读不到配置时安全侧落 false。
+        if getattr(self, "_user_config", None) is not None:
+            network_allowed = resolve_sandbox_network_enabled(self._user_config)
+        else:
+            network_allowed = bool(
+                getattr(getattr(self.sandbox_manager, "config", None), "network_enabled", False)
+            )
         network_active = bool(network_enabled) and network_allowed
         network_mode = "bridge" if network_active else "none"
 

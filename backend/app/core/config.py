@@ -230,6 +230,16 @@ class Settings(BaseSettings):
     SANDBOX_NETWORK_MODE: str = "none"  # 娌欑缃戠粶妯″紡 (none, bridge)
     SANDBOX_NETWORK_ENABLED: bool = False  # 沙箱是否允许联网（默认关闭）
 
+    # fix-audit-presentation-p13 T2（P0-C 软证据兜底降阈）：
+    # _normalize_verification_outcome 软证据"中档"判定的置信度阈值。
+    # 强档（五项齐，含 verification_method）仍用原 0.75（硬编码保持不变）；
+    # 中档（code_snippet + dataflow_path + confidence>=本阈值）走降阈升级
+    # static_confirmed，note 标注"软证据（降阈）"。默认 0.6 低于原 0.75，
+    # 用于接住 confidence 落 0.6~0.74 区间的真实静态漏洞（消除"验证了却显示
+    # 未验证"错觉）；低于本阈值的"弱档"（仅 code_snippet）维持 needs_context
+    # 不升级（防滥升）。env SOFT_EVIDENCE_CONFIDENCE_THRESHOLD 可配。
+    SOFT_EVIDENCE_CONFIDENCE_THRESHOLD: float = 0.6
+
     # C2: LLM 连通性测试允许放行的内网代理主机（逗号分隔），其余回环/内网地址一律拒绝（防 SSRF）
     LLM_TEST_ALLOWED_HOSTS: str = ""
 

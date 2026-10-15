@@ -130,16 +130,31 @@ async def test_deterministic_non_network_command_stays_none_even_switch_on(
 
 
 def test_network_mode_helper_mapping(monkeypatch):
-    """network_enabled × 全局开关 真值表（兜底路径与确定性路径共用同一映射）。"""
+    """network_enabled × 沙箱联网开关 真值表（兜底路径与确定性路径共用同一映射）。
+
+    P13 T3：_network_mode_for_command 由 staticmethod 改为实例方法，开关口径走
+    self._sandbox_network_enabled（初始化时由 resolve_sandbox_network_enabled 解析）。
+    本用例保留"缺属性时回退 env"的兜底口径（__new__ 直构无属性），并用显式设置
+    属性覆盖验证新语义（用户配置优先级已在 test_p13_sandbox_network_wiring.py 覆盖）。
+    """
+    agent = VerificationAgent.__new__(VerificationAgent)
+
     monkeypatch.setattr(settings, "SANDBOX_NETWORK_ENABLED", True)
-    assert VerificationAgent._network_mode_for_command({"network_enabled": True}) == "bridge"
-    assert VerificationAgent._network_mode_for_command({"network_enabled": False}) == "none"
-    assert VerificationAgent._network_mode_for_command({}) == "none"
-    assert VerificationAgent._network_mode_for_command(None) == "none"
+    # 缺 _sandbox_network_enabled 属性 → 回退 settings（env true）
+    if hasattr(agent, "_sandbox_network_enabled"):
+        del agent._sandbox_network_enabled
+    assert agent._network_mode_for_command({"network_enabled": True}) == "bridge"
+    assert agent._network_mode_for_command({"network_enabled": False}) == "none"
+    assert agent._network_mode_for_command({}) == "none"
+    assert agent._network_mode_for_command(None) == "none"
 
     monkeypatch.setattr(settings, "SANDBOX_NETWORK_ENABLED", False)
-    assert VerificationAgent._network_mode_for_command({"network_enabled": True}) == "none"
-    assert VerificationAgent._network_mode_for_command({}) == "none"
+    assert agent._network_mode_for_command({"network_enabled": True}) == "none"
+    assert agent._network_mode_for_command({}) == "none"
+
+    # 显式属性（用户配置解析结果）覆盖 env：env false 但实例值 true → bridge
+    agent._sandbox_network_enabled = True
+    assert agent._network_mode_for_command({"network_enabled": True}) == "bridge"
 
 
 # ---------- LLM 路径（SandboxTool._execute 的 sandbox_exec） ----------

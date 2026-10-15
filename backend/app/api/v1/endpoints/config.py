@@ -203,7 +203,10 @@ def get_default_config() -> dict:
             "llmGapMs": settings.LLM_GAP_MS,
             "llmRatePerMinute": 60,
             "outputLanguage": settings.OUTPUT_LANGUAGE,
-            "sandboxNetworkEnabled": False,
+            # P13 T3：系统默认反映环境变量双保险（此前硬编码 False 致页面刷新后
+            # 开关回显断裂）；用户保存值在 resolve_effective_config 的合并中覆盖本
+            # 默认（用户优先），故不会掩盖用户显式关闭。
+            "sandboxNetworkEnabled": bool(getattr(settings, "SANDBOX_NETWORK_ENABLED", False)),
         }
     }
 
@@ -329,6 +332,18 @@ async def update_my_config(
     llm_data = config_in.llmConfig.dict(exclude_none=True) if config_in.llmConfig else {}
     other_data = config_in.otherConfig.dict(exclude_none=True) if config_in.otherConfig else {}
 
+    # P13 终审 Critical 修复（方案 a）：sandboxNetworkEnabled 是安全策略键
+    # （沙箱联网 kill-switch），仅超级管理员（系统级配置来源）可写——非超管
+    # 请求中该键剔除（防任意登录用户越权开网；PUT 层根治后用户层不可能有
+    # 该键，resolve_effective_config 合并值自然只来自系统层/环境默认）。
+    # P13 终审 Critical 修复（方案 a）：sandboxNetworkEnabled 是安全策略键
+    # （沙箱联网 kill-switch），仅超级管理员（系统级配置来源）可写——非超管
+    # 请求中该键剔除（防任意登录用户越权开网；PUT 层根治后用户层不可能有
+    # 该键，resolve_effective_config 合并值自然只来自系统层/环境默认）。
+    _is_superuser = bool(getattr(current_user, "is_superuser", False))
+    if not _is_superuser:
+        other_data.pop("sandboxNetworkEnabled", None)
+
     # 问题二：空敏感字段不覆盖已存密钥（前端未修改密钥时回传空串）
     llm_data = strip_empty_sensitive(llm_data, SENSITIVE_LLM_FIELDS)
     other_data = strip_empty_sensitive(other_data, SENSITIVE_OTHER_FIELDS)
@@ -362,6 +377,9 @@ async def update_my_config(
             existing_other = json.loads(config.other_config) if config.other_config else {}
             # 先解密现有数据，再合并新数据，最后加密
             existing_other = decrypt_config(existing_other, SENSITIVE_OTHER_FIELDS)
+            # P13 方案 a：非超管更新时清除历史残留的沙箱联网键（防越权残留）
+            if not _is_superuser:
+                existing_other.pop("sandboxNetworkEnabled", None)
             existing_other.update(other_data)  # 使用未加密的新数据合并
             config.other_config = json.dumps(encrypt_config(existing_other, SENSITIVE_OTHER_FIELDS))
 

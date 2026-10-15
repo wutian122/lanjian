@@ -251,6 +251,41 @@ VULN_EVIDENCE_MARKERS = (
 
 LANGUAGE_TEST_TOOL_NAMES = {"python_test", "php_test", "javascript_test", "java_test", "go_test", "ruby_test", "shell_test", "bash_test"}
 
+# P13 T1（验证呈现口径根治 · P0-A）：模板静态确认标记识别集。
+# 确定性 PoC 模板实际产出的静态确认标记不止 VULNERABILITY_ 前缀两式——
+# SSRF 降级 / insecure_cookie / expression_injection / 通用模板打印**裸**
+# `STATIC_CONFIRMED` 及带 `:<detail>` 后缀变体；此前状态引擎只认
+# VULNERABILITY_CONFIRMED(STATIC)/VULNERABILITY_STATIC_ONLY，裸标记被丢弃 →
+# 静态确认证据空转 not_reproducible（"验证了却显示未验证"）。统一归一化识别，
+# 大小写/后缀容忍（obs 已转小写）。反伪造：紧随 false_positive 否定语义的
+# 标记不算静态确认（与 P7-1 标记+语义双条件一致）。
+_STATIC_EVIDENCE_MARKERS = (
+    "vulnerability_confirmed(static)",
+    "vulnerability_static_only",
+    # 裸 STATIC_CONFIRMED（可带 ":<detail>" 后缀，如 SSRF 降级分支）
+    "static_confirmed",
+)
+_STATIC_EVIDENCE_NEGATION_MARKERS = ("false_positive", "false positive")
+
+
+def _is_static_confirmation_output(obs_lower: str) -> bool:
+    """P13 T1：判定（已转小写的）PoC 输出是否含静态确认证据标记。
+
+    前缀匹配兼容裸 `STATIC_CONFIRMED` 及 `STATIC_CONFIRMED:<detail>` 变体；
+    命中标记后短窗内出现 false_positive 否定语义时不计（标记+语义双条件）。
+    """
+    if not obs_lower:
+        return False
+    for marker in _STATIC_EVIDENCE_MARKERS:
+        idx = obs_lower.find(marker)
+        while idx != -1:
+            tail = obs_lower[idx + len(marker): idx + len(marker) + 60]
+            if not any(neg in tail for neg in _STATIC_EVIDENCE_NEGATION_MARKERS):
+                return True
+            idx = obs_lower.find(marker, idx + 1)
+    return False
+
+
 # Task 1（Phase 1 基础设施语义修复）：沙箱基础设施故障签名——小写匹配。
 # 命中即视为沙箱环境自身故障（不是漏洞/PoC 问题），不冒充"漏洞未复现"。
 # docker/宿主机层专有签名：容器内 PoC 不可能产出（镜像拉取/挂载/daemon 缺席发生在
@@ -993,6 +1028,7 @@ class VerificationAgent(BaseAgent):
         event_emitter=None,
         task_id: Optional[str] = None,
         llm_rate_per_minute: Optional[int] = None,
+        user_config: Optional[Dict[str, Any]] = None,
     ):
         # 组合增强的系统提示词
         # 🔥 v3.1: 使用 build_enhanced_prompt 注入防幻觉规则和文件验证
@@ -1026,6 +1062,11 @@ class VerificationAgent(BaseAgent):
         
         self._conversation_history: List[Dict[str, str]] = []
         self._steps: List[VerificationStep] = []
+        # P13 T3：沙箱联网开关统一口径。任务启动时用户配置现取（与 llmConfig 的
+        # _get_user_config 现取模式一致，无快照旁路），解析后固定在本实例生命周期内
+        # 复用（运行期不重读，避免同一任务内多读点漂移）。None → 回退 env 双保险。
+        from app.services.agent.tools.sandbox_tool import resolve_sandbox_network_enabled
+        self._sandbox_network_enabled = resolve_sandbox_network_enabled(user_config)
 
 
 
@@ -2326,18 +2367,22 @@ class VerificationAgent(BaseAgent):
         # 动态确认）同属静态证据档——此前该标记零消费点，secret/deserialization/
         # xss-sink-only 的确定性 PoC 输出空转 not_reproducible（design 第 3 节：
         # "统一走既有 static_evidence 识别，终态上限 static_confirmed"）。
-        static_evidence = (
-            "vulnerability_confirmed(static)" in obs_lower
-            or "vulnerability_static_only" in obs_lower
-        )
+        # P13 T1：识别集扩展为覆盖模板真实产出的裸标记（STATIC_CONFIRMED 及其
+        # `:<detail>` 变体）——见 _is_static_confirmation_output。
+        static_evidence = _is_static_confirmation_output(obs_lower)
         has_vuln_evidence = (
             not static_evidence
             and any(marker.lower() in obs_lower for marker in VULN_EVIDENCE_MARKERS)
         )
         # R3 反伪造：源码缺失/模拟输出 + 声称确认 → 证据不可信
         # （真实读取源码并打印确认标记的 attempt 不受影响）
-        fabricated = has_vuln_evidence and any(
-            marker.lower() in obs_lower for marker in FABRICATION_MARKERS
+        # P13 终审 Important #2：与 static_evidence 解耦——此前 fabricated 依赖
+        # has_vuln_evidence（其定义排除 static_evidence），「Simulated +
+        # STATIC_CONFIRMED」可逃逸伪造检测并被升级（洗白路径）。修复：任意
+        # 确认类标记（动态铁证或静态确认）与伪造标记共现即判伪造。
+        fabricated = (
+            (has_vuln_evidence or static_evidence)
+            and any(marker.lower() in obs_lower for marker in FABRICATION_MARKERS)
         )
         # success = exit_code==0 AND (有漏洞证据 OR 没有失败标记且有输出)
         has_output = len(obs_lower.strip()) >= 50  # 有实质性输出（>=50 字符，避免边界值误判）
@@ -3143,19 +3188,48 @@ class VerificationAgent(BaseAgent):
                 "path_traversal", "command_injection", "sql_injection",
             }
             vuln_type = (finding.get("vulnerability_type") or "").lower()
-            has_soft_evidence = (
-                vuln_type in VULN_TYPES_SOFT_EVIDENCE
-                and bool(finding.get("dataflow_path"))
-                and bool(finding.get("code_snippet"))
-                and (_to_float(finding.get("ai_confidence")) or 0) >= 0.75
+            _soft_conf = _to_float(finding.get("ai_confidence")) or 0
+            _has_snippet = bool(finding.get("code_snippet"))
+            _has_dataflow = bool(finding.get("dataflow_path"))
+            _type_ok = vuln_type in VULN_TYPES_SOFT_EVIDENCE
+            # P13 T2（P0-C 软证据兜底降阈）：阈值入 config（默认 0.6，低于原 0.75）。
+            # getattr 兜底防旧配置对象缺字段（单测直构 Settings/子类时稳健）。
+            _soft_threshold = float(
+                getattr(settings, "SOFT_EVIDENCE_CONFIDENCE_THRESHOLD", 0.6)
+            )
+            # 强档（保持现行为）：五项齐（类型白名单 + dataflow + snippet +
+            # 0.75 硬阈值 + verification_method）→ static_confirmed。
+            strong_soft_evidence = (
+                _type_ok
+                and _has_dataflow
+                and _has_snippet
+                and _soft_conf >= 0.75
                 and bool(finding.get("verification_method"))
             )
-            if has_soft_evidence:
+            # 中档（P13 T2 新增，降阈）：类型白名单 + code_snippet 非空 +
+            # dataflow_path 非空 + confidence >= 可配阈值（默认 0.6）
+            # → static_confirmed + note 标注降阈。不提 verification_method
+            # 要求：接住 confidence 落 0.6~0.74 的真实静态漏洞（放宽与洗白
+            # 防护正交——上方前置 real_non_infra_attempts + 无 poc_error 仍强制）。
+            # P13 终审 Important #3：类型白名单与强档同口径保留（此前中档
+            # 取消白名单属契约外滥升面——非白名单类型只要 snippet+dataflow
+            # +阈值即升，已收口）。
+            mid_soft_evidence = (
+                not strong_soft_evidence
+                and _type_ok
+                and _has_snippet
+                and _has_dataflow
+                and _soft_conf >= _soft_threshold
+            )
+            # 弱档：仅 code_snippet + confidence>=阈值（缺 dataflow_path）→ 不升级，
+            # 维持 needs_context/not_reproducible（防滥升）。
+            if strong_soft_evidence or mid_soft_evidence:
                 status = VerificationStatus.STATIC_CONFIRMED
                 is_verified = True
-                finding["verification_note"] = (
-                    "沙箱环境限制无法动态复现，通过代码推理链路静态确认为真实漏洞"
-                )
+                _soft_note = "沙箱环境限制无法动态复现，通过代码推理链路静态确认为真实漏洞"
+                if mid_soft_evidence:
+                    _soft_note += "（软证据（降阈））"
+                finding["verification_note"] = _soft_note
                 finding["verification_method"] = (
                     finding.get("verification_method", "static_reasoning")
                     + " (沙箱受限，代码推理链确认)"
@@ -3172,6 +3246,29 @@ class VerificationAgent(BaseAgent):
                 str(finding.get("verification_note") or "")
                 + " 顺序归并证据，请人工复核"
             ).strip()
+
+        # P13 T1-3（网络类呈现口径）：SSRF 等网络类 finding 在「沙箱无网且未真实
+        # 外联」时静态确认——verification_note 明确写「静态确认（沙箱无网不可动态
+        # 复现）」，消除"验证了却显示未验证"的错觉。降级判据取 PoC 实际产出：
+        # 未真实联网/bridge unavailable（沙箱无网降级分支标记）。
+        if status == VerificationStatus.STATIC_CONFIRMED:
+            _vuln_type = str(finding.get("vulnerability_type") or "").lower()
+            _network_types = {"ssrf", "open_redirect", "ssrf_blind"}
+            if _vuln_type in _network_types:
+                _evidence_blob = " ".join(
+                    str(a.get("evidence_summary") or "")
+                    for a in (finding.get("sandbox_attempts") or [])
+                    if isinstance(a, dict)
+                )
+                _degraded_offline = (
+                    "未真实联网" in _evidence_blob
+                    or "bridge unavailable" in _evidence_blob.lower()
+                )
+                if _degraded_offline:
+                    finding["verification_note"] = (
+                        str(finding.get("verification_note") or "")
+                        + " 静态确认（沙箱无网不可动态复现）"
+                    ).strip()
 
         normalized = dict(finding)
         normalized["verification_status"] = status
@@ -3471,18 +3568,24 @@ class VerificationAgent(BaseAgent):
                 return tool.sandbox_manager
         return None
 
-    @staticmethod
-    def _network_mode_for_command(cmd_input: Optional[Dict[str, Any]]) -> str:
-        """确定性 PoC 的网络模式映射（Task 3）。
+    def _network_mode_for_command(self, cmd_input: Optional[Dict[str, Any]]) -> str:
+        """确定性 PoC 的网络模式映射（Task 3 / P13 T3）。
 
         模板显式请求网络（network_enabled=True，如 SSRF metadata 探测）**且**
-        全局沙箱联网开关（SANDBOX_NETWORK_ENABLED，环境变量配置）开启时才给
-        "bridge"；其余一律显式 "none"。
+        沙箱联网开关开启时才给 "bridge"；其余一律显式 "none"。
+
+        P13 T3：开关口径不再只读环境变量——本实例初始化时已用
+        resolve_sandbox_network_enabled(user_config) 解析出
+        self._sandbox_network_enabled（DB 用户开关优先、env 双保险兜底）。缺属性
+        （如 __new__ 直构的单测）保守回退 settings 值。
 
         必须显式传值：execute_with_files 的 network_mode 形参虽默认 "none"，
         但传 None 会透传到 Docker SDK 并被当作"默认网络"（bridge）处理，反而开网。
         """
-        if (cmd_input or {}).get("network_enabled") and settings.SANDBOX_NETWORK_ENABLED:
+        _enabled = getattr(
+            self, "_sandbox_network_enabled", bool(getattr(settings, "SANDBOX_NETWORK_ENABLED", False))
+        )
+        if (cmd_input or {}).get("network_enabled") and _enabled:
             return "bridge"
         return "none"
 

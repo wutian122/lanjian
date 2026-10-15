@@ -1165,6 +1165,7 @@ async def _execute_agent_task(task_id: str, resume_checkpoint_id: str | None = N
                 event_emitter=event_emitter,
                 task_id=task_id,
                 llm_rate_per_minute=task_rpm,
+                user_config=user_config,  # P13 T3：沙箱联网开关走用户配置现取口径
             )
 
             await event_emitter.emit_info("AI agents ready", metadata={"init_step": "Preparing agents", "init_status": "done"})
@@ -1931,7 +1932,7 @@ async def _initialize_tools(
         # 修复沙箱验证空目录 bug：SandboxTool 必须传 project_root，否则 execute_tool_command
         # 里 effective_workdir=None，永远走 execute_command 不挂载分支，
         # 导致沙箱 /workspace/src 为空，Verification Agent 找不到项目文件，验证全部失败。
-        "sandbox_exec": SandboxTool(sandbox_manager, project_root=project_root),
+        "sandbox_exec": SandboxTool(sandbox_manager, project_root=project_root, user_config=user_config),
         "sandbox_http": SandboxHttpTool(sandbox_manager),
         "sandbox_browser": SandboxBrowserTool(sandbox_manager),  # Q2: 浏览器验证
         "verify_vulnerability": VulnerabilityVerifyTool(sandbox_manager),
@@ -3592,10 +3593,23 @@ async def reverify_finding(
     executable_poc = replay_command or poc_code
 
     from app.core.config import settings
-    from app.services.agent.tools.sandbox_tool import SandboxConfig, SandboxManager
+    from app.services.agent.tools.sandbox_tool import (
+        SandboxConfig,
+        SandboxManager,
+        resolve_sandbox_network_enabled,
+    )
 
-    network_enabled = bool(getattr(settings, "SANDBOX_NETWORK_ENABLED", False))
-    manager = SandboxManager(config=SandboxConfig(network_mode="bridge" if network_enabled else "none"))
+    # P13 T3：重跑端点与验证引擎同口径——用户配置（DB otherConfig.sandboxNetworkEnabled
+    # 现取）优先，env 双保险兜底；不再只读 settings。task.created_by 缺失（旧构造/
+    # 单测替身）时 getattr 兜底为 None → helper 回退 env，行为等同旧口径。
+    _user_config = await _get_user_config(db, getattr(task, "created_by", None))
+    network_enabled = resolve_sandbox_network_enabled(_user_config)
+    manager = SandboxManager(
+        config=SandboxConfig(
+            network_mode="bridge" if network_enabled else "none",
+            user_config=_user_config,
+        )
+    )
     await manager.initialize()
     if not manager.is_available:
         raise HTTPException(status_code=503, detail="沙箱环境不可用")
