@@ -341,16 +341,29 @@ async def test_analysis_tools_injected_and_submit_findings_finalizes(monkeypatch
     """能力 tools=True → 每轮携带 submit_findings 定义；tool_calls 响应即 Final Answer。
 
     本轮正文为空（tool_calls 形态正常表现）：不得误判空响应；findings 直接来自
-    arguments（不经 json-repair）；首轮即可交卷（"禁止无工具直接 Final"仅为提示词
-    约束，submit_findings 本身就是工具调用，无代码门禁会误拦）。
+    arguments（不经 json-repair）。
+
+    P12 Wave1.1 变更：交卷门禁生效——submit_findings（文本桥接/tool_calls 两路
+    同口径）在 0 个成功工具 step 时被拒绝并注入 Final Answer 引导（防首轮裸
+    交卷幻觉）。本用例更新为「首轮被拦 → 一次成功工具 → 第二轮交卷成功」。
     """
     caps = BackendCapabilities(tools=True, guided_json=False)
     agent = _make_analysis(monkeypatch, caps)
     emitter = agent.event_emitter
     seen = _install_stream(monkeypatch, agent, [
+        # 首轮：直接 tool_calls 交卷（0 成功工具）→ 交卷门禁拦截并引导
+        {"tool_calls": [_tool_call("submit_findings", json.dumps(ANALYSIS_PAYLOAD, ensure_ascii=False))],
+         "output": ""},
+        # 第二轮：read_file 文本工具 → 成功工具 step 建立
+        {"output": 'Thought: 读文件\nAction: read_file\nAction Input: {"file_path": "src/sql_vuln.py"}'},
+        # 第三轮：再次 tool_calls 交卷 → 门禁放行
         {"tool_calls": [_tool_call("submit_findings", json.dumps(ANALYSIS_PAYLOAD, ensure_ascii=False))],
          "output": ""},
     ])
+    monkeypatch.setattr(
+        agent, "execute_tool",
+        AsyncMock(return_value="cursor.execute(query)  # 真实源码"),
+    )
 
     # json-repair 间谍：tool_calls 路径不得调用 AgentJsonParser.parse
     from app.services.agent.agents import analysis as analysis_mod
@@ -375,10 +388,15 @@ async def test_analysis_tools_injected_and_submit_findings_finalizes(monkeypatch
     assert len(findings) == 1, f"findings 应直接来自 arguments: {findings}"
     assert findings[0]["title"] == "SQL 注入漏洞"
     assert findings[0]["file_path"] == "src/sql_vuln.py"
-    assert parse_calls == [], "tool_calls submit_findings 路径不得走 json-repair 文本解析"
+    assert all("sql_vuln" not in c or "findings" not in c for c in parse_calls), (
+        "tool_calls submit_findings 路径不得走 json-repair 文本解析"
+        f"（parse_calls 只应含文本轮的普通工具参数）: {parse_calls}"
+    )
 
-    # 首轮即终态：证明无"先 Action 后 Final"代码门禁误拦工具形态
-    assert result.iterations == 1
+    # P12 Wave1.1：首轮交卷被门禁拦截（0 成功工具），第三轮（已有 read_file）放行
+    assert result.iterations == 3, (
+        f"交卷门禁应拦首轮（iterations=3：交卷→读码→交卷），实际 {result.iterations}"
+    )
 
     # 事件流等价：完成决策 + 完成事件照常发射
     events = _emitted(emitter)

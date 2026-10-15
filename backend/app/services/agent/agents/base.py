@@ -405,6 +405,11 @@ class BaseAgent(ABC):
         # orchestrator 轮置位），收口段据此跳过 force verification 补发
         self._orderly_stopped = False
 
+        # P11/P12：崩坏重试差异化采样档位（正向 boost；P12 F4 反向档独立
+        # 计数 _f4_negative_streak，成功轮/跨调度归零）
+        self._degenerate_retry_boost = 0
+        self._f4_negative_streak = 0
+
         # 获取超时配置
         self._timeout_config = self._get_timeout_config()
         
@@ -1252,20 +1257,23 @@ class BaseAgent(ABC):
         # 相同崩坏，采样扰动是唯一低成本破局手段）。请求级 extra_params 优先
         # 于 config（adapter setdefault 语义），成功轮归零后自然恢复用户配置。
         _boost = getattr(self, "_degenerate_retry_boost", 0)
-        if _boost > 0:
+        _f4neg = getattr(self, "_f4_negative_streak", 0)
+        if _boost or _f4neg:
             _base_rp = getattr(self.config, "repetition_penalty", None)
             if _base_rp is None:
                 from app.core.config import settings
 
                 _base_rp = settings.LLM_REPETITION_PENALTY
             extra_params = dict(extra_params or {})
+            # P12 Wave3：F4 反向档（-0.05×streak）优先于正向 boost
+            _delta = -0.05 * _f4neg if _f4neg else 0.15 * _boost
             extra_params["repetition_penalty"] = round(
-                float(_base_rp) + 0.15 * _boost, 3
+                float(_base_rp) + _delta, 3
             )
             logger.info(
                 f"[{self.name}] 崩坏重试差异化采样: "
                 f"repetition_penalty={extra_params['repetition_penalty']} "
-                f"(boost={_boost})"
+                f"(boost={_boost}, f4_streak={_f4neg})"
             )
         """
         统一的流式 LLM 调用方法
@@ -1479,12 +1487,50 @@ class BaseAgent(ABC):
                                 await self._persist_degenerate_sample(
                                     degeneracy, accumulated
                                 )
+                                # P12 Wave1.3（降级语义）：交卷标记轮整轮丢弃 +
+                                # 计数留痕（salvage 管线按 spike 闸门降级不启用；
+                                # 铁律不变——崩坏原文不进 SSE/前端/报告）。
+                                if self._has_submit_marker(accumulated):
+                                    self._degenerate_submit_marker_dropped = (
+                                        getattr(
+                                            self,
+                                            "_degenerate_submit_marker_dropped",
+                                            0,
+                                        ) + 1
+                                    )
+                                    logger.warning(
+                                        f"[{self.name}] 崩坏轮含交卷协议标记，整轮"
+                                        f"丢弃（salvage 降级不启用；累计 "
+                                        f"{self._degenerate_submit_marker_dropped} 次）"
+                                    )
+                                # P12 Wave3：崩坏浪费核账——est. token 累计
+                                # （_persist_degenerate_sample 已算 est；此处
+                                # 独立累加供 orchestrator 收口写 observations）。
+                                try:
+                                    _est = self._estimate_token_count(accumulated)
+                                    self._degenerate_waste_est = (
+                                        getattr(self, "_degenerate_waste_est", 0) + _est
+                                    )
+                                except Exception:
+                                    pass
                                 # P11：崩坏后递增差异化采样档位（封顶 3），供
                                 # 下一轮重试请求注入 rp 增量；成功轮归零。
-                                self._degenerate_retry_boost = min(
-                                    getattr(self, "_degenerate_retry_boost", 0) + 1,
-                                    3,
-                                )
+                                # P12 Wave3（裁决⑩）：F4 标点漂移的高 rp 反向
+                                # 激励修正——开关开启时 F4 走负向档（-0.05×
+                                # streak），默认关（灰度）。
+                                from app.core.config import settings as _settings
+
+                                if degeneracy == "F4" and getattr(
+                                    _settings, "LLM_DEGENERATE_F4_REVERSE_BOOST", False
+                                ):
+                                    self._f4_negative_streak = min(
+                                        getattr(self, "_f4_negative_streak", 0) + 1, 3
+                                    )
+                                else:
+                                    self._degenerate_retry_boost = min(
+                                        getattr(self, "_degenerate_retry_boost", 0) + 1,
+                                        3,
+                                    )
                                 accumulated = ""
                                 accumulated_content = ""
                                 accumulated_reasoning = ""
@@ -1589,8 +1635,10 @@ class BaseAgent(ABC):
 
             # P11：成功轮归零差异化采样档位（崩坏轮 _last_empty_kind=="degenerate"
             # 不归零，保持 boost 供下一轮注入；归零后自然恢复用户配置参数）。
+            # P12 Wave3：F4 反向档（_f4_negative_streak）同步归零。
             if getattr(self, "_last_empty_kind", None) != "degenerate":
                 self._degenerate_retry_boost = 0
+                self._f4_negative_streak = 0
             return accumulated, total_tokens
 
         endpoint = self._llm_endpoint_key()
@@ -2318,6 +2366,16 @@ class BaseAgent(ABC):
             and bool(self._has_garbled_wall(llm_output or ""))
         )
 
+    # P12 Wave1.3（降级语义）：交卷协议标记检测——spike 实测 salvage 良率
+    # 不达标（三字段齐备 0%），按裁决④降级为「只纠正不抢救」：含交卷标记的
+    # 崩坏轮整轮丢弃（铁律不变），仅计数留痕供观测区分普通崩坏轮。
+    _SUBMIT_MARKER_RE = re.compile(
+        r"Action:\s*submit_findings|Final Answer:\s*\{|\"findings\"\s*:"
+    )
+
+    def _has_submit_marker(self, text: str) -> bool:
+        return bool(self._SUBMIT_MARKER_RE.search(text or ""))
+
     def _detect_output_degeneracy(self, text: str) -> Optional[str]:
         """检测生成文本的崩坏萌芽特征，命中即丢弃本轮静默重试。
 
@@ -2647,6 +2705,18 @@ class BaseAgent(ABC):
         tool = self.tools.get(tool_name)
 
         if not tool:
+            # P12 Wave1.1：submit_findings 是终态交卷语义而非日常工具——文本
+            # 协议降级时（能力探测 tools=true 但函数调用不稳定）模型会以
+            # `Action: submit_findings` 文本形态提交，此处返回定向引导改用
+            # Final Answer 文本协议，而非泛化「可用工具」清单（8a3a713f
+            # seq3419 实证：泛化清单让模型在两种协议间反复撞墙）。
+            if tool_name == "submit_findings":
+                return (
+                    "提示: submit_findings 为终态提交动作，请改用文本协议交卷——"
+                    '输出 `Final Answer: {"findings": [...], "summary": "..."}`'
+                    "（findings 为候选数组，低置信候选 confidence 0.1-0.7 并设 "
+                    "needs_verification=true）。"
+                )
             return f"错误: 工具 '{tool_name}' 不存在。可用工具: {list(self.tools.keys())}"
 
         import time

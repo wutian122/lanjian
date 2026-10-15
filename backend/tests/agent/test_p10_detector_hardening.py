@@ -253,12 +253,13 @@ class TestThrottleNamedConstant:
 
 
 class TestNoStaleRp115Fallback:
-    """d 1.15 过期清理防回潮：真基线 settings.LLM_REPETITION_PENALTY=1.2。"""
+    """d 1.15 过期清理防回潮：真基线 settings.LLM_REPETITION_PENALTY=1.1
+    （P12 裁决⑩：与生产实测基线统一，1.2 臂格式错误 40 次）。"""
 
-    def test_settings_default_is_1_2(self):
+    def test_settings_default_is_1_1(self):
         from app.core.config import settings
 
-        assert float(settings.LLM_REPETITION_PENALTY) == 1.2
+        assert float(settings.LLM_REPETITION_PENALTY) == 1.1
 
     @pytest.mark.parametrize(
         "relpath",
@@ -276,7 +277,7 @@ class TestNoStaleRp115Fallback:
         content = (backend_root / relpath).read_text(encoding="utf-8")
         assert "1.15" not in content, f"{relpath} 残留过期默认 1.15"
 
-    def test_frontend_fallback_aligned_to_1_2(self):
+    def test_frontend_fallback_aligned_to_1_1(self):
         # base.py → backend=parents[4]、仓库根=parents[5]
         repo_root = Path(base_module.__file__).parents[5]
         target = (
@@ -285,4 +286,4 @@ class TestNoStaleRp115Fallback:
         )
         content = target.read_text(encoding="utf-8")
         assert "1.15" not in content, "前端兜底残留过期默认 1.15"
-        assert "1.2" in content
+        assert "?? 1.1" in content, "前端兜底须与 P12 裁决⑩基线 1.1 对齐"

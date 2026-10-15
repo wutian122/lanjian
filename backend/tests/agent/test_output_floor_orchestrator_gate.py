@@ -101,19 +101,23 @@ async def test_semgrep_fallback_persists_candidates_on_zero_output():
 
 @pytest.mark.asyncio
 async def test_fallback_dedupes_by_file_path_and_rule_id():
-    """去重键 file_path+rule_id：同文件同规则不同行的 semgrep 记录只落 1 条候选。"""
+    """去重键 file_path+rule_id+line_start（P12 Wave2.3：同规则多行不塌缩；
+    8a3a713f 实证 changes.xml 同规则 10 行被旧两键折叠为 1 条）。"""
     agent = _make_orch()
     agent._semgrep_findings = [
         _semgrep_finding(path="app/db.py", line=42, rule="p.sql-injection", message="SQL injection via query"),
         _semgrep_finding(path="app/db.py", line=88, rule="p.sql-injection", message="SQL injection via query"),
-        _semgrep_finding(path="app/db.py", line=42, rule="p.xss", message="XSS sink in template"),
+        _semgrep_finding(path="app/db.py", line=100, rule="p.xss", message="XSS sink in template"),
+        # 完全重复（同文件同规则同行）仍去重
+        _semgrep_finding(path="app/db.py", line=100, rule="p.xss", message="XSS sink in template"),
     ]
 
     added = await agent._apply_semgrep_fallback()
 
-    assert added == 2
-    titles = {f["title"] for f in agent._all_findings}
-    assert len(titles) == 2
+    assert added == 3, "同文件同规则不同行逐行成候选；完全重复才去重"
+    # title 同 message 时按 file:line 区分（SQL 42/88 行 + XSS 100 行）
+    locations = {(f.get("file_path"), f.get("line_start")) for f in agent._all_findings}
+    assert {("app/db.py", 42), ("app/db.py", 88), ("app/db.py", 100)} == locations
 
 
 @pytest.mark.asyncio

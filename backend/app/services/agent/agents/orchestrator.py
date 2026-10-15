@@ -1017,16 +1017,19 @@ class OrchestratorAgent(BaseAgent):
 
         预扫存储格式见 _run_semgrep_prescan：title 存 check_id（规则 ID），
         description 存规则 message，severity/vulnerability_type 已映射。
-        去重键 file_path + rule_id（spec：同文件同规则只落一条候选）。
+        去重键 file_path + rule_id + line_start（P12 Wave2.3：同规则多行
+        命中不得折叠为一条——8a3a713f 实证 changes.xml 10 行被 file+rule
+        两键塌缩成 1 条；行号对齐后逐行成候选，再由 F1 白名单/幻觉过滤把关）。
         """
         candidates: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, int]] = set()
         for sf in self._semgrep_findings or []:
             if not isinstance(sf, dict):
                 continue
             file_path = sf.get("file_path", "") or ""
             rule_id = str(sf.get("semgrep_rule_id") or sf.get("check_id") or sf.get("title", "") or "")
-            key = (file_path, rule_id)
+            line_key = int(sf.get("line_start") or 0)
+            key = (file_path, rule_id, line_key)
             if key in seen:
                 continue
             seen.add(key)
@@ -1186,18 +1189,34 @@ class OrchestratorAgent(BaseAgent):
             return 0
 
     def _ingest_analysis_floor_signal(self, data: Any) -> None:
-        """Task 11: 读取 Analysis 强制总结的产出下限信号（Task 10 data 字段）。
+        """Task 11 + P12 Wave3：读取 Analysis 强制总结的产出下限信号。
 
         output_floor_violated=true 粘滞置位（任一轮强制总结 0 候选 0 豁免即
-        留证）；收口判定在 max_dispatch/finish 处结合"最终是否仍 0 可验证产出"。
+        留证）；P12 Wave3 起改为**按批次可撤销**——后批合规（violated=False
+        且给出候选或有效维度豁免）必须清掉前批粘滞，否则 8a3a713f 形态重现：
+        批 2 崩坏违规、批 3 合规豁免，守卫仍以批 2 粘滞误伤收口（连续违规
+        批次保持置位，见 F4 控制组）。
         """
-        if isinstance(data, dict) and data.get("output_floor_violated"):
+        if not isinstance(data, dict):
+            return
+        if data.get("output_floor_violated"):
             if not self._output_floor_violated:
                 logger.warning(
                     "[Orchestrator] Analysis output floor violated: forced summary "
                     "produced 0 candidates and 0 exemptions"
                 )
             self._output_floor_violated = True
+            return
+        # P12 Wave3：合规批次（候选非空或维度豁免非空）撤销前批粘滞位
+        gaps = data.get("dimension_gaps_reported") or {}
+        findings = data.get("findings") or []
+        if findings or gaps:
+            if self._output_floor_violated:
+                logger.info(
+                    "[Orchestrator] 合规 Analysis 批次（候选/豁免在场）"
+                    "撤销前批 floor 粘滞位"
+                )
+            self._output_floor_violated = False
 
     def _apply_output_floor_closeout(self) -> bool:
         """Task 11: 产出下限违规且兜底后仍 0 可验证产出 → 覆盖不足语义收口。
@@ -1234,6 +1253,58 @@ class OrchestratorAgent(BaseAgent):
             "closing with coverage gaps (completed_with_gaps)"
         )
         return True
+
+    async def _unified_closeout(self) -> None:
+        """P12 Wave2：统一收口钩子（任何收口路径都不销毁证据）。
+
+        收敛三件幂等收口动作，整体 best-effort（绝不抛错破坏主流程）：
+        1. semgrep_leads 静态线索 gate 留痕（_register_semgrep_leads_observation
+           自带一次性标志，原仅 finish:2175 可达）；
+        2. Semgrep 兜底落库（_apply_semgrep_fallback，幂等）；
+        3. 产出下限收口（_apply_output_floor_closeout，幂等）。
+        正常 finish / deadline 早返 / error 早返 / 外层 except 四路径共用；
+        重复调用安全（三函数各自幂等）。
+        """
+        try:
+            self._register_semgrep_leads_observation()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Unified closeout: leads register failed (non-fatal): {e}")
+        try:
+            await self._apply_semgrep_fallback()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Unified closeout: semgrep fallback failed (non-fatal): {e}")
+        try:
+            self._apply_output_floor_closeout()
+        except Exception as e:
+            logger.warning(f"[Orchestrator] Unified closeout: floor closeout failed (non-fatal): {e}")
+        # P12 Wave3：崩坏浪费核账入 observations（子 Agent 累计 est. token）
+        try:
+            waste = 0
+            for _ag in (self.sub_agents or {}).values():
+                waste += int(getattr(_ag, "_degenerate_waste_est", 0) or 0)
+            self._aggr_degenerate_waste_est = waste
+            if waste and not any(
+                o.get("gate") == "degenerate_waste" for o in self._gate_observations
+            ):
+                self._record_gate_observation(
+                    "degenerate_waste",
+                    f"本轮编排崩坏丢弃的正文估算 {waste} tokens（本地口径，"
+                    "非端点计费值；P10 采集钩子样本含逐次明细）",
+                )
+        except Exception as e:
+            logger.debug(f"[Orchestrator] degenerate waste accounting failed: {e}")
+
+    def _closeout_steps_skeleton(self) -> list:
+        """P12 Wave2：收口返回体 steps 骨架（失败路径复用）。"""
+        return [
+            {
+                "thought": s.thought,
+                "action": s.action,
+                "action_input": s.action_input,
+                "observation": s.observation[:500] if s.observation else None,
+            }
+            for s in self._steps
+        ]
 
     async def _finalize_output_floor_gate(self) -> None:
         """Task 11（修复轮 1 I2）：轮次耗尽收尾路径的兜底/收口统一入口。
@@ -2176,7 +2247,10 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     # Task 11 (finding-output-floor): finish 前兜底——Analysis 达调度
                     # 上限或产出下限违规时，Semgrep 预扫发现兜底落库（幂等）；仍无
                     # 可验证产出则按覆盖不足语义收口（completed_with_gaps）。
-                    if self._dispatched_tasks.get("analysis", 0) >= 3 or self._output_floor_violated:
+                    from app.core.config import settings as _finish_settings
+
+                    _max_dispatch = int(getattr(_finish_settings, "LLM_MAX_DISPATCH_PER_AGENT", 3))
+                    if self._dispatched_tasks.get("analysis", 0) >= _max_dispatch or self._output_floor_violated:
                         try:
                             await self._apply_semgrep_fallback()
                         except Exception as e:
@@ -2581,6 +2655,11 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                         f"[{self.name}] Task budget exhausted, graceful wrap-up: "
                         f"{len(self._all_findings)} findings, {self._dispatch_failures} dispatch failures"
                     )
+                    # P12 Wave2：deadline 早返还统一收口（semgrep_leads/兜底/floor）
+                    try:
+                        await self._unified_closeout()
+                    except Exception as e:
+                        logger.warning(f"[Orchestrator] deadline unified closeout failed (non-fatal): {e}")
                     return AgentResult(
                         success=True,
                         data={
@@ -2637,20 +2716,19 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
                     "error",
                     f"❌ Orchestrator 失败: {error_message}"
                 )
+                # P12 Wave2：error 早返也跑统一收口（best-effort），失败返回体
+                # 补 observations，任何收口路径不销毁证据。
+                try:
+                    await self._unified_closeout()
+                except Exception as _closeout_err:
+                    logger.warning(f"[Orchestrator] error unified closeout failed (non-fatal): {_closeout_err}")
                 return AgentResult(
                     success=False,
                     error=error_message,
                     data={
                         "findings": self._all_findings,
-                        "steps": [
-                            {
-                                "thought": s.thought,
-                                "action": s.action,
-                                "action_input": s.action_input,
-                                "observation": s.observation[:500] if s.observation else None,
-                            }
-                            for s in self._steps
-                        ],
+                        "observations": list(self._gate_observations),
+                        "steps": self._closeout_steps_skeleton(),
                     },
                     iterations=self._iteration + self._sub_agent_total_iterations,
                     tool_calls=self._tool_calls + self._sub_agent_total_tool_calls,
@@ -2787,9 +2865,27 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             raise
         except Exception as e:
             logger.error(f"Orchestrator failed: {e}", exc_info=True)
+            # P12 Wave2：外层 except 也 best-effort 跑统一收口（不抛二次异常），
+            # 失败返回体补齐 findings/observations/steps，不裸 AgentResult(error)。
+            try:
+                await self._unified_closeout()
+            except Exception as _closeout_err:
+                logger.warning(f"[Orchestrator] except unified closeout failed (non-fatal): {_closeout_err}")
+            try:
+                _fail_duration = int((time.time() - start_time) * 1000)
+                _fail_steps = self._closeout_steps_skeleton()
+            except Exception:
+                _fail_duration = 0
+                _fail_steps = []
             return AgentResult(
                 success=False,
                 error=str(e),
+                data={
+                    "findings": getattr(self, "_all_findings", []),
+                    "observations": list(getattr(self, "_gate_observations", [])),
+                    "steps": _fail_steps,
+                },
+                duration_ms=_fail_duration,
             )
         finally:
             # 🔥 v3.0: 最终化追踪文件
@@ -2853,6 +2949,25 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             except asyncio.CancelledError:
                 return
 
+
+    @staticmethod
+    def _is_doc_noise_path(path: str) -> bool:
+        """P12 Wave3：Semgrep 预扫文档示例噪声路径判定（裁决⑦）。
+
+        排除 docs/ 目录、*.md/*.rst 文档、CHANGELOG*/changes.xml 类变更日志；
+        不排 tests/、examples/（测试代码可能是靶场线索）。
+        """
+        if not path:
+            return False
+        p = path.replace("\\", "/").lower()
+        base = p.rsplit("/", 1)[-1]
+        if p.endswith(".md") or p.endswith(".rst"):
+            return True
+        if "/docs/" in p or p.startswith("docs/"):
+            return True
+        if base.startswith("changelog") or base == "changes.xml" or base.startswith("changes."):
+            return True
+        return False
 
     async def _run_semgrep_prescan(self) -> dict[str, Any]:
         """Phase 0: Semgrep full scan before Recon (async subprocess, not sandbox)."""
@@ -2942,6 +3057,7 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
         seen = set()
         unique = []
+        docs_noise_count = 0
         for f in all_raw:
             if not isinstance(f, dict):
                 continue
@@ -2949,7 +3065,24 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
             key = (f.get("path", ""), f.get("check_id", ""), start.get("line", 0))
             if key not in seen:
                 seen.add(key)
+                # P12 Wave3：预扫排噪（裁决⑦）——docs/、*.md、*.rst、
+                # CHANGELOG/changes.xml 类文档示例不进 hot_files/findings
+                # （8a3a713f 实证 10 条文档 generic 命中占唯一 hot file）；
+                # tests/examples 不排除（测试代码可能是靶场线索）。
+                if self._is_doc_noise_path(f.get("path", "")):
+                    docs_noise_count += 1
+                    continue
                 unique.append(f)
+        if docs_noise_count:
+            self._record_gate_observation(
+                "semgrep_prescan_docs_filtered",
+                f"预扫排除 {docs_noise_count} 条文档示例命中"
+                "（docs/*.md/*.rst/CHANGELOG/changes.xml；tests/examples 保留）",
+            )
+            logger.info(
+                f"[Orchestrator] Semgrep prescan filtered {docs_noise_count} "
+                f"documentation-example hits"
+            )
 
         hot_files = list(set(f.get("path", "") for f in unique if f.get("path")))
         if hot_files:
@@ -3517,11 +3650,13 @@ Action Input: {"agent": "verification", "task": "验证 SSRF 漏洞", "context":
 
         # 🔥 检查是否重复调度同一个 Agent
         dispatch_count = self._dispatched_tasks.get(agent_name, 0)
-        # 调度上限固定 3 次（达限不增加调度次数；analysis 达限走下方 Semgrep
-        # 兜底/产出下限收口分支）。覆盖率门禁的"3 次拦截后自动放行"由
-        # _hard_coverage_block_count 独立控制，不提升调度上限——旧注释
-        # "提升上限到 4" 为陈旧表述，无对应代码。
-        max_dispatch = 3
+        # 调度上限（P12 Wave3：抽 settings 共享常量，默认 3；3→5 实测
+        # +0.63~1.34M token 且 1800s 默认预算下第 5 次大概率被拒发）。
+        # 覆盖率门禁的"3 次拦截后自动放行"由 _hard_coverage_block_count
+        # 独立控制，不提升调度上限。
+        from app.core.config import settings as _settings
+
+        max_dispatch = int(getattr(_settings, "LLM_MAX_DISPATCH_PER_AGENT", 3))
         if dispatch_count >= max_dispatch:
             if agent_name == "analysis":
                 # Task 11 (finding-output-floor): Analysis 达调度上限 = "全部派发
@@ -4169,6 +4304,34 @@ Action Input: {{"agent": "verification", "task": "验证 {fallback_added} 个 Se
                 # 失败结果同样计入 _dispatch_failures（R7 诚实终态的计数口径）
                 self._dispatch_failures += 1
                 merged_count = self._merge_failed_result_findings(agent_name, result)
+                # P12 Wave2/3：区分两类零产出——「崩溃零产出」（端点/崩坏原因，
+                # analysis data.failed_zero_output=true，见 F3）与「下限违规」
+                # （模型拒交 output_floor_violated）。崩溃类记独立 gate（不污染
+                # output_floor 语义），并置 coverage_bypassed 防 completed 伪装。
+                fail_data = result.data if isinstance(result.data, dict) else {}
+                if agent_name == "analysis" and fail_data.get("failed_zero_output"):
+                    self._failed_zero_output_dispatch = (
+                        getattr(self, "_failed_zero_output_dispatch", 0) + 1
+                    )
+                    self._record_gate_observation(
+                        "failed_zero_output",
+                        f"{agent_name} 调度因端点/崩坏崩溃零产出退出"
+                        f"（success=False, failed_zero_output；第 "
+                        f"{self._failed_zero_output_dispatch} 次失败调度），"
+                        "区别于模型拒交的产出下限违规",
+                    )
+                    if not self._coverage_bypassed:
+                        self._coverage_bypassed = True
+                        try:
+                            self._coverage_bypass_info = self._build_coverage_bypass_info(
+                                reason="analysis_failed_zero_output",
+                                covered_count=0,
+                                total_dimensions=10,
+                                gaps=[],
+                                block_count=self._hard_coverage_block_count,
+                            )
+                        except Exception:
+                            pass
                 note = f"\n\n（该 Agent 已声明的 {merged_count} 个发现已保留）" if merged_count else ""
                 return f"## {agent_name} Agent 执行失败\n\n错误: {result.error}{note}"
 

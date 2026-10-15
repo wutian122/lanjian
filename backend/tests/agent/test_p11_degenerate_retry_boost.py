@@ -16,6 +16,19 @@ import pytest
 from app.services.agent.agents.orchestrator import OrchestratorAgent
 
 
+@pytest.fixture(autouse=True)
+def _no_real_throttle():
+    """degenerate 记账会让全局端点健康单例 degraded 并真实 sleep 节流；
+    本文件只验证采样参数，统一 patch 限流器与节流。"""
+    import app.services.agent.agents.base as base_mod
+
+    async def _no_sleep(*a, **k):
+        return None
+
+    with patch.object(base_mod.get_endpoint_health(), "maybe_throttle", _no_sleep):
+        yield
+
+
 def _make_agent() -> OrchestratorAgent:
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
     agent.config = MagicMock()
@@ -29,6 +42,9 @@ def _make_agent() -> OrchestratorAgent:
     agent._last_empty_kind = None
     agent._truncated_empty_streak = 0
     agent._degenerate_retry_boost = 0
+    agent._f4_negative_streak = 0
+    agent.task_id = None
+    agent._get_llm_rate_limiter = lambda: MagicMock(acquire=AsyncMock())
     return agent
 
 
@@ -127,7 +143,7 @@ class TestDegenerateRetryBoost:
         captured: Dict[str, Any] = {}
         await _run(agent, _clean_stream(captured))
         rp = captured.get("extra_params", {}).get("repetition_penalty")
-        assert rp == pytest.approx(1.35), "config rp=None 应回落 settings 默认 1.2 + 0.15"
+        assert rp == pytest.approx(1.25), "config rp=None 应回落 settings 默认 1.1 + 0.15（P12 裁决⑩基线统一 1.1）"
 
     @pytest.mark.asyncio
     async def test_no_boost_no_injection(self):
@@ -136,3 +152,59 @@ class TestDegenerateRetryBoost:
         await _run(agent, _clean_stream(captured))
         assert "repetition_penalty" not in (captured.get("extra_params") or {}), \
             "正常路径不得污染请求参数"
+
+
+class TestF4ReverseBoost:
+    """P12 Wave3（裁决⑩）：F4 标点漂移反向 boost（灰度开关默认关）。"""
+
+    def _f4_stream(self, captured):
+        def fake_stream(**kwargs):
+            captured.update(kwargs)
+
+            async def _gen():
+                # 900 字符随机 hex（F4 形态：无句读长正文）
+                import string, random
+                random.seed(7)
+                acc = "".join(random.choice(string.hexdigits.lower()) for _ in range(900))
+                yield {"type": "token", "kind": "content", "content": acc,
+                       "accumulated": acc, "accumulated_content": acc,
+                       "accumulated_reasoning": ""}
+            return _gen()
+        return fake_stream
+
+    @pytest.mark.asyncio
+    async def test_f4_default_off_uses_positive_boost(self):
+        """开关默认关：F4 与其他形态一样走正向 boost（灰度不改默认行为）。"""
+        agent = _make_agent()
+        with patch("app.core.config.settings") as s:
+            s.LLM_DEGENERATE_F4_REVERSE_BOOST = False
+            s.LLM_REPETITION_PENALTY = 1.1
+            out, _ = await _run(agent, self._f4_stream({}))
+        assert out == ""
+        assert agent._f4_negative_streak == 0
+        assert agent._degenerate_retry_boost == 1
+
+    @pytest.mark.asyncio
+    async def test_f4_reverse_enabled_lowers_rp(self):
+        """开关开：F4 连续崩坏走负向档（base - 0.05×streak），打破高 rp 反向激励。"""
+        agent = _make_agent()
+        with patch("app.core.config.settings") as s:
+            s.LLM_DEGENERATE_F4_REVERSE_BOOST = True
+            s.LLM_REPETITION_PENALTY = 1.1
+            await _run(agent, self._f4_stream({}))
+        assert agent._f4_negative_streak == 1
+        assert agent._degenerate_retry_boost == 0
+        # 崩坏轮在置位前已 break；档位注入发生在下一轮（正常轮仍注入，
+        # 因 _last_empty_kind=degenerate 不归零）
+        captured2: Dict[str, Any] = {}
+        agent._last_empty_kind = "degenerate"
+        await _run(agent, _clean_stream(captured2))
+        assert captured2["extra_params"]["repetition_penalty"] == pytest.approx(1.05)
+
+    @pytest.mark.asyncio
+    async def test_f4_streak_resets_on_success(self):
+        agent = _make_agent()
+        agent._f4_negative_streak = 2
+        captured: Dict[str, Any] = {}
+        await _run(agent, _clean_stream(captured))
+        assert agent._f4_negative_streak == 0

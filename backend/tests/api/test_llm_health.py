@@ -60,4 +60,5 @@ class TestLLMHealth:
         assert health["format_retries"] == 1
         assert health["garbled_drops"] == 1
         assert health["empty_responses"] == 1
-        assert health["degraded"] is False  # 1/4 < 0.5
+        # P12 Wave3：degraded 分子纳入 garbled_drops → (1 空 + 1 崩坏)/4 = 0.5 达阈
+        assert health["degraded"] is True

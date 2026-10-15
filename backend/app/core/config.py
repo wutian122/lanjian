@@ -104,7 +104,17 @@ class Settings(BaseSettings):
     LLM_FREQUENCY_PENALTY: float = 1.2  # ??????? LLM ????
     # structured-output-protocol 层次 6：repetition_penalty（SGLang/vLLM 接受，
     # 经 extra_params→extra_body/native body 透传；用户配置 llmConfig.repetitionPenalty 优先）
-    LLM_REPETITION_PENALTY: float = 1.2
+    LLM_REPETITION_PENALTY: float = 1.1
+    # P12 Wave3（裁决⑩）：rp 基线与生产实测统一为 1.1（spike 三档实证
+    # 1.05/1.1/1.2 崩坏率非单调，1.1 为无格式伤害档；1.2 臂格式错误 40 次）。
+    # P12 Wave3：F4（标点漂移）崩坏后的差异化采样反向档位开关——高 rp 本身
+    # 是 F4 成因之一（P10 注释），开启后 F4 连续崩坏以 -0.05×streak 降 rp
+    # 打破确定性循环；默认关闭（灰度，N=1 证据不足以改默认）。
+    LLM_DEGENERATE_F4_REVERSE_BOOST: bool = False
+    # P12 Wave3（裁决③）：单 Agent 类型最大调度次数（默认维持 3；3→5 实测
+    # +0.63~1.34M token 且 1800s 默认预算下第 5 次大概率被拒发，放宽须配套
+    # timeout 7200——故仅提供配置面，默认不变）。
+    LLM_MAX_DISPATCH_PER_AGENT: int = 3
     # 关思考开关（R-C1，2026-09-26）：True 时三条出站路径向 extra_body 注入
     # chat_template_kwargs={"enable_thinking": False}（SGLang/vLLM 端点按请求体
     # 顶层键接受），并放行护栏对 enable_thinking 键的剥除（<|think_off|> /

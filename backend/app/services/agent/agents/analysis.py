@@ -565,6 +565,9 @@ class AnalysisStep:
     observation: Optional[str] = None
     is_final: bool = False
     final_answer: Optional[Dict] = None
+    # P12 Wave1.1：终态来源——文本协议 submit_findings 动作合成的终态为 True
+    # （交卷门禁只拦它）；Final Answer 文本交卷路径为 False（合法终态不拦）。
+    from_submit_action: bool = False
 
 
 class AnalysisAgent(BaseAgent):
@@ -618,6 +621,12 @@ class AnalysisAgent(BaseAgent):
         
         self._conversation_history: List[Dict[str, str]] = []
         self._steps: List[AnalysisStep] = []
+        # P12 Wave1.1：交卷门禁计数——文本/tool_calls 两路 is_final 收口前要求
+        # 至少 1 个成功工具 step（防首轮裸交卷幻觉；与 tool_calls 路径同口径）。
+        self._successful_tool_steps = 0
+        # P12 Wave1.4：空卷矛盾门禁——summary 承认候选而 findings 空时注入过
+        # 纠正轮（pending）；最终收口仍空则 contradicted_empty=True 供报告分区。
+        self._correction_pending = False
     
 
     
@@ -685,6 +694,12 @@ class AnalysisAgent(BaseAgent):
                     before_action = re.sub(r'^Thought:\s*', '', before_action)
                     if before_action:
                         step.thought = before_action[:500] if len(before_action) > 500 else before_action
+
+        # P12 Wave1.1：文本协议 submit_findings 终态特判——交卷动作先于通用
+        # input 提取处理（json-repair 抢救链；8a3a713f seq3418 形态：模型函数
+        # 调用不稳定降级文本交卷，旧实现当未知工具整体丢弃候选）。
+        if step.action == "submit_findings":
+            return self._synthesize_submit_final_step(cleaned_response, step)
 
         # 🔥 提取 Action Input
         input_match = re.search(r'Action Input:\s*(.*?)(?=Thought:|Action:|Observation:|$)', cleaned_response, re.DOTALL)
@@ -830,6 +845,94 @@ class AnalysisAgent(BaseAgent):
             },
         }
 
+    # P12 Wave1.4：候选承认特征（seq4536 形态）——三特征共现才算承认：
+    # confidence=0.x + needs_verification + file_path/行号 定位。
+    _ADMISSION_CONFIDENCE_RE = re.compile(r"confidence\s*[=:：]\s*0\.\d")
+    _ADMISSION_NEEDS_VERIF_RE = re.compile(r"needs_verification")
+    _ADMISSION_FILE_RE = re.compile(
+        r"file_path|文件路径|\.[A-Za-z0-9_]{1,8}:\d+|line\s*[=:：]?\s*\d+"
+    )
+
+    def _admits_withheld_candidates(self, step: AnalysisStep) -> bool:
+        """P12 Wave1.4：summary/thought 是否承认持有候选（三特征共现）。
+
+        控制组（纯"nothing"）不得命中——门禁不得误拦真"判干净"。
+        """
+        fa = step.final_answer or {}
+        text = f"{step.thought or ''}\n{fa.get('summary') or ''}"
+        return bool(
+            self._ADMISSION_CONFIDENCE_RE.search(text)
+            and self._ADMISSION_NEEDS_VERIF_RE.search(text)
+            and self._ADMISSION_FILE_RE.search(text)
+        )
+
+    def _build_final_step(
+        self,
+        payload: Dict[str, Any],
+        thought: str = "",
+        from_submit_action: bool = False,
+    ) -> Optional[AnalysisStep]:
+        """P12 Wave1.1：submit_findings payload → 终态 step（文本/tool_calls 两路共用）。
+
+        findings 非 list → None（交主循环格式 nudge）；非 dict 项过滤（防
+        垃圾项进落库链）。``from_submit_action`` 标记终态来自 submit_findings
+        动作（文本桥接/tool_calls 两路为 True，Final Answer 文本交卷为 False），
+        供交卷门禁消费——两路同口径，Final Answer 路径不拦。
+        """
+        if not isinstance(payload.get("findings"), list):
+            return None
+        payload = dict(payload)
+        payload["findings"] = [f for f in payload["findings"] if isinstance(f, dict)]
+        step = AnalysisStep(thought=thought)
+        step.is_final = True
+        step.final_answer = payload
+        step.from_submit_action = from_submit_action
+        return step
+
+    def _synthesize_submit_final_step(
+        self, cleaned_response: str, step: AnalysisStep
+    ) -> Optional[AnalysisStep]:
+        """P12 Wave1.1：文本协议 submit_findings 终态合成（协议桥接）。
+
+        事件证据（8a3a713f seq3418/3419、对照 cdbc12ff seq5452）：能力探测
+        tools=true 但模型函数调用不稳定时降级文本 ``Action: submit_findings``，
+        旧实现将其当未知工具整体丢弃（summary/豁免/候选全销毁）。本方法按
+        标签 → 无标签 → 尾部 json-repair 三级提取 payload 合成终态；
+        提取失败返回 None 走既有格式 nudge（P9-1b）。
+        """
+        payload = None
+        input_match = re.search(
+            r'Action Input:\s*(.*?)(?=Thought:|Action:|Observation:|$)',
+            cleaned_response, re.DOTALL,
+        )
+        if input_match:
+            input_text = input_match.group(1).strip()
+            input_text = re.sub(r'```json\s*', '', input_text)
+            input_text = re.sub(r'```\s*', '', input_text)
+            payload = self._parse_tool_call_arguments(input_text)
+        if payload is None:
+            extracted = self._extract_unlabeled_input("submit_findings", cleaned_response)
+            if extracted is not None:
+                payload = extracted
+        if payload is None:
+            idx = cleaned_response.find("{")
+            if idx >= 0:
+                payload = self._parse_tool_call_arguments(cleaned_response[idx:])
+        if not isinstance(payload, dict):
+            logger.warning(
+                "[Analysis] 文本 submit_findings 提取失败（标签/无标签/repair 三级）"
+                " -> format failure"
+            )
+            return None
+        final_step = self._build_final_step(payload, thought=step.thought,
+                                            from_submit_action=True)
+        if final_step is not None:
+            logger.info(
+                f"[Analysis] 文本 submit_findings 终态桥接成功 "
+                f"(findings={len(final_step.final_answer['findings'])})"
+            )
+        return final_step
+
     def _final_step_from_tool_calls(
         self, tool_calls: Optional[List[Dict[str, Any]]]
     ) -> Optional[AnalysisStep]:
@@ -855,14 +958,9 @@ class AnalysisAgent(BaseAgent):
         if not name or parsed is None:
             return None
         if name == "submit_findings":
-            # 终态：与文本路径同构（findings 过滤非字典项）
-            if not isinstance(parsed.get("findings"), list):
-                return None
-            parsed["findings"] = [f for f in parsed["findings"] if isinstance(f, dict)]
-            step = AnalysisStep(thought="")
-            step.is_final = True
-            step.final_answer = parsed
-            return step
+            # 终态：与文本路径同构（P12 Wave1.1 起共用 _build_final_step；
+            # tool_calls 与文本桥接两路同口径受交卷门禁约束）
+            return self._build_final_step(parsed, from_submit_action=True)
         # X1：中间工具泛化——走既有 execute_tool 链
         if name in self.tools:
             step = AnalysisStep(thought="")
@@ -1028,6 +1126,14 @@ class AnalysisAgent(BaseAgent):
         """
         import time
         start_time = time.time()
+
+        # P12 Wave3：跨调度重置——同一 Analysis 实例被多批 dispatch 复用，
+        # P11 差异化采样档位/交卷门禁计数/矛盾标志不得跨批次泄漏（8a3a713f
+        # 批1 崩坏留下的 boost 不应影响批 2/3 的正常请求）。
+        self._degenerate_retry_boost = 0
+        self._f4_negative_streak = 0
+        self._successful_tool_steps = 0
+        self._correction_pending = False
         
         project_info = input_data.get("project_info", {})
         config = input_data.get("config", {})
@@ -1233,12 +1339,29 @@ class AnalysisAgent(BaseAgent):
                     iteration + 1, self.config.max_iterations,
                     has_candidates=bool(all_findings),
                 ):
+                    # P12 Wave1.2：文案按能力分叉——文本降级模式下"调用
+                    # submit_findings"是必败指令（函数调用不稳定已实证），
+                    # 改说 Final Answer 文本协议（与 1314 守卫口径统一）。
+                    _caps = getattr(self.llm_service, "backend_capabilities", None)
+                    _tools_available = bool(
+                        _caps is not None and getattr(_caps, "tools", False)
+                    )
+                    if _tools_available:
+                        _nudge_howto = (
+                            "请立即调用 submit_findings 交卷——哪怕只有 1 条低置信候选"
+                            "（confidence 如实、needs_verification=true，交沙箱裁决）。"
+                        )
+                    else:
+                        _nudge_howto = (
+                            "请立即输出 Final Answer 交卷——哪怕只有 1 条低置信候选"
+                            "（confidence 0.1-0.7 如实填写、needs_verification=true，"
+                            "交沙箱裁决）。"
+                        )
                     self._conversation_history.append({
                         "role": "user",
                         "content": (
                             f"[系统提醒] 你已探索 {iteration + 1}/{self.config.max_iterations} 轮且尚未提交任何候选。"
-                            "请立即调用 submit_findings 交卷——哪怕只有 1 条低置信候选"
-                            "（confidence 如实、needs_verification=true，交沙箱裁决）。"
+                            + _nudge_howto +
                             "若某维度确认无候选，必须在 summary 中用 "
                             "UNCOVERED_DIMENSION_EXEMPT: <维度> - <理由> 单独成行豁免。"
                             "继续只探索不交卷将被视为无效审计。"
@@ -1388,6 +1511,52 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 
                 # 检查是否完成
                 if step.is_final:
+                    # P12 Wave1.1 交卷门禁：submit_findings 动作（文本桥接/tool_calls
+                    # 两路，from_submit_action=True）0 成功工具 step 时拒绝终态
+                    # （防首轮裸交卷幻觉）——注入定向 Final Answer 引导后继续
+                    # 循环（不占 dispatch 名额）；Final Answer 文本交卷路径不拦。
+                    if (
+                        getattr(step, "from_submit_action", False)
+                        and self._successful_tool_steps == 0
+                    ):
+                        logger.warning(
+                            f"[{self.name}] 交卷门禁：尚无成功工具步骤，拒绝终态并引导"
+                        )
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": (
+                                "⚠️ **系统提示**：你尚未成功执行任何工具调用，禁止直接交卷。"
+                                "请先实际读取代码（Action: read_file / search_code 等）完成审计，"
+                                '再以 Final Answer: {"findings": [...], "summary": "..."} 格式提交报告。'
+                            ),
+                        })
+                        continue
+                    # P12 Wave1.4 空卷矛盾门禁：findings 为空但 summary/thought
+                    # 承认持有候选（confidence=0.x + file_path + needs_verification
+                    # 共现）→ 不 break，注入模板化纠正（回引原文，不占 dispatch）。
+                    if (
+                        not (step.final_answer or {}).get("findings")
+                        and not self._correction_pending
+                        and self._admits_withheld_candidates(step)
+                    ):
+                        self._correction_pending = True
+                        logger.warning(
+                            f"[{self.name}] 空卷矛盾门禁：summary 承认候选但 findings "
+                            f"为空，注入纠正轮"
+                        )
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": (
+                                "⚠️ **系统纠正**：你在摘要/思考中记录了候选发现"
+                                "（含 confidence/file_path/needs_verification 特征），"
+                                "但 findings 数组为空。必须二选一：\n"
+                                "1. 将这些候选放入 findings 数组（confidence 0.1-0.7 如实"
+                                "填写、needs_verification=true 交沙箱验证）；\n"
+                                "2. 在 summary 中逐条引用证据否定它们（说明为何不构成发现）。\n"
+                                "请立即重新输出 Final Answer。"
+                            ),
+                        })
+                        continue
                     await self.emit_llm_decision("完成安全分析", "LLM 判断分析已充分")
                     logger.info(f"[{self.name}] Received Final Answer: {step.final_answer}")
                     if step.final_answer and "findings" in step.final_answer:
@@ -1464,6 +1633,8 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                         # 成功调用，重置失败计数
                         if tool_call_key in self._failed_tool_calls:
                             del self._failed_tool_calls[tool_call_key]
+                        # P12 Wave1.1：交卷门禁计数（成功工具 step 供 is_final 门禁消费）
+                        self._successful_tool_steps += 1
                     
                     # 🔥 工具执行后检查取消状态
                     if self.is_cancelled:
@@ -1531,14 +1702,44 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     "error",
                     f"❌ Analysis Agent 失败: {error_message}"
                 )
+                # P12 Wave1.5：崩坏退出保全——已有 ≥3 个成功工具动作时，不赌
+                # 第二次 LLM（guided_json 同通道双崩已实证），确定性合成已读
+                # 文件/搜索命中骨架 + failed_zero_output=true（与模型拒交的
+                # floor 违规区分；8a3a713f 批1 形态：三连 charwall 后裸 error）。
+                err_data: Dict[str, Any] = {
+                    "findings": all_findings,
+                    "dimension_gaps_reported": {},
+                    "output_floor_violated": False,
+                }
+                if self._successful_tool_steps >= 3:
+                    try:
+                        err_report = self._collect_execution_report()
+                    except Exception:
+                        err_report = {"files_read": [], "grep_patterns": []}
+                    err_data.update({
+                        "files_read": err_report["files_read"],
+                        "grep_patterns": err_report["grep_patterns"],
+                        "steps": [
+                            {
+                                "thought": s.thought,
+                                "action": s.action,
+                                "action_input": s.action_input,
+                                "observation": s.observation[:500] if s.observation else None,
+                            }
+                            for s in self._steps
+                            if s.action and isinstance(s.action_input, dict)
+                        ],
+                        "failed_zero_output": True,
+                    })
+                    logger.info(
+                        f"[{self.name}] 崩坏退出保全：合成骨架 "
+                        f"(files_read={len(err_data['files_read'])}, "
+                        f"steps={len(err_data['steps'])})"
+                    )
                 return AgentResult(
                     success=False,
                     error=error_message,
-                    data={
-                        "findings": all_findings,
-                        "dimension_gaps_reported": {},
-                        "output_floor_violated": False,
-                    },
+                    data=err_data,
                     iterations=self._iteration,
                     tool_calls=self._tool_calls,
                     tokens_used=self._total_tokens,
@@ -1605,6 +1806,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     "findings": standardized_findings,
                     "dimension_gaps_reported": floor_report["dimension_gaps_reported"],
                     "output_floor_violated": floor_report["output_floor_violated"],
+                    # P12 Wave1.4：空卷矛盾标记——注入过纠正轮且最终仍空 findings
+                    # （供守卫/报告区分"判干净"与"自相矛盾"）
+                    "contradicted_empty": bool(
+                        self._correction_pending and not standardized_findings
+                    ),
                     "files_read": execution_report["files_read"],
                     "grep_patterns": execution_report["grep_patterns"],
                     "steps": [

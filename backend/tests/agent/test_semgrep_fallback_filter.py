@@ -319,8 +319,8 @@ def test_canonicalize_type_mapping_unit(rule_id, expected):
 
 @pytest.mark.asyncio
 async def test_dedup_then_filter_counts_deduped_candidates():
-    """去重键 file_path+rule_id 先于过滤生效：同文件同规则的 2 条配置类
-    命中只计 1 条被滤；可验证候选不受影响。"""
+    """P12 Wave2.3 去重键 file_path+rule_id+line_start：同文件同规则**不同行**
+    逐行成候选；完全重复才去重。可验证候选不受影响。"""
     agent = _make_orch()
     agent._semgrep_findings = [
         _semgrep_finding(
@@ -341,7 +341,9 @@ async def test_dedup_then_filter_counts_deduped_candidates():
     assert agent._all_findings[0]["vulnerability_type"] == "sql_injection"
     filtered = _filtered_obs(agent)
     assert len(filtered) == 1
-    assert "1 条" in filtered[0]["reason"], f"去重后应只滤 1 条，got: {filtered[0]['reason']!r}"
+    assert "2 条" in filtered[0]["reason"], (
+        f"行号对齐后同规则两行各成候选（2 条被滤），got: {filtered[0]['reason']!r}"
+    )
 
 
 @pytest.mark.asyncio

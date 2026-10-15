@@ -2555,9 +2555,11 @@ async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
     llm_calls 以 thinking_start 数为准（每轮流式调用恰好发射一次）；
     truncations/empty_responses/format_retries/garbled_drops 按事件消息
     关键词归账（与 base.py/orchestrator.py 的告警文案同源）。degraded =
-    调用数>0 且 (截断+空响应) 占比 ≥ 0.5——达到该比例说明多数调用轮次
+    调用数>0 且 (截断+空响应+崩坏) 占比 ≥ 0.5——达到该比例说明多数调用轮次
     LLM 输出不可用，审计结论不可信（生产实证：任务 c6d6cd09/327b6430
-    截断率近 100% 且 0 finding）。
+    截断率近 100% 且 0 finding）。P12 Wave3：崩坏（garbled_drops）计入
+    degraded 分子——崩坏主导的劣化此前不在公式内（8a3a713f 实证 15 次崩坏
+    但 degraded 仍 False），健康剖面失真。
     """
     stmt = select(
         AgentEvent.event_type, AgentEvent.message
@@ -2582,7 +2584,9 @@ async def _compute_llm_health(db: AsyncSession, task_id: str) -> dict:
         if "乱码" in msg or "崩坏" in msg:
             # P9 D6：degenerate 掐断 warning（「崩坏」）同归 garbled_drops
             garbled_drops += 1
-    degraded = llm_calls > 0 and (truncations + empty_responses) / llm_calls >= 0.5
+    degraded = llm_calls > 0 and (
+        truncations + empty_responses + garbled_drops
+    ) / llm_calls >= 0.5
     return {
         "llm_calls": llm_calls,
         "truncations": truncations,
