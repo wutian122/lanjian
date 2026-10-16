@@ -1,7 +1,8 @@
 # llm-structured-output Specification
 
 ## Purpose
-TBD - created by archiving change structured-output-protocol. Update Purpose after archive.
+
+lanjian LLM 结构化输出协议规范：多推理后端能力探测与协议自动选择（Function Calling/Tool Use 优先、文本协议降级共存）、Final Answer 轮注入结构化 JSON 约束、原生工具调用的分发映射与文本协议共存。
 
 ## Requirements
 

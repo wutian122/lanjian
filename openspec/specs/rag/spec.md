@@ -1,7 +1,8 @@
 # rag Specification
 
 ## Purpose
-TBD - created by archiving change fix-audit-data-rag-cost. Update Purpose after archive.
+
+lanjian RAG 管道（ChromaDB 索引与语义检索）的健壮性规范：RAG 工具参数契约防御、collection 元数据更新行为、检索事件入审计链、embedding 限流与缓存策略，以及生产容器禁止热重载的运行约束。
 ## Requirements
 ### Requirement: RAG 工具参数健壮性
 

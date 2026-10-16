@@ -1,7 +1,8 @@
 # sse-realtime-stream Specification
 
 ## Purpose
-TBD - created by archiving change fix-sse-realtime-stream. Update Purpose after archive.
+
+lanjian SSE 实时事件流规范：端点集合与响应头契约、事件 id 与 Last-Event-ID 断点续传、10 秒心跳独立协程、DB 回补游标分页、事件队列有界与分级丢弃。
 ## Requirements
 ### Requirement: SSE 端点集合定义与响应头
 

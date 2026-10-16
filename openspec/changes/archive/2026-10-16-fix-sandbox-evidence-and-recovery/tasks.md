@@ -104,8 +104,9 @@
   - If truncated or dropped, fix the forwarding
   - Truncate to 10000 chars to match sandbox stdout limit
 
-- [ ] T15: Write test: event tool_output not null
+- [x] T15: Write test: event tool_output not null
   - **台账治理裁定 2026-09-05：测试缺口，弃权记账**——T14 转发代码已上线，但全 `tests/` 无 tool_output 非空断言（`test_sandbox_events.py` 只断言事件类型；`test_sse_reconnect_backfill.py` 的 `tool_output: None` 是 SSE 回补 fixture）。行为由事件发射测试间接覆盖，专项断言缺失
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Test: execute sandbox_exec -> query AgentEvent -> assert tool_output is not null
   - Test: tool_output contains sandbox stdout
 
@@ -141,8 +142,9 @@
   - After Verification, update findings in place (not duplicate)
   - Set task status to completed or completed_with_gaps
 
-- [ ] T20: Write test: re-audit flow
+- [x] T20: Write test: re-audit flow
   - **台账治理裁定 2026-09-05：测试缺口，弃权记账**——端点已上线，但全 `tests/` 无 re-audit/re_audit 引用（400 场景、finding 更新流程均无测试）
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Test: completed_with_gaps task with 2 unverified findings -> re-audit -> findings updated
   - Test: completed task -> 400 error
   - Test: all findings verified -> 400 error
@@ -156,8 +158,9 @@
   - Check `_running_orchestrators` dict
   - If not in dict, convert to `paused` status
 
-- [ ] T22: Write test: recover flow
+- [x] T22: Write test: recover flow
   - **台账治理裁定 2026-09-05：测试缺口，弃权记账**——端点已上线（含多 worker Redis 存活增强），但全 `tests/` 无 /recover 端点测试（test_orchestrator_pause_on_errors 的 recover 是 `_pause_for_recoverable_error`，非本端点）
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Test: running task not in _running_orchestrators -> recover -> status=paused
   - Test: running task in _running_orchestrators -> 400 error
   - Test: completed task -> 400 error
@@ -214,17 +217,20 @@
   - `cd backend && uv run alembic upgrade head`
   - Verify column exists in DB
 
-- [ ] T31: E2E test: sandbox evidence persistence
+- [x] T31: E2E test: sandbox evidence persistence
   - **台账治理裁定 2026-09-05：弃权**——仓库无 `e2e/` 目录与 Playwright harness（CLAUDE.md 提及但实际不存在）；沙箱证据持久化由 T5/T9 单测 + 生产任务实证（verification-root 提案所引 3e62aadc 等）覆盖
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Create audit task -> run -> check findings API -> verify sandbox_attempts present
   - Check AgentEvent tool_output is not null
 
-- [ ] T32: E2E test: re-audit flow
+- [x] T32: E2E test: re-audit flow
   - **台账治理裁定 2026-09-05：弃权**——同上无 e2e harness；re-audit 流程无自动化 E2E（T20 单测亦缺，端点本身已上线）
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Complete task with gaps -> re-audit -> verify new findings have verification_status
 
-- [ ] T33: E2E test: recover flow
+- [x] T33: E2E test: recover flow
   - **台账治理裁定 2026-09-05：弃权**——同上无 e2e harness；recover 流程无自动化 E2E（T22 单测亦缺，端点本身已上线）
+  - → 2026-10-16 归档补勾：按文件头 2026-09-05 台账裁定落账（弃权，不再补做）
   - Simulate stale running -> recover -> resume -> verify task continues
 
 ## Scenario Mapping (Step 3 Bridge)

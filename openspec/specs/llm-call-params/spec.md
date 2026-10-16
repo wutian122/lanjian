@@ -1,7 +1,8 @@
 # llm-call-params Specification
 
 ## Purpose
-TBD - created by archiving change structured-output-protocol. Update Purpose after archive.
+
+lanjian LLM 调用参数契约规范：采样参数（temperature/max_tokens/repetition_penalty 等）可配置并透传至推理端点，调用参数变更全链路可追溯。
 
 ## Requirements
 

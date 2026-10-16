@@ -1,7 +1,8 @@
 # thinking-stream-separation Specification
 
 ## Purpose
-TBD - created by archiving change structured-output-protocol. Update Purpose after archive.
+
+lanjian LLM 思考流与正文流分离规范：流式响应按 reasoning_content/content/tool_calls 三字段分流、前端按字段分流渲染、调用侧参数治理（本规范确立时禁止关闭思考参数；2026-09-30 思考策略已倒转为默认强制关思考，见 AGENTS.md）。
 
 ## Requirements
 
