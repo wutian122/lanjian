@@ -1,6 +1,6 @@
 # API 层 — FastAPI 端点与路由
 
-19 文件、~8,775 行、13 个端点模块。deps/中间件/端点三层结构，路由聚合 → 依赖注入 → 端点处理。
+19 文件、~12,149 行、13 个端点模块。deps/中间件/端点三层结构，路由聚合 → 依赖注入 → 端点处理。（2026-10-16 刷新至 v6.9.1）
 
 ## 路由聚合链
 
@@ -17,7 +17,7 @@ main.py                  → app.include_router(api_router, prefix="/api/v1")
     endpoints/database.py    /database     数据库连接测试
     endpoints/prompts.py     /prompts      提示词模板（中英双语）
     endpoints/rules.py       /rules        审计规则集 CRUD + 导入导出
-    endpoints/agent-tasks    /agent-tasks  ⭐ SSE 流式 + Agent 审计（3441 行）
+    endpoints/agent-tasks    /agent-tasks  ⭐ SSE 流式 + Agent 审计（5794 行）
     endpoints/embedding      /embedding    Embedding 模型配置
     endpoints/ssh-keys       /ssh-keys     SSH 密钥管理
 ```
@@ -27,26 +27,26 @@ main.py                  → app.include_router(api_router, prefix="/api/v1")
 ```
 api/
 ├── __init__.py              # 空（0 行）— 仅标记包边界
-├── deps.py                  # 依赖注入中心（50 行）
+├── deps.py                  # 依赖注入中心（88 行）
 ├── middleware.py            # AppNameMiddleware（13 行）
 └── v1/
     ├── __init__.py          # 空（0 行）
     ├── api.py               # 路由聚合器（17 行）
     └── endpoints/
         ├── __init__.py      # 空（0 行）
-        ├── agent_tasks.py   # ⚠️ 3441 行 — 39% 代码集中在此文件
-        ├── rules.py         # 705 行
-        ├── projects.py      # 686 行
-        ├── database.py      # 672 行
-        ├── config.py        # 620 行（含 sandbox 管理 API）
-        ├── scan.py          # 547 行
-        ├── prompts.py       # 415 行
-        ├── users.py         # 338 行
-        ├── embedding_config.py  # 307 行
-        ├── tasks.py         # 286 行
-        ├── auth.py          # 283 行
-        ├── ssh_keys.py      # 206 行
-        └── members.py       # 189 行（与 projects 共享前缀）
+        ├── agent_tasks.py   # ⚠️ 5794 行 — 48% 代码集中在此文件
+        ├── config.py        # 889 行（LLM 运行时配置 + sandbox 管理 API）
+        ├── projects.py      # 826 行
+        ├── rules.py         # 747 行
+        ├── database.py      # 722 行
+        ├── scan.py          # 581 行
+        ├── prompts.py       # 443 行
+        ├── auth.py          # 411 行
+        ├── embedding_config.py  # 405 行
+        ├── users.py         # 395 行
+        ├── tasks.py         # 341 行
+        ├── ssh_keys.py      # 261 行
+        └── members.py       # 216 行（与 projects 共享前缀）
 ```
 
 ## 认证与权限 — 双模式（⚠️ 不一致风险）
@@ -98,9 +98,9 @@ limit: int = Query(20, ge=1, le=100)
 `/agent-tasks/{task_id}/events` 和 `/stream` 使用 `StreamingResponse`。
 其他 12 个端点均不涉及流式。
 
-## agent_tasks.py — 超大文件（3,441 行）
+## agent_tasks.py — 超大文件（5,794 行）
 
-包含 22 个路由处理器：任务 CRUD、SSE 流式、聊天、Agent 树、检查点、findings、报告导出。
+包含 23 个路由处理器：任务 CRUD、SSE 流式、聊天、Agent 树、检查点、findings、报告导出、pending 任务启动入口、LLM 健康度统计。
 建议拆分为子模块包（`agent_tasks/lifecycle.py`、`streaming.py`、`findings.py`、`chat.py`）。
 
 ## 反模式

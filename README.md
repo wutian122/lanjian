@@ -3,7 +3,7 @@
 > **AI 驱动的本地化代码安全审计平台**  —— 项目导入 → 规则审计 → Multi-Agent AI 分析 → Docker 沙箱验证 → 报告导出
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-v6.7.0-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
+[![Version](https://img.shields.io/badge/version-v6.9.1-brightgreen.svg)](https://github.com/wutian122/lanjian/releases)
 [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker)](https://hub.docker.com/u/wutian449)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Node 18+](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org/)
@@ -31,6 +31,9 @@
 - **空参失效簇根治**（v6.7.0）：无标签 JSON 提取 helper 接入四个解析器（LLM 省略 `Action Input:` 标签时不再静默丢参——工具失败真根因）；格式纠正 nudge（前端可见 warning + audit_trace marker + 连续 8 次止损豁免收口）；缺参错误模式组+短路防双份引导；R1 必填校验重写（pydantic v2 `is_required()` 权威+v1 回退）；映射参数形状防御 `coerce_mapping_arg`（六语言沙箱叶子+Universal+HTTP headers，坏形状不再直达 TypeError）；沙箱 wrapper 六语言注入加固（json.dumps/var_export 字面量，杜绝畸形 key/value 伪造 stdout 标记产生假确认）；files_read 只计成功读取（跨轮禁读约束不再饿死真实未读文件）
 - **验证证据绑定簇根治**（v6.7.0）：merge 阶段 poc/code_snippet/description 三字段安全归一+逐条 try/except 隔离（dict poc 不再 KeyError 中断 merge——dispatch_complete 必达，消除每轮仅首条 merge 成功引发的 verification 反复重调度与百万级 token 空烧）；verdict→verification_status 归一映射+证据前置防洗白（confirmed/likely 仅在 ≥1 个非伪造非基础设施真实沙箱尝试时采信，否则维持 needs_context）；finding_id 三级优先跨轮稳定；本体回写局部闸门清理+拼接统一 `_merge_attempts_deduped`+sandbox_exec 去重键纳入 finding_id（消除跨 finding 误拦）；报告空身份条目顺序对齐（confirmed→static_confirmed 降级+「请人工复核」标注+aligned 分桶不参与真验证口径）；fingerprint 落库接线（规范化 sha1，同指纹标 `duplicate_of` 不静默删，历史不回填）；持久证据归档（FIFO 2000）+落库前 `_final_evidence_sweep` 反查绑定（单调只升+幂等+gate marking 前时序）；显式 false_positive 遇新证据维持、推导型如实重算（D10）
 - **端点软熔断与观测**（v6.7.0）：EndpointHealth 按 base_url 滑动窗口（20 帧/10 样本/空率 50%）空响应+崩坏记账——degraded 全局降速（throttle 5s+退避放大，救援帧免收）+持续 30s 有序收口（复用 finish 流保留证据+120s 冷却），无物理调用帧不计窗；LLM 全局并发 6→4；崩坏/格式 warning 前端 amber 类型可见化+`garbled_drops` 如实归账；`agent_events.tokens_used` 写事件级当轮 usage（崩坏轮写 0）；verification N 进 N 出核对（缺条 metadata 标注 missing_conclusions）；MD 报告漏洞段渲染「验证说明」（verification_note 三格式可见补齐）；测试基建 endpoint_health autouse 重置 fixture
+- **崩坏（degenerate）优化**（v6.8.0）：崩坏采集钩子（F1-F4 形态枚举 + 掐断置空前 JSONL 留存独立诊断通道，严禁进 SSE 报告，目录 0700/文件 0600/保留 30 天）；8 类红方反例误杀防护（行级分隔线/缩进/引号字面量/Latin-1 等精确形态豁免，49 例语料 + 变异测试）；检测器硬化（跨轮失明修复、content 盲段反向搜索等价实现、节流 64→24）；验证计数口径统一（`VERIFIED_COUNT_STATUSES` 单一真相谓词 = confirmed+static_confirmed 且 is_verified，前端"动态确认 N·合计 M（含静态）"双标，breakdown 实时聚合）
+- **崩坏重试差异化采样 + 丢失链根治**（v6.9.0）：P11 崩坏（F1-F4 命中）后重试请求注入 `repetition_penalty = 基线 + 0.15×boost`（封顶 +0.45，请求级 extra_params 优先，成功轮归零）——打破同 prompt 确定性再崩的连续簇（P10 spike 实证 59% 崩坏落连续重试簇），rp 定值回 1.1；P12 交卷候选保全（文本协议 submit_findings 终态桥接、0 成功工具步拒绝裸交卷、空卷矛盾门禁纠正轮、error 分支确定性保全 failed_zero_output）+ `_unified_closeout` 四挂点统一收口（失败返回体补 observations/findings/steps，防 completed 伪装）+ 口径硬化（floor 粘滞位可撤销、预扫描排除 docs/CHANGELOG 噪声漏斗、Semgrep 去重键加行号、max_dispatch 抽常量）
+- **验证呈现口径根治**（v6.9.1）：静态证据标记口径统一（模板裸 `STATIC_CONFIRMED` 变体纳入状态引擎识别，静态确认证据不再空转跌 not_reproducible；伪造检测与 static_evidence 解耦，封堵 Simulated+STATIC_CONFIRMED 洗白路径）；软证据兜底分层放宽（强档五项齐 0.75 保持 / 中档类型白名单+snippet+dataflow 阈值 0.6 / 弱档不升，防洗白前置不放松）；沙箱联网开关接线（`resolve_sandbox_network_enabled` 用户配置优先 → env 兜底，四消费点接线；`sandboxNetworkEnabled` 为安全策略键，非超管写入剔除防越权开网）
 - **实时 SSE 流**：断线重连 + 心跳监控 + Last-Event-ID 语义
 - **暂停/恢复**：任务级 checkpoint + 自动周期检查点
 - **报告导出**：Markdown / PDF / JSON 多格式导出
@@ -53,7 +56,7 @@ lanjian/
 │   │   ├── api/v1/endpoints/  # 13 个 API 端点模块
 │   │   ├── core/              # 配置、安全、RBAC、Redis
 │   │   ├── db/                # 异步会话工厂 + seed
-│   │   ├── models/            # 10 个 SQLAlchemy ORM
+│   │   ├── models/            # 9 个 model 模块（16 张表）
 │   │   ├── schemas/           # Pydantic schemas
 │   │   ├── services/
 │   │   │   ├── agent/         # Multi-Agent 审计引擎（orchestrator / recon / analysis / verification）
@@ -62,12 +65,12 @@ lanjian/
 │   │   │   └── scanner.py     # 传统 SAST 扫描器
 │   │   └── main.py            # FastAPI 入口
 │   ├── alembic/               # 数据库迁移（001 → 023）
-│   ├── tests/                 # 82 个 pytest 文件 / 575 个用例
+│   ├── tests/                 # 200 个 pytest 文件（约 760+ 用例）
 │   └── pyproject.toml
 ├── frontend/                   # React 前端
 │   ├── src/
 │   │   ├── app/               # 应用入口与路由
-│   │   ├── pages/             # 15 个业务页面
+│   │   ├── pages/             # 17 个业务页面
 │   │   ├── components/
 │   │   │   ├── ui/            # shadcn/ui 组件（37 个）
 │   │   │   ├── agent/, audit/, reports/, database/, system/, layout/, common/
@@ -80,9 +83,9 @@ lanjian/
 ├── docker-compose.yml         # 默认部署
 ├── docker-compose.override.yml # 开发热更覆盖
 ├── docker-compose.prod.yml    # 生产部署
+├── docker-compose.b-amd64.yml # 历史存档（旧 B 机专用，不再使用）
 ├── openspec/                  # 规格驱动开发（changes/ + specs/）
-├── docs/                      # 架构文档 + 历史交付日志
-├── e2e/                       # Playwright E2E 测试
+├── docs/                      # 代码级流程分析（agent-execution-flow / audit-data-flow）
 ├── rules/                     # ast-grep 静态规则
 └── README.md
 ```
@@ -121,16 +124,16 @@ docker compose up -d
 #    后端 API 文档: http://localhost:8000/docs
 ```
 
-**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）：**backend `v6.7.0`**（本次发布：空参失效簇根治、验证证据绑定簇根治——含 dict poc merge 中断引发的空烧重调度根治、端点软熔断与观测增强）、**frontend `v6.7.0`**（amber warning 可见化 / 健康度面板 / 静态确认徽标）、sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
+**镜像版本控制**：`docker-compose.yml` 中的 `image` 显式锁版本（生产已禁用 `:latest` 浮动 tag）。⚠️ **发布锁定漂移提示（2026-10-16）**：代码版本已至 **v6.9.1**（P13 验证呈现口径根治），但三份 compose 仍锁定 backend/frontend **`v6.7.0`**——v6.8.0/v6.9.1 两次发版未同步 compose 锁定（v6.9.0 镜像已重建双架构并双机重部署，提交 06b6ef8；v6.9.1 无部署记录）；**下次发布部署前需先把 compose 锁定同步到目标版本再构建/推送**。sandbox `v6.1.0`（无变更）。上述镜像均为 **多架构镜像**（`linux/amd64` + `linux/arm64`，manifest 已合并），`docker compose pull` 自动匹配宿主机架构，无需手动指定架构。
 
 锁定到具体版本：
 
 ```bash
-IMAGE_TAG=v6.7.0 docker compose pull
-IMAGE_TAG=v6.0.1 docker compose up -d
+IMAGE_TAG=v6.9.1 docker compose pull
+IMAGE_TAG=v6.9.1 docker compose up -d
 ```
 
-可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v6.0.1" > .env`。
+可选：在部署机根目录建 `.env` 永久锁版本 —— `echo "IMAGE_TAG=v6.9.1" > .env`。
 
 > **镜像说明**：backend / frontend / sandbox 三镜像均发布多架构清单（manifest list）。前端镜像基于 `nginx:1.31.2-alpine`（锁定版本，兼容旧内核如 CentOS 7 / 3.10，避免浮动 tag 重建引入不兼容）。
 

@@ -1,6 +1,6 @@
 # LLM 服务层 — 工厂 + 适配器 + 编排
 
-12 文件、~3,028 行、11 个 LLM 提供商。LiteLLM 统一适配（8/11）+ 3 个原生适配器。
+13 文件、~4,032 行、11 个 LLM 提供商。LiteLLM 统一适配（8/11）+ 3 个原生适配器。
 三层架构：LLMService（编排）→ LLMFactory（路由+缓存）→ BaseLLMAdapter（调用）。
 
 ## 目录结构
@@ -8,18 +8,19 @@
 ```
 llm/
 ├── __init__.py              # 导出 LLMService + 类型 + PromptCacheManager + MemoryCompressor
-├── types.py                 # LLMProvider 枚举(11) + dataclass 契约（103 行）
-├── base_adapter.py          # Abstract BaseLLMAdapter + 重试/超时/错误分类（166 行）
-├── factory.py               # LLMFactory（带实例缓存）+ 路由逻辑（194 行）
-├── service.py               # LLMService 编排层（988 行）
-├── prompt_cache.py          # Claude Prompt Caching（316 行）
-├── memory_compressor.py     # 对话记忆压缩（333 行）
+├── types.py                 # LLMProvider 枚举(11) + dataclass 契约（151 行）
+├── base_adapter.py          # Abstract BaseLLMAdapter + 重试/超时/错误分类（183 行）
+├── factory.py               # LLMFactory（带实例缓存）+ 路由逻辑（218 行）
+├── service.py               # LLMService 编排层（1130 行）
+├── prompt_cache.py          # Claude Prompt Caching（333 行）
+├── memory_compressor.py     # 对话记忆压缩（349 行）
+├── sync_stream_bridge.py    # 同步流式调用线程桥接（事件循环冻结根治，137 行）
 └── adapters/
     ├── __init__.py
-    ├── litellm_adapter.py   # 主适配器（8/11 提供商，541 行）
-    ├── baidu_adapter.py     # 百度文心 OAuth（147 行）
-    ├── doubao_adapter.py    # 字节豆包（84 行）
-    └── minimax_adapter.py   # MiniMax 特殊错误格式（89 行）
+    ├── litellm_adapter.py   # 主适配器（8/11 提供商，1106 行）
+    ├── baidu_adapter.py     # 百度文心 OAuth（158 行）
+    ├── doubao_adapter.py    # 字节豆包（93 行）
+    └── minimax_adapter.py   # MiniMax 特殊错误格式（100 行）
 ```
 
 ## 11 提供商路由表
@@ -50,13 +51,19 @@ LLMService.config                 → 配置优先级链解析（用户配置 > 
 LLMFactory.create_adapter(config) → 带缓存（key = provider:model:api_key[:8]）
     │  路由：{BAIDU,MINIMAX,DOUBAO} → 原生 / 其余 → LiteLLM
     ▼
-adapter.complete(LLMRequest)      → LiteLLM 重试 5 次（延迟 2s）
+adapter.complete(LLMRequest)      → 非流式重试最多 5 次（指数退避 2s 起步）
+    │  llm_gate 全局并发闸包裹出站（默认 4 路，超限进程内排队）
     │  Claude → prompt_cache_manager 添加缓存断点
     │  OPENAI+自定义base_url → _native_openai_call()（讯飞 MaaS）
     │  else → litellm.acompletion()
     ▼
 LLM Provider API → LLMResponse → 返回 Agent
+
+流式路径（stream_complete）：litellm.completion(stream=True) 经 sync_stream_bridge
+剥离到工作线程执行，chunk 按 reasoning/content 分流并聚合 tool_calls。
 ```
+
+思考策略（2026-09-29 倒转）：默认强制关思考——三条出站路径统一注入 `chat_template_kwargs={"enable_thinking": False}`（强制覆盖请求级 True）；仅 `LLM_ENABLE_THINKING` + `LLM_THINKING_SEPARATE_BUDGET` 双开关齐 true 才放行思考。关思考护栏保留防注入职责：`<|think_off|>`（全域）与 `/no_think`（仅 system/user 消息中的独立命令形态）清洗恒生效。
 
 ## 配置优先级链（LLMService.config）
 
@@ -67,14 +74,19 @@ LLM Provider API → LLMResponse → 返回 Agent
 | Base URL | `user_config` | env `LLM_BASE_URL` | `DEFAULT_BASE_URLS` |
 | Model | `user_config` | env `LLM_MODEL` | `DEFAULT_MODELS` |
 | Timeout | `user_config` (ms→s) | env `LLM_TIMEOUT` (s) | `150s` |
+| Temperature | `user_config` (llmTemperature) | env `LLM_TEMPERATURE` | `0.1` |
+| Max Tokens | `user_config` (llmMaxTokens) | env `LLM_MAX_TOKENS` | `4096` |
+| Repetition Penalty | `user_config` (repetitionPenalty) | env `LLM_REPETITION_PENALTY` | `1.1` |
 
 ## 三大对外接口（LLMService）
 
 | 接口 | 用途 | 返回 |
 |------|------|------|
-| `chat_completion(messages, tools)` | Agent 主接口（支持工具调用） | `{content, usage, tool_calls}` |
+| `chat_completion(messages, tools, response_format, extra_params)` | Agent 主接口（支持工具调用） | `{content, usage, tool_calls}` |
 | `chat_completion_raw(messages)` | 简化版（无工具） | `{content, usage}` |
-| `chat_completion_stream(messages)` | 流式 async generator | 逐 chunk yield |
+| `chat_completion_stream(messages, tools, response_format, extra_params)` | 流式 async generator（chunk 按 reasoning/content 分流） | 逐 chunk yield |
+
+另有辅助方法：`get_backend_capabilities()`（tools/guided_json 后端能力探测+缓存+降级）、`get_agent_timeout_config()`、`sampling_params_summary()`。
 
 ## 7 策略 JSON 修复管道（`_parse_json`）
 
@@ -92,19 +104,20 @@ LLM Provider API → LLMResponse → 返回 Agent
 |--------|---------|
 | `BaseAgent` (agents/base.py) | `llm_service.chat_completion()` / `chat_completion_stream()` |
 | `scanner.py` | `LLMService(user_config)` |
-| Agent 核心基础设施 | circuit_breaker + rate_limiter 包裹 LLM 调用 |
-| 模块单例 | `llm_service = LLMService()` (service.py:1064) |
+| Agent 核心基础设施 | endpoint 软熔断（app/core/llm_endpoint_health.py）+ circuit_breaker + rate_limiter 包裹 LLM 调用 |
+| 模块单例 | `llm_service = LLMService()` (service.py:1130) |
 
 ## 关键配置常量
 
 | 常量 | 位置 | 值 |
 |------|------|-----|
 | `NATIVE_ONLY_PROVIDERS` | factory.py:20 | `{BAIDU, MINIMAX, DOUBAO}` |
-| LiteLLM 重试 | litellm_adapter | max_attempts=5, delay=2.0s |
+| LiteLLM 重试 | litellm_adapter | max_attempts=5, delay=2.0s（指数退避 2/4/8/16s） |
 | 基类重试 | base_adapter | max_attempts=3, delay=1.0s，4xx 不重试 |
 | 默认超时 | types.py | 150s |
 | CacheStrategy | prompt_cache.py | SYSTEM_ONLY / SYSTEM_AND_EARLY / MULTI_POINT / NONE |
 | 压缩阈值 | memory_compressor.py | token > 90% 时触发 |
+| 全局并发闸 | app/core/llm_global_gate.py | `LLM_GLOBAL_CONCURRENCY` 默认 4（超限进程内排队） |
 
 ## 新增提供商 Checklist
 
@@ -120,4 +133,4 @@ LLM Provider API → LLMResponse → 返回 Agent
 - 禁止绕过 LLMFactory 直接实例化适配器
 - 禁止在 Agent 中硬编码 provider/model
 - 禁止跳过 JSON 修复管道（所有 LLM 输出必须经 `_parse_json`）
-- 讯飞 MaaS → 必须设置 `OPENAI_API_BASE`，否则会走 LiteLLM 非原生路径
+- 讯飞 MaaS → 必须配置自定义 base_url（用户配置 `llmBaseUrl` / env `LLM_BASE_URL` / `OPENAI_BASE_URL`），否则不会走 `_native_openai_call()` 原生路径

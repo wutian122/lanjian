@@ -8,12 +8,11 @@ AI 驱动的本地化代码安全审计平台：项目导入 -> RAG 索引 + 静
 - `backend/` - FastAPI 后端，入口 `app.main:app`（详见 `backend/AGENTS.md`）
 - `backend/app/services/agent/` - Multi-Agent 审计引擎（详见其目录下 AGENTS.md）
 - `frontend/` - React 前端（详见 `frontend/AGENTS.md`）
-- `e2e/` - Playwright E2E（仅 1 个 spec、无 playwright.config，基建实际废弃）
 - `docker/sandbox/` - 沙箱镜像构建（多语言 Dockerfile + seccomp；国内镜像源，`ARG TARGETARCH` 多架构）
-- `openspec/` - OpenSpec 规格域（`specs/` 4 个规格域：audit-engine/llm-adapter/rag/sse-realtime-stream，`changes/` 为草稿变更：fix-deployment-drift-2026-08 / fix-sandbox-evidence-and-recovery / fix-verification-evidence-root / repo-cleanup-init / show-init-progress，另含 archive/）；草稿变更不代表已实施，动手前先对齐
-- `specs/` - **根规格基线**（9 个规格域，spec-merger 合并产物，git 跟踪）：agent-audit-init-progress / llm-field-type-hardening / login-and-verification-evidence / rag-indexing-hardening / security-hardening / verification-completeness / verification-crash-match-binding / verification-poc-quality / version-bump
-- `changes/` - spec-superflow 变更目录（已归档 change 的规划工件，**gitignore 不跟踪**）；活动变更在 `.superpowers/`（同样 gitignore）
-- `docs/` - 代码级流程分析（agent-execution-flow / audit-data-flow）+ 安全加固交付报告 + `e2e-test-prompt.md`/`e2e-test-report-2026-08-28.md`（五层 E2E 测试规范与报告，问题清单 #1-#6 是 v6.2.5 修复依据）；另根目录有 `security-hardening-2026-08/`（安全加固变更规划工件）
+- `openspec/` - OpenSpec 规格域（`specs/` 7 个规格域：audit-engine/llm-adapter/llm-call-params/llm-structured-output/rag/sse-realtime-stream/thinking-stream-separation；`changes/` 变更：sandbox-verification-hard-gate / fix-sandbox-evidence-and-recovery / fix-audit-observability-time-governance / fix-deployment-drift-2026-08 任务全勾，repo-cleanup-init / show-init-progress 无任务清单，均未归档；p10-degenerate-optimization / p12-candidate-preservation 为空壳（对应代码已实施）；另含 archive/）；未归档变更不代表已关闭，动手前先对齐
+- `specs/` - **根规格基线**（11 个规格域，spec-merger 合并产物，git 跟踪）：agent-audit-init-progress / agent-task-cleanup / agent-time-budget / llm-field-type-hardening / login-and-verification-evidence / rag-indexing-hardening / security-hardening / verification-completeness / verification-crash-match-binding / verification-poc-quality / version-bump
+- `changes/` - spec-superflow 变更目录（已完成变更的规划工件残留，**gitignore 不跟踪**）；活动变更在 `.superpowers/`（同样 gitignore）
+- `docs/` - 代码级流程分析（agent-execution-flow / audit-data-flow，2026-06 产出，行号有漂移仅作架构参考）
 - `rules/` - ast-grep 规则（仅 SelectItem.yml，前端 TSX lint 用；后端审计不使用 ast-grep）
 - compose 四件套：`docker-compose.yml`（默认）/ `docker-compose.override.yml`（开发热更）/ `docker-compose.prod.yml`（生产，含独立 db-migrate 服务）/ `docker-compose.b-amd64.yml`（**历史存档，不再使用**：旧 B 机 192.168.238.11 现场专用 override；2026-09 起 B 机为 192.168.238.132 新机，直接用标准 `docker-compose.yml`）
 - `.codegraph/` - 已建 CodeGraph 索引，定位代码优先 `codegraph explore` 再用 rg
@@ -70,10 +69,13 @@ docker compose logs -f backend                  # 日志
 | 蓝鉴 compose | `docker-compose.yml`（**仅 4 服务：db/redis/backend/frontend，无 sandbox 服务定义**） | `docker-compose.yml`（仓库默认；锁 `v6.5.0-arm64` + sandbox `v6.1.0-arm64`） |
 | 实测版本 | **`v6.5.0`**（compose 2026-09-10 更新；2026-09-26 实测核实） | **`v6.5.0-arm64`**（2026-09-26 实测核实） |
 
+- **2026-10-16 代码 v6.9.1（P13 验证呈现口径根治，a598749 + 6a78e16）**：仓库无重建镜像/部署记录。同期部署层变更（a598749 提交信息）：双机 env `SANDBOX_NETWORK_ENABLED=true` 已生效（沙箱联网开启）。
+- **2026-10 中 v6.9.0 已重建双架构镜像并双机重部署（06b6ef8 提交信息，未实测核实）**：内容为 P10（崩坏优化，v6.8.0）+ P11（崩坏重试差异化采样）+ P12（丢失链根治）；06b6ef8 修正 frontend/package.json 版本号 6.8.0→6.9.0（P11/P12 仅 bump backend 致前端页面版本显示滞后）。⚠️ **发布锁定漂移**：v6.8.0/v6.9.1 两次发版未同步三份 compose 的镜像锁定（仍 `v6.7.0`），下次发布前需先同步。
+- **2026-10 上旬 v6.7.0 / 2026-09 底 v6.6.0（b87c6a6 P9 根治 14 项 + 终审 2 项加固；1be7162 v6.6.0 同步；dfaa03d v6.7.0 README/三 compose 锁定同步）**：仓库无独立部署记录（v6.7.0 compose 锁定已同步，其后续 v6.8.0 起漂移）。
 - **2026-09-10 v6.5.0 已部署（2026-09-26 双机 SSH 实测核实）**：backend/frontend `v6.5.0`（sandbox 未动）。同期 B 机整体迁移：原 CentOS 7（`192.168.238.11`）下线，换新 VMware 虚拟机 `192.168.238.132`（Ubuntu 26.04.1，amd64）；B 机 compose 改为 4 服务精简版（**无 sandbox 服务定义**，backend env `SANDBOX_IMAGE=v6.1.0` 保持 PoC 能力）；旧机宿主机 nginx :8080 的 drone-platform 业务未迁移。A 机 compose 锁 `v6.5.0-arm64` + sandbox `v6.1.0-arm64`。
 - 容器形态（2026-09-26 实测）：A 机 5 容器——`db`/`redis`（healthy）/`backend`/`frontend` + 2026-09-06 的旧基底容器 `lanjian-sandbox-1`（镜像名显示 `v5.1.0-arm64` 但 backend env `SANDBOX_IMAGE=v6.1.0-arm64`，实际起 PoC 用后者，勿被镜像名误导）；B 机 4 容器（无 sandbox 常驻基底）。
 - 镜像来自 Docker Hub 组织 `wutian449`（lanjian-backend / lanjian-frontend / lanjian-sandbox），均为多架构（amd64 + arm64）；生产已锁 `v6.5.0`（backend/frontend）/ `v6.1.0`（sandbox），禁止 `:latest` 浮动。
-- **2026-08-29 v6.2.5 已部署（A/B 双机实测核实，2026-08-30）**：backend+frontend 均 `v6.2.5`（**sandbox 保持 `v6.1.0`**）。内容为六项 E2E 缺陷修复（对应 docs/e2e-test-report-2026-08-28.md 问题 #1-#6）。arm64 镜像为 A 机本地 buildx 构建（backend 8-28 22:06、frontend 8-29 09:05）；A 机另有长亭系新容器 agent-compose/octobus（与蓝鉴无关）。
+- **2026-08-29 v6.2.5 已部署（A/B 双机实测核实，2026-08-30）**：backend+frontend 均 `v6.2.5`（**sandbox 保持 `v6.1.0`**）。内容为六项 E2E 缺陷修复（六项问题源自 2026-08-28 五层 E2E 测试，报告已清理）。arm64 镜像为 A 机本地 buildx 构建（backend 8-28 22:06、frontend 8-29 09:05）；A 机另有长亭系新容器 agent-compose/octobus（与蓝鉴无关）。
 - **2026-08-19 只读实测**：两台 5 容器全部 `v5.1.0`、db/redis healthy、sandbox 按设计 Exited(0)；生效 compose 经容器 label 核实（B=`b-amd64.yml`，A=默认 `docker-compose.yml`）；A 机另有 buildx buildkit 常驻容器（本地构建用）。
 - **2026-08-27 v6.2.4 已部署**：两台服务器（A/B）backend + frontend 已升级到 `v6.2.4`（**sandbox 保持 `v6.1.0`**）。内容：① 任务临时目录清理根治（REQ-CLEAN-1/2/3：任务终态 finally 清理 `/tmp/lanjian/<task_id>`、reverify 兼容已清理目录（ZIP 重解压/仓库 409）、delete 任务兜底清理）——根因是服务器 A 的 `/tmp` 为 16G tmpfs，任务目录从不清理致 46 个目录累积 13G 塞满，新任务 `[Errno 28]` 失败并连带 db/redis 误报 unhealthy（清理后自动恢复）；② 前端纯版本号升级 6.2.3→6.2.4（无功能变更）。生产回归 PASS：任务 c7b646d7 终态后目录被清理、`/tmp` 保持 1%、db/redis healthy；Hub 多架构已上传：backend（amd64 `95a1caaa`/arm64 `d455d278`）+ frontend（amd64 `2770dc11`/arm64 `b232351c`）。部署经验：10.129.30.219 代理对 Docker Hub **body 上传会破坏内容**（16 字节已知内容也 DIGEST_INVALID，docker push 全路径失败），网络恢复后 B 机 docker push 成功（老板登录后网络恢复）；manifest 合并若 docker manifest push EOF 用 B 机 curl 手动 PUT manifest list。
 - **2026-08-27 v6.2.3 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v6.2.3`，**sandbox 保持 `v6.1.0`**。内容为语言 sink pattern 正则转义修复（REQ-CM-5：path_traversal/command_injection 未转义括号致 re.error 崩溃）+ 防回归测试。回归任务 f7f91565 实证中；代理 `10.129.30.219` 对 docker push 间歇 EOF（重试后成功）。
@@ -86,7 +88,7 @@ docker compose logs -f backend                  # 日志
 - **2026-08-23 v6.0.1 已部署**：两台服务器（A/B）backend 已升级到 `v6.0.1`（**frontend 保持 `v6.0.0`**，本次无前端改动），**sandbox 仍锁 `v5.1.0`**。内容为验证完整性修复（验证清单全量送验/R4+轮次耗尽程序化补验/模板正则修复+poc_error 分档/sink 挂钩收敛误报/static 口径收紧）。A 机生产回归（nacos）2/2 confirmed 通过。
 - **2026-08-21 v5.4.0 已部署**：两台服务器（A/B）backend+frontend 已升级到 `v5.4.0`，**sandbox 仍锁 `v5.1.0`**（本次未重建沙箱镜像）。本次同样为**每台服务器本地重新构建镜像**（基于 v5.3.0 镜像叠加 v5.4.0 代码），内容为验证引擎根治（R1-R7 确定性证据判定与门禁终止）+ 北京时间统一输出。
 - ⚠️ **v5.1.0 镜像是重打 tag，不是重新构建**（历史教训）：三个镜像的层创建于 2026-06/07（v5.0.0 时代），v5.1.0 为纯版本号升级；两台前端容器显示的 5.1.0 是 2026-08-18 容器重建后**就地 sed 修补 dist**（index/icons/utils 三个 JS bundle）的产物--**recreate 容器后版本号显示会回退 5.0.0**。**v5.3.0 已改为真正重新构建**（见上一条），改代码必须重新 build 镜像再更新两台，只 bump 版本号无效。
-- 部署凭证（SUPERADMIN/POSTGRES 密码、SECRET_KEY）见 `docs/security-hardening-2026-07-DELIVERY.md` §6，登录凭证已录入 remote-shell 加密凭证库（credctl）。
+- 部署凭证（SUPERADMIN/POSTGRES 密码、SECRET_KEY）已录入 remote-shell 加密凭证库（credctl，解锁后可查）；历史交付报告（2026-07 安全加固）已随文档清理移除，背景可查 git 历史。
 - **远程操作唯一入口是 remote-shell 技能**，默认只读，危险操作须老板确认。
 
 ### 各服务器部署的业务
@@ -113,16 +115,16 @@ docker compose logs -f backend                  # 日志
 - 敏感字段 Fernet 加密存储，密文带 `enc:v1:` 前缀；SECRET_KEY 轮换会显式抛异常。
 - RBAC 三级角色（super_admin / admin / user）+ 行级数据范围隔离；项目资源访问统一走 `assert_can_access_project`（2026-08 安全加固已补上 members.py 遗漏的断言；前端用户管理已对 admin 开放，与后端下辖管理 RBAC 对齐）。
 - 沙箱 `/workspace/src` 只读，PoC 写 `/workspace/poc`（容器 read_only + cap_drop ALL + 默认 network none + 60s 超时；SANDBOX_IMAGE 代码默认 `:latest`，生产靠 compose 锁 v6.1.0 覆盖）。
-- **uv.lock 与 pyproject 不同步**：lock 停在 v3.5.0 时代（含 langchain/langgraph 等 pyproject 未声明的依赖），pyproject 已 6.2.3；动依赖先 `uv lock` 再全量测试。
+- **uv.lock 与 pyproject 已同步（2026-08-20 起）**：langchain/langgraph 已从 uv.lock 清除（4f34123，v5.2.0），lock 随版本发版同步更新；动依赖仍须先 `uv lock` 再全量测试。
 - **SSE 只服务 Agent 审计页**：前端 useResilientStream 用 fetch+ReadableStream（非 EventSource，需 Bearer header），心跳 45s/长操作 180s、Last-Event-ID + after_sequence 续传、最多重连 5 次；普通审计任务是 setInterval 轮询（2s->60s 分级），无 SSE。
 - **前端版本号在构建期硬编码进 JS bundle**（package.json version 经 vite 注入），运行时不可配；升版本必须重构建前端镜像。
 - **大项目审计"0 漏洞"根因（2026-08-30 诊断，nacos/tomact 两任务实证）**：默认 `timeout_seconds=1800` 的预算时钟从 orchestration 起算（RAG 索引等 preparation ~20 分钟在计时之外但占真实时间）；子 Agent 单次调度硬上限 recon=300s / analysis=1200s（`orchestrator.py:1916-1923`，config `SUB_AGENT_TIMEOUT_SECONDS=1200`）；Qwen3.8-27B 约 40s/轮 → 5000 文件级项目 analysis 只够 ~30 轮探索，走不到 Final Answer → 全程 0 个 finding_new → 覆盖率门禁以"无发现"全部跳过 → 终态 `completed`"发现 0 个漏洞"（**不是干净结论，是时间预算饥饿**）。次生缺陷：调度超时清理调用 `agent.cancel()` 后 `_cancelled` 单向锁死（`base.py:534-536`），同类型 Agent 复用实例的补发调度即刻"任务已取消"退出（带陈旧统计"0 个发现, 30 轮迭代"），全部恢复尝试空转。**审计大项目必须建任务时调大 timeout_seconds（上限 7200）或缩小审计范围**。
 - **时间预算治理（fix-audit-time-budget-2026-08 修复上述根因，四层机制）**：① 任务 `timeout_seconds` 经 `input_data.task_timeout_seconds` 传入 orchestrator（回退 `agent_timeout`/1800），主循环硬阈值 break（config `TIME_BUDGET_HARD_FLOOR_SECONDS=60`）；② 剩余 <`SOFT_STOP_SECONDS=180` 时经 0.5s 调度轮询对 in-flight analysis 幂等请求**软停止**（`BaseAgent.request_soft_stop`，与取消语义分离）→ analysis 走 `_run_forced_summary` 立即交卷（合并语义：已有发现 extend/空列表 replace）；③ 调度超时 = `min(类型上限, 剩余预算)`、剩余 ≤`MIN_DISPATCH_SECONDS=30` 拒发新调度、调度前 `reset_dispatch_cancel()` 复位超时锁存（`_user_cancelled` 用户取消锁存不可被复位）；④ 任务超时 watchdog 化（`_run_orchestrator_with_budget_watchdog`）：到点 `mark_deadline_hit()` + `GRACE_SECONDS=45` 宽限优雅收口，宽限内返回注入 `task_timeout` bypass，宽限耗尽 hard-cancel 兜底——Py3.12 `wait_for` 吞取消语义下原 916-936 兜底是死代码的缺陷由此根治；0 发现+调度失败 → `dispatch_budget_exhausted` → `completed_with_gaps`（metadata reason 优先级 task_timeout（最高，端点侧收口覆盖）> 运行中先写先赢的 bypass（token 预算/覆盖率门禁/task_deadline_exhausted）> dispatch_budget_exhausted（0 发现+调度失败兜底））。
 
-## 代码速览（2026-08-27 全量深读核验）
+## 代码速览（2026-08-27 全量深读核验；2026-10-16 数字刷新至 v6.9.1）
 
-- 后端：13 个 API 端点模块（`agent_tasks.py` 最大，4803 行，含 SSE 流式/RAG 索引/任务生命周期）；16 张表 / 9 个 model 文件；24 个 alembic 迁移（head=`023_drop_dead`）；**86 个测试文件**（asyncio_mode=auto，含 `tests/agent/`、`tests/rag/` 专项）。
-- 审计引擎：OrchestratorAgent（ReAct 循环 + Semgrep 预扫描）调度 Recon/Analysis/Verification 三子 Agent；27 种 SSE 事件（`models/agent_task.py` 的 `AgentEventType` 枚举）；D1-D10 十维度覆盖率门禁；LLM 调用经熔断器 + 令牌桶限流（均已接线）。
+- 后端：13 个 API 端点模块（`agent_tasks.py` 最大，5794 行，含 SSE 流式/RAG 索引/任务生命周期/LLM 健康度）；168 个业务 py 约 7.1 万行；9 个 model 模块 / 16 张表；24 个 alembic 迁移（head=`023_drop_dead`）；**200 个测试文件 / 约 760+ 用例**（asyncio_mode=auto，纯单元，含 `tests/agent/`、`tests/rag/` 专项）。
+- 审计引擎：OrchestratorAgent（ReAct 循环 + Semgrep 预扫描）调度 Recon/Analysis/Verification 三子 Agent；29 种 SSE 事件（`models/agent_task.py` 的 `AgentEventType` 常量类）；D1-D10 十维度覆盖率门禁；LLM 调用经端点软熔断 + 熔断器 + 令牌桶限流 + 全局并发闸（均已接线）。
 - 静态检测三套：沙箱内外部工具 7 种（Semgrep/Bandit/Gitleaks/TruffleHog/npm audit/Safety/OSV-Scanner）+ 内置 OWASP 正则模式库 + DB 中的 AuditRuleSet（LLM 提示词规则）。
 - **RAG 索引加固（v5.3.0 新增）**：`indexer.py` 构建产物路径段排除 + minified 启发式（`BUILD_ARTIFACT_DIR_SEGMENTS` / `MAX_SINGLE_LINE_LENGTH=2000` / `MAX_SOURCE_FILE_SIZE=2MB`）、单文件分块护栏（`FILE_CHUNK_TIMEOUT=20s` 跳过、`MAX_CHUNKS_PER_FILE=500` 截断）、有界并发（`CHUNK_CONCURRENCY=4` 分批 gather）、嵌入快速失败（`EmbeddingUnavailableError` 重试耗尽后抛出，agent_tasks `rag_unavailable` 分支，禁止写入零向量）、进度消息分阶段标注（`CHUNK_PROGRESS_MSG_TEMPLATE`=分块进度 / `EMBED_PROGRESS_MSG_TEMPLATE`=嵌入进度）。烟雾脚本 `backend/smoke_rag_indexing.py`，新测试 `backend/tests/rag/test_indexing_hardening.py`。
 - **验证引擎根治（v5.4.0 新增）**：`verification.py` 新增纯函数 `compute_verification_status`（R1 确定性状态引擎：由 sandbox_attempts 证据推导 verification_status/is_verified，不信任 LLM 自述 verdict；仅保留 false_positive / sandbox_skip_reason 两个显式标注位）+ `_bind_runtime_evidence_to_all`（R2 全量证据按 finding_id 强制绑定，LLM 漏报不丢证据）+ `FABRICATION_MARKERS` 反伪造（R3：Simulated/模拟输出/源码缺失标记 `fabricated`，排除出判定与门禁）+ 确定性沙箱执行（R3 前置执行全部预生成 PoC）；`orchestrator.py` 门禁 3 次终止（R4 `verification_max_force_redispatch` 默认 3）+ Bug D 判定修正（R5：needs_context 视为未验证）+ observations 记录（R6）+ 中断收口（R7 补发 dispatch_complete/phase_complete）；`agent_tasks.py` 持久化 observations 到 `agent_tasks.observations`；`app/core/timeutil.py` 新增北京时间统一序列化（UTC+8），`main.py`/`agent_tasks.py` 全部 API/SSE 时间字段走 `serialize_cst`。测试见 `tests/agent/test_verification_evidence.py`（42 用例）与 `tests/agent/test_orchestrator_gates.py`。
@@ -131,8 +133,13 @@ docker compose logs -f backend                  # 日志
 - **验证引擎 PoC 质量修复（v6.2.0 新增）**：`verification.py` 新增 `_language_sink_patterns`（REQ-VP-1：deserialization/ssrf/path_traversal 模板按 file_path 扩展名选 sink pattern，Java 识别 ObjectInputStream/HttpURLConnection 等，修复 Python pattern grep Java 源码空转）；确定性沙箱执行发 sandbox_start/sandbox_result 事件（REQ-VP-2，`AgentEventType.SANDBOX_*` 从死枚举接线）+ `execute_tool` 对 sandbox_exec 发事件 + 前端 `LogType`/`onEvent` 渲染；`is_strict_finding` 放宽保留理论风险 finding（REQ-VP-3，缺 file_path 但 confidence>=0.7 且有 title+description，nginx 型不再整条消失）；`_attach_runtime_sandbox_attempts` 第三级路径后缀+vuln_type 兜底（REQ-VP-4，Tribes 型不再 null）。测试 `test_verification_poc_language.py`/`test_sandbox_events.py`/`test_strict_finding_theoretical.py`/`test_evidence_binding_fallback.py`。
 - **验证过程四缺陷修复（v6.2.2 新增）**：REQ-CM-1 空 file_path 崩溃防御；REQ-CM-2 铁证匹配丢弃修复（`_language_sink_patterns` 判定与 evidence 匹配链路）；REQ-CM-3 证据绑定 ID 回填；REQ-CM-4 SSRF 死循环修复。测试 `test_verification_poc_crash_match_binding.py` 等。
 - **语言 sink pattern 正则转义（v6.2.3 新增）**：REQ-CM-5 path_traversal/command_injection 模板 pattern 未转义括号致 `re.error` 崩溃修复 + 防回归测试。
-- **E2E 六项缺陷修复（v6.2.5 新增，2026-08-29 部署）**：对应 `docs/e2e-test-report-2026-08-28.md` 问题 #1-#6（EventQueue 饱和 → thinking_token 聚合+非阻塞入队 `event_manager.py`、reverify poc_code 误降级 → 重放 sandbox_attempts 真实 PoC、沙箱只读覆盖确定性执行路径、多文件 findings 落库、验证覆盖、仪表盘统计）。
-- 前端：16 个页面 / 13 条业务路由（无角色分流，权限全靠后端 API）；React Context + useReducer（无 zustand）；无单测框架（仅 3 个静态断言脚本）；三层 lint = tsgo + Biome（单规则）+ ast-grep。
+- **E2E 六项缺陷修复（v6.2.5 新增，2026-08-29 部署）**：六项问题源自 2026-08-28 五层 E2E 测试（报告已清理）——EventQueue 饱和 → thinking_token 聚合+非阻塞入队 `event_manager.py`、reverify poc_code 误降级 → 重放 sandbox_attempts 真实 PoC、沙箱只读覆盖确定性执行路径、多文件 findings 落库、验证覆盖、仪表盘统计。
+- **沙箱验证硬门禁与产出下限（v6.5.0 新增）**：封堵十条绕过沙箱直达终态的豁免路径；基础设施故障分离 `infra_error` 语义；Analysis 分层候选制 + 维度级产出下限 + Semgrep 兜底落库；audit_trace 全链路闭环；LLM 调用韧性 + 分阶段 max_tokens 预算治理；pending 任务手动启动入口；详见 README v6.5.0 条目与引擎 AGENTS.md。
+- **LLM 输出韧性与过载治理（v6.6.0 新增）**：思考策略差异化、输出崩坏萌芽检测+静默重试与乱码墙治理（根治双机 0 发现）、tool_calls 通道健壮化、空响应救援序列、评分输入改用落库口径、dispatch 预算守卫、前端 LLM 健康度横幅与指标面板。
+- **空参失效簇 / 验证证据绑定簇 / 端点软熔断（v6.7.0 新增）**：无标签 JSON 提取 helper 接入四个解析器、格式纠正 nudge、`coerce_mapping_arg` 形状防御、沙箱 wrapper 六语言注入加固；merge 阶段三字段安全归一防 KeyError 中断、verdict→verification_status 归一映射+证据前置防洗白、fingerprint 落库接线、持久证据归档 FIFO；EndpointHealth 按 base_url 滑动窗口软熔断（throttle 5s/收口 30s/冷却 120s）、LLM 全局并发 6→4、`garbled_drops` 如实归账。
+- **崩坏优化与丢失链根治（v6.8.0 P10 / v6.9.0 P11+P12）**：崩坏采集 JSONL 诊断通道、8 类误杀防护、检测器硬化、`VERIFIED_COUNT_STATUSES` 口径统一；崩坏重试差异化采样（rp+0.15×boost 封顶 +0.45）；交卷候选保全、`_unified_closeout` 统一收口、预扫描排 docs 噪声漏斗。
+- **验证呈现口径根治（v6.9.1 P13）**：裸 STATIC_CONFIRMED 标记纳入状态引擎识别、软证据兜底分层（强 0.75/中 0.6 白名单/弱不升）、`resolve_sandbox_network_enabled` 沙箱联网开关接线（用户配置优先→env 兜底，安全键防越权）、伪造检测与 static_evidence 解耦。
+- 前端：17 个页面 / 13 条业务路由（无角色分流，权限全靠后端 API）；React Context + useReducer（无 zustand）；6 个契约/重连测试（`.test.ts/.test.tsx/.test.mjs`）；三层 lint = tsgo + Biome（单规则）+ ast-grep。
 
 ## 编码规范
 
@@ -143,10 +150,11 @@ docker compose logs -f backend                  # 日志
 
 ## 改动前先读
 
-- 动后端 → `backend/AGENTS.md`（2026-08-20 已核对：端点模块 13 个 / 模型 9 个 / 迁移 24 个（head=`023_drop_dead`）/ 测试 78 个文件，agent_tasks/projects 行数及 Semgrep 条目已修正；其余文件内细节仍以代码为准）
-- 动前端 → `frontend/AGENTS.md`（2026-08-20 已删除已被移除的 apiInterceptor 引用（commit 104da40）；组件/路由/zod 等描述仍以代码为准）
-- 动审计引擎 → `backend/app/services/agent/AGENTS.md`（2026-08-20 已核对：SSE 事件类型 27 种（`models/agent_task.py` 枚举）、关键超时/迭代常量与 `config.py` 一致）
+- 动后端 → `backend/AGENTS.md`（端点模块 13 个 / model 9 个 / 迁移 24 个（head=`023_drop_dead`）/ 测试 200 个文件；其余文件内细节仍以代码为准）
+- 动前端 → `frontend/AGENTS.md`（组件/路由/zod 等描述仍以代码为准）
+- 动审计引擎 → `backend/app/services/agent/AGENTS.md`（2026-10-16 已刷新至 v6.9.1：SSE 事件 29 种、轮次/预算常量与运行时硬编码值对齐、弹性模式含 P5-P13 全部治理机制）
+- 动 LLM 层 → `backend/app/services/llm/AGENTS.md`（2026-10-16 已刷新至 v6.9.1：13 文件 4032 行、思考策略倒转、全局并发闸、指数退避口径）
 - 动 RAG → `backend/app/services/rag/AGENTS.md`（与代码一致性良好）
 - 动审计引擎规格 → `openspec/specs/audit-engine/spec.md`；正式规格基线见根 `specs/`（spec-merger 合并产物，改需求先对齐 spec 再动代码）
-- 安全加固背景 → `docs/security-hardening-2026-07-DELIVERY.md`（§6 部署凭证、§7 留待老板事项）
-- 代码级流程 -> `docs/agent-execution-flow.md` + `docs/audit-data-flow.md`（2026-06-22 产出；2026-08-20 已修正"熔断/限流未接入"与"18 种事件"两条过时结论，其余行号仍可能有漂移，仅作架构参考）
+- 安全加固背景 → 根 `specs/security-hardening/spec.md`（基线；2026-07 交付报告已清理，背景可查 git 历史）
+- 代码级流程 -> `docs/agent-execution-flow.md` + `docs/audit-data-flow.md`（2026-06-22 产出；2026-08-20 已修正"熔断/限流未接入"与"18 种事件"两条过时结论；v6.5.0 之后引擎演进见引擎 AGENTS.md「输出质量与收口治理」小节，其余行号仍可能有漂移，仅作架构参考）

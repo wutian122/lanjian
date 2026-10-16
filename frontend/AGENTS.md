@@ -29,24 +29,28 @@ frontend/
 │   ├── app/                      # 应用根组件 + 路由配置（14 条路由）
 │   │   ├── main.tsx              # 入口（ThemeProvider + AuthProvider + HelmetProvider）
 │   │   ├── App.tsx               # 根组件（BrowserRouter + Routes）
-│   │   ├── routes.tsx            # 路由配置表（13 条路由，含隐藏路由）
+│   │   ├── routes.tsx            # 路由配置表（14 条路由，含隐藏路由）
 │   │   └── ProtectedRoute.tsx    # 路由守卫（未认证→/login，已认证 / → /dashboard，无角色分流）
 │   ├── pages/                    # 路由页面
 │   │   ├── AgentAudit/           # ⭐ Agent 审计 UI（最复杂页面，模块化拆分）
-│   │   │   ├── index.tsx         # 主页面入口
+│   │   │   ├── index.tsx         # 主页面入口（1869 行，含 LLM 健康度横幅渲染）
 │   │   │   ├── types.ts          # 类型定义（State、Action、Props）
 │   │   │   ├── constants.tsx     # 视觉配置（颜色、图标、轮询间隔）
 │   │   │   ├── utils.ts          # 工具函数（树构建、日志过滤、AI 上下文摘要）
 │   │   │   ├── hooks/
 │   │   │   │   ├── useAgentAuditState.ts  # 核心状态 Hook（useReducer，23 个 case）
-│   │   │   │   └── useResilientStream.ts  # SSE 弹性流 Hook（604 行）
+│   │   │   │   ├── useResilientStream.ts  # SSE 弹性流 Hook（620 行）
+│   │   │   │   └── resilientStreamPolicy.ts # 重连策略纯函数（可测）
 │   │   │   └── components/
 │   │   │       ├── Header.tsx            # 页头（任务状态、取消/导出/新建）
 │   │   │       ├── SplashScreen.tsx      # 欢迎屏
+│   │   │       ├── InitProgress.tsx      # RAG 索引初始化进度
 │   │   │       ├── LogEntry.tsx          # 日志条目渲染
 │   │   │       ├── AgentTreeNode.tsx     # Agent 树节点
 │   │   │       ├── AgentDetailPanel.tsx  # Agent 详情面板
-│   │   │       ├── StatsPanel.tsx        # 统计面板
+│   │   │       ├── FindingDetailPanel.tsx # 漏洞详情面板（含 verification_note「验证说明」渲染）
+│   │   │       ├── FindingSandboxEvidence.tsx # 沙箱证据四标记（fabricated/static_evidence/poc_error/infra_error）
+│   │   │       ├── StatsPanel.tsx        # 统计面板（含「LLM 输出健康度」区块 + 验证状态五态分布徽标）
 │   │   │       ├── AICollaborationPanel.tsx # AI 协作面板
 │   │   │       ├── ConnectionStatus.tsx  # SSE 连接状态
 │   │   │       ├── AgentErrorBoundary.tsx # 错误边界
@@ -230,6 +234,15 @@ disconnected → connecting → connected
 - Phase 3：15s 间隔（5-15 分钟）
 - Phase 4：60s 间隔（15 分钟后）
 
+## LLM 健康度与验证呈现（v6.6.0–v6.9.1）
+
+- **健康度横幅**（index.tsx）：`task.observations.llm_health.degraded=true` 时显示橙色横幅「LLM 输出质量异常（截断/空响应占比过高），本轮审计结论可能不完整」
+- **LLM 输出健康度区块**（StatsPanel）：收口后读 `observations.llm_health` 权威口径（LLM 调用/截断/空响应/格式失败/乱码丢弃 5 指标），degraded 橙框 +「输出质量异常」徽标；运行中按 `llmRuntimeWarnings` 实时事件计数
+- **验证状态五态分布**（StatsPanel）：confirmed（动态确认）/ static_confirmed（「静态确认」徽标，P5-4 补齐）/ not_reproducible / needs_context / false_positive 完整呈现
+- **amber warning 类型**（LogEntry）：崩坏/格式 warning 前端 amber 类型可见化（v6.7.0）
+- **「验证说明」渲染**（FindingDetailPanel）：`verification_note` 三字段在漏洞详情可见（v6.7.0）
+- 沙箱证据四标记（FindingSandboxEvidence）：fabricated 红="伪造证据已排除" / static_evidence 蓝 / `poc_error` 琥珀 / `infra_error` 灰 + `sandbox_skip_reason` 中文释义
+
 ## 认证与权限
 
 ```
@@ -301,6 +314,10 @@ pnpm format           # Biome 格式化
 | Agent 审计 UI | `pages/AgentAudit/` | SSE 流式审计日志 |
 | SSE 连接 | `pages/AgentAudit/hooks/useResilientStream.ts` | 弹性流 |
 | Agent 审计状态 | `pages/AgentAudit/hooks/useAgentAuditState.ts` | useReducer |
+| LLM 健康度 | `pages/AgentAudit/index.tsx`（横幅）+ `components/StatsPanel.tsx`（面板） | degraded 可见化 |
+| 验证说明/漏洞详情 | `pages/AgentAudit/components/FindingDetailPanel.tsx` | verification_note 渲染 |
+| 沙箱证据标记 | `pages/AgentAudit/components/FindingSandboxEvidence.tsx` | 四标记 + skip_reason 释义 |
+| 前端契约测试 | `pages/AgentAudit/**/__tests__/`、`hooks/resilientStreamPolicy.test.ts` | 6 个 .test.ts/.test.mjs/.test.tsx |
 | 项目详情 | `pages/project-detail/` | 项目仪表盘 + 漏洞列表 |
 | 仪表盘 | `pages/Dashboard.tsx` | 安全态势概览 |
 | AI 控制中心 | `pages/AI/` | 全局 AI 对话 |

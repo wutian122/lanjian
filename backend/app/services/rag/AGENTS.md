@@ -1,7 +1,7 @@
 # RAG 管道 — 代码索引与语义检索
 
-5 文件、~3,775 行。tree-sitter AST 分块 → 7 个 Embedding 提供商 → ChromaDB 向量存储 → 语义检索。
-支持智能/增量/全量三种索引模式。
+5 文件、~4,029 行。tree-sitter AST 分块 → 7 个 Embedding 提供商 → ChromaDB 向量存储 → 语义检索。
+支持智能/增量/全量三种索引模式。（2026-10-16 行数刷新；v6.5.0 以来本模块代码零变更）
 
 ## 目录结构
 
@@ -9,9 +9,9 @@
 rag/
 ├── __init__.py       # 模块边界（35 行），导出 9 个公共符号
 ├── splitter.py       # 代码拆分（850 行）：tree-sitter AST + 正则回退 + 行级回退
-├── embeddings.py     # 嵌入服务：7 个提供商 + 工厂 + 缓存 + 重试（耗尽后抛 EmbeddingUnavailableError 快速失败，杜绝零向量静默入库）
-├── indexer.py        # 代码索引（1453 行）：智能/增量/全量 + ChromaVectorStore + InMemoryVectorStore
-└── retriever.py      # 代码检索（588 行）：语义/混合/函数上下文/相似代码
+├── embeddings.py     # 嵌入服务（935 行）：7 个提供商 + 工厂 + 缓存 + 重试（耗尽后抛 EmbeddingUnavailableError 快速失败，杜绝零向量静默入库）
+├── indexer.py        # 代码索引（1620 行）：智能/增量/全量 + ChromaVectorStore + InMemoryVectorStore
+└── retriever.py      # 代码检索（589 行）：语义/混合/函数上下文/相似代码
 ```
 
 ## 数据流
@@ -49,15 +49,15 @@ CodeRetriever.retrieve(query, top_k=10)
 
 | 类 | 文件 | 行 | 职责 |
 |----|------|:--:|------|
-| `EmbeddingProvider` (ABC) | embeddings.py | 28 | 抽象基类 |
-| `EmbeddingService` | embeddings.py | 595 | 统一入口，SHA256 缓存，批量嵌入 |
-| `CodeSplitter` | splitter.py | 329 | 三级分块（AST→正则→行级） |
-| `TreeSitterParser` | splitter.py | 138 | 21 语言 tree-sitter 解析 |
-| `CodeIndexer` | indexer.py | 679 | 核心索引器（3 种模式） |
-| `ChromaVectorStore` | indexer.py | 197 | ChromaDB 持久化（cosine 距离） |
-| `InMemoryVectorStore` | indexer.py | 525 | 测试回退 |
-| `CodeRetriever` | retriever.py | 75 | 5 种检索方法 |
-| `RetrievalResult` | retriever.py | 20 | 含 score + security_indicators |
+| `EmbeddingProvider` (ABC) | embeddings.py | 20 | 抽象基类 |
+| `EmbeddingService` | embeddings.py | 330 | 统一入口，SHA256 缓存，批量嵌入 |
+| `CodeSplitter` | splitter.py | 523 | 三级分块（AST→正则→行级） |
+| `TreeSitterParser` | splitter.py | 191 | 21 语言 tree-sitter 解析 |
+| `CodeIndexer` | indexer.py | 904 | 核心索引器（3 种模式） |
+| `ChromaVectorStore` | indexer.py | 333 | ChromaDB 持久化（cosine 距离） |
+| `InMemoryVectorStore` | indexer.py | 154 | 测试回退 |
+| `CodeRetriever` | retriever.py | 516 | 5 种检索方法 |
+| `RetrievalResult` | retriever.py | 55 | 含 score + security_indicators |
 
 ## 7 个 Embedding 提供商
 

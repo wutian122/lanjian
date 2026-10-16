@@ -14,7 +14,7 @@ backend/
 │   │   └── v1/
 │   │       ├── api.py                # 路由聚合器（13 个端点模块）
 │   │       └── endpoints/
-│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期，4803 行）
+│   │           ├── agent_tasks.py    # ⭐ Agent 审计任务（SSE 流式、RAG 索引、任务生命周期、LLM 健康度，5794 行）
 │   │           ├── auth.py           # 登录、注册、验证码、改密、登出
 │   │           ├── users.py          # 用户 CRUD + 状态切换 + 级联删除
 │   │           ├── projects.py       # 项目管理 + ZIP + 分支 + 文件树（826 行）
@@ -28,7 +28,7 @@ backend/
 │   │           ├── embedding_config.py # Embedding 模型配置
 │   │           └── ssh_keys.py       # SSH 密钥管理（Ed25519/RSA）
 │   ├── core/
-│   │   ├── config.py                 # Pydantic Settings（80+ 配置项：LLM/DB/JWT/Agent/沙箱/RAG/Feature Flags）
+│   │   ├── config.py                 # Pydantic Settings（100 配置项：LLM/DB/JWT/Agent/沙箱/RAG/Feature Flags）
 │   │   ├── security.py               # 密码策略（12位复杂度+历史检查+锁定+过期）、JWT 令牌
 │   │   ├── encryption.py             # 字段级 Fernet 对称加密（API Key/SSH 私钥等）
 │   │   ├── rbac.py                   # 三级 RBAC（super_admin/admin/user）+ 行级数据范围隔离
@@ -40,7 +40,7 @@ backend/
 │   ├── models/                       # 9 个 ORM 模型（16 张表）
 │   │   ├── user.py                   # 用户（UUID 主键、RBAC 角色、多租户、密码历史、账户锁定）
 │   │   ├── project.py                # 项目（repository/zip 两种类型）+ 项目成员
-│   │   ├── agent_task.py             # Agent 任务（11 种状态）+ 事件（27 种类型）+ 发现（7 种状态）+ 检查点 + 树节点
+│   │   ├── agent_task.py             # Agent 任务（13 种状态）+ 事件（29 种类型）+ 发现（8 种状态）+ 检查点 + 树节点
 │   │   ├── audit.py                  # 传统审计任务 + 审计问题（5 级严重度）
 │   │   ├── audit_rule.py             # 审计规则集 + 规则（支持导入导出）
 │   │   ├── audit_log.py              # 操作审计日志
@@ -80,8 +80,8 @@ backend/
 │       └── repo_utils.py             # Git 仓库操作
 ├── alembic/                          # 数据库迁移（24 个迁移文件）
 │   └── versions/                     # 001_initial → 023_drop_dead（含一次 merge heads 4c280754c680）
-├── tests/                            # 测试（82 个测试文件，575 个用例）
-│   ├── agent/                        # Agent 专项测试（62 个：验证/沙箱/覆盖率/严格发现等）
+├── tests/                            # 测试（200 个测试文件，约 760+ 用例）
+│   ├── agent/                        # Agent 专项测试（157 个：验证/沙箱/覆盖率/严格发现/崩坏/收口等）
 │   ├── rag/                          # RAG 测试（test_indexing_hardening.py：B1-B5 索引进度加固）
 │   └── test_*.py                     # 认证/RBAC/攻击链/覆盖率/跨轮次/文件选择测试
 ├── uploads/                          # 上传文件存储
@@ -103,9 +103,9 @@ backend/
 | `/api/v1/projects` | projects.py | 项目管理 + ZIP + 分支 + 文件树 |
 | `/api/v1/projects` | members.py | 项目成员管理 |
 | `/api/v1/tasks` | tasks.py | 传统审计任务 + 问题 + PDF 报告 |
-| `/api/v1/agent-tasks` | agent_tasks.py | ⭐ Agent 审计（创建/SSE 流/取消/重启/报告） |
+| `/api/v1/agent-tasks` | agent_tasks.py | ⭐ Agent 审计（创建/SSE 流/取消/重启/报告/pending 启动入口） |
 | `/api/v1/scan` | scan.py | 即时代码扫描（仓库/ZIP/即时分析） |
-| `/api/v1/config` | config.py | LLM 运行时配置（加密存储） |
+| `/api/v1/config` | config.py | LLM 运行时配置（加密存储；test-llm 内网/回环拦截已移除，2026-10-03 老板决策 5e40902） |
 | `/api/v1/database` | database.py | 数据库连接测试 |
 | `/api/v1/prompts` | prompts.py | 提示词模板管理 |
 | `/api/v1/rules` | rules.py | 审计规则集管理 |
@@ -129,7 +129,7 @@ backend/
     ├── 4. 创建子 Agent（Recon/Analysis/Verification）
     ├── 5. 创建 OrchestratorAgent
     ├── 6. orchestrator.run(input_data)
-    │     ├── LLM 决策循环（max_iterations=20，orchestrator.py:220 硬编码）
+    │     ├── LLM 决策循环（max_iterations=20，orchestrator.py:398 硬编码）
     │     ├── dispatch_agent("recon") → ReconAgent.run()
     │     ├── dispatch_agent("analysis") → AnalysisAgent.run()
     │     ├── dispatch_agent("verification") → VerificationAgent.run()
@@ -140,6 +140,8 @@ backend/
 > **v5.3.0 起 RAG 索引经 B1-B5 加固**：构建产物路径段排除 + minified 启发式（`indexer.py` `BUILD_ARTIFACT_DIR_SEGMENTS` / `MAX_SINGLE_LINE_LENGTH=2000` / `MAX_SOURCE_FILE_SIZE=2MB`）、单文件分块护栏（`FILE_CHUNK_TIMEOUT=20s` 跳过 / `MAX_CHUNKS_PER_FILE=500` 截断）、有界并发（`CHUNK_CONCURRENCY=4` 分批 gather）、嵌入快速失败（`embeddings.py` 重试耗尽抛 `EmbeddingUnavailableError`，agent_tasks 走 `rag_unavailable` 分支，禁止写入零向量）、进度消息分阶段标注（`CHUNK_PROGRESS_MSG_TEMPLATE` / `EMBED_PROGRESS_MSG_TEMPLATE`）。测试见 `tests/rag/test_indexing_hardening.py`，烟雾脚本 `smoke_rag_indexing.py`。
 
 > **v5.4.0 验证引擎根治（R1-R7）**：`verification.py` 新增确定性状态引擎 `compute_verification_status`（R1：由 sandbox_attempts 证据推导状态，不信任 LLM 自述 verdict，仅保留 false_positive/sandbox_skip_reason 两个显式标注位）、`_bind_runtime_evidence_to_all`（R2：证据按 finding_id 强制绑定，LLM 漏报不丢证据）、`FABRICATION_MARKERS` 反伪造（R3：Simulated/模拟/源码缺失标记 `fabricated` 并排除出判定与门禁）+ 确定性沙箱执行；`orchestrator.py` 门禁 3 次终止（R4 `verification_max_force_redispatch`）、Bug D 判定修正（R5：needs_context 视为未验证）、observations 记录（R6）、中断收口（R7）。`app/core/timeutil.py` 统一 API/SSE 时间为北京时间（UTC+8）。测试见 `tests/agent/test_verification_evidence.py` 与 `tests/agent/test_orchestrator_gates.py`。
+
+> **v6.5.0–v6.9.1 引擎演进**：验证五态收口（confirmed/static_confirmed/not_reproducible/needs_context/false_positive，`poc_error`/`infra_error` 严禁冒充未复现）、沙箱硬门禁四层完成门禁链、崩坏检测与差异化采样、交卷候选保全与 `_unified_closeout` 统一收口、LLM 健康度（degraded 任务升级 `completed_with_gaps`）、沙箱联网开关（P13）。详见 `app/services/agent/AGENTS.md`「输出质量与收口治理」小节。
 
 ## 数据库迁移演进
 
@@ -172,8 +174,8 @@ backend/
 - 禁止跳过类型注解
 - 禁止未迁移的模型更改
 - 禁止硬编码密钥密码
-- 沙箱工具禁止网络访问
-- 所有 LLM 调用必须经过 `circuit_breaker`
+- 沙箱工具默认隔离网络（联网须经 `resolve_sandbox_network_enabled` 判定：用户配置优先 → env 兜底，不得绕过）
+- 所有 LLM 调用必须经过 `circuit_breaker` + 全局并发闸 `llm_gate` + 端点软熔断（`app/core/llm_endpoint_health.py`）
 - 外部静态分析工具为审计核心必用：Orchestrator 含 Semgrep 预扫描，沙箱内 7 种外部工具（Semgrep/Bandit/Gitleaks/TruffleHog/npm audit/Safety/OSV-Scanner）；静态检测三套 = 外部工具 + 内置 OWASP 正则模式库 + DB 中 AuditRuleSet（LLM 提示词规则，非 ast-grep）
 - 敏感信息必须通过 Fernet 加密存储
 
