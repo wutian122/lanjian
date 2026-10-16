@@ -62,12 +62,10 @@ class AgentConfig(BaseSettings):
         description="Temperature for Orchestrator (v3.0: 建议 0.3-0.5，避免过低导致格式错误)"
     )
     # W1（分阶段 max_tokens）：单一全局输出预算无法同时满足「ReAct 中间轮短决策
-    # 防漂移」与「报告轮大 JSON 防截断」——fp8 内网推理实测 2048 中间轮胡乱输出
-    # 大减、32768 长输出漂移 + KV 累积误差、4096 reasoning 吃光预算空响应。
-    # 按 Agent 类型差异化：调度/侦察短决策 2048；分析/验证报告轮 4096
-    # （P1 折中：8192 长输出漂移实证——同义词链/字符集墙；4096 保 2-3 finding
-    #   报告空间且漂移空间减半；4+ findings 大报告由强制总结轮 32768 兜底）；
-    # analysis 强制总结轮一次性输出全量 findings JSON，预算留大 32768。
+    # 防漂移」与「报告轮大 JSON 防截断」。按 Agent 类型分字段（当前四类型统一
+    # 8192：2026-09-27 选项 a 恢复思考后预算翻倍、2026-09-29 层 2a 4096 下
+    # dispatch 常态截断致乱码传播——各字段的演进注记见下方 description）；
+    # analysis 强制总结轮一次性输出全量 findings JSON，预算单独留大 32768。
     # 未知类型无映射 → 回退用户全局 llmMaxTokens。
     llm_max_tokens_orchestrator: int = Field(
         default=8192,
